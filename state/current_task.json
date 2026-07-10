@@ -1,0 +1,37 @@
+{
+  "task_id": "bootstrap",
+  "user_goal": "Build a minimal CLI long-running coding agent skeleton.",
+  "acceptance_criteria": [
+    "The agent loop can run from the command line.",
+    "State and trace files are written to disk.",
+    "A verifier decides whether finish is allowed."
+  ],
+  "nodes": [
+    {
+      "id": "T1",
+      "title": "Initialize explicit task plan",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "T2",
+      "title": "Collect or produce one useful observation",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "T3",
+      "title": "Run independent verification",
+      "status": "pending",
+      "evidence": []
+    }
+  ],
+  "iterations": 0,
+  "created_at": "2026-07-10T00:00:00+00:00",
+  "updated_at": "2026-07-10T00:00:00+00:00",
+  "last_action": {},
+  "last_observation": {},
+  "last_verified_at": null,
+  "evidence_sources": [],
+  "acceptance_contracts": []
+}

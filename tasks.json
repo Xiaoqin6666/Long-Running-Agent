@@ -1,0 +1,80 @@
+{
+  "project": "Long-Running Agent",
+  "initializer_has_run": true,
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Bootstrap CLI agent loop",
+      "priority": 1,
+      "depends_on": [],
+      "status": "done",
+      "acceptance_criteria": [
+        "CLI entrypoint can run from python -m agent.main.",
+        "Offline provider completes a smoke task.",
+        "State and trace files are written."
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "Add minimal tool layer",
+      "priority": 2,
+      "depends_on": ["T1"],
+      "status": "done",
+      "acceptance_criteria": [
+        "read can inspect files and list directories.",
+        "bash can run a bounded command.",
+        "search and write tool interfaces exist.",
+        "Tool observations are recorded in trace."
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Add OpenAI-compatible model provider",
+      "priority": 3,
+      "depends_on": ["T1"],
+      "status": "done",
+      "acceptance_criteria": [
+        "Provider reads API settings from environment variables.",
+        "Provider validates JSON action output.",
+        "Protocol errors do not crash the harness."
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Add verifier-backed behavior tests",
+      "priority": 4,
+      "depends_on": ["T1", "T2"],
+      "status": "done",
+      "acceptance_criteria": [
+        "Unit tests cover key harness behavior.",
+        "Verifier runs unit tests during finish checks.",
+        "Offline smoke run completes with verifier enabled."
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Enforce acceptance contracts before coding",
+      "priority": 5,
+      "depends_on": ["T4"],
+      "status": "in_progress",
+      "acceptance_criteria": [
+        "Main Agent can create a task acceptance contract.",
+        "write actions are rejected before a contract exists.",
+        "Verifier checks contract presence and test evidence."
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "Run long-task evaluation and ablations",
+      "priority": 6,
+      "depends_on": ["T5"],
+      "status": "pending",
+      "acceptance_criteria": [
+        "At least one long coding task is run.",
+        "Trace metrics are reported.",
+        "At least one mechanism is disabled for ablation."
+      ]
+    }
+  ]
+}
+
