@@ -84,6 +84,7 @@ class AgentLoop:
                     "risk": "low",
                 }
                 observation = ToolResult(False, f"Protocol error: {exc}", {"error_type": type(exc).__name__})
+            self._record_budget_usage(state, context, action, observation)
             self._update_state(state, action, observation)
             self._append_trace(step, action, observation, state)
             self._write_state(state)
@@ -91,6 +92,10 @@ class AgentLoop:
             if action["action"] in {"answer", "finish"} and observation.ok:
                 completed = True
                 message = observation.data.get("answer", observation.summary)
+                break
+            if state.handoff_ready:
+                self._write_handoff(state)
+                message = "Session handoff threshold reached. Handoff written."
                 break
 
         if not completed:
@@ -121,6 +126,12 @@ class AgentLoop:
             return ToolResult(True, "Final answer produced.", {"answer": answer})
         if name == "contract":
             return self._validate_contract_action(action)
+        if name == "write" and state.handoff_ready:
+            return ToolResult(
+                False,
+                "Write rejected: session is past handoff threshold; generate handoff instead of starting new edits.",
+                {"handoff_ready": True},
+            )
         if name == "write" and not self._has_contract_for_active_task(state):
             return ToolResult(
                 False,
@@ -267,23 +278,105 @@ class AgentLoop:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _write_handoff(self, state: TaskState) -> None:
+        active_node = self._active_node(state)
+        completed = [node for node in state.nodes if node.get("status") == "done"]
+        pending = [node for node in state.nodes if node.get("status") != "done"]
+        contracts = state.acceptance_contracts[-5:]
+        evidence = state.evidence_sources[-20:]
         lines = [
-            "# Handoff",
+            "# Worker Session Handoff",
             "",
-            "## Goal",
+            "## 1. User Goal",
             state.user_goal,
             "",
-            "## Current State",
+            "## 2. Session Budget",
+            f"- budget_tokens: {state.session_budget_tokens}",
+            f"- threshold_ratio: {state.handoff_threshold}",
+            f"- threshold_tokens: {int(state.session_budget_tokens * state.handoff_threshold)}",
+            f"- estimated_used_tokens: {state.session_used_tokens}",
+            f"- handoff_ready: {state.handoff_ready}",
+            "",
+            "## 3. Active Task",
+            self._format_node(active_node) if active_node else "No active task.",
+            "",
+            "## 4. Completed Tasks",
+            *[self._format_node(node) for node in completed],
+            "",
+            "## 5. Pending Or Blocked Tasks",
+            *[self._format_node(node) for node in pending],
+            "",
+            "## 6. Acceptance Contracts",
+            *[self._format_contract(contract) for contract in contracts],
+            "",
+            "## 7. Evidence Sources",
+            *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in evidence],
+            "",
+            "## 8. Last Action",
+            json.dumps(state.last_action, ensure_ascii=False, indent=2),
+            "",
+            "## 9. Last Observation",
+            json.dumps(state.last_observation, ensure_ascii=False, indent=2),
+            "",
+            "## 10. Verification Status",
+            f"- last_verified_at: {state.last_verified_at}",
+            "- deterministic verifier: run `python -m unittest discover -s tests` and `python -m compileall agent eval tests`.",
+            "",
+            "## 11. Known Risks And Failed Attempts",
+            "- Review trace for failed observations and protocol errors before resuming.",
+            "- Do not repeat failed actions unchanged.",
+            "- Do not start new large edits until the next worker session has rebuilt context from this handoff.",
+            "",
+            "## 12. Current State Summary",
             state.summary(),
             "",
-            "## Last Observation",
-            state.last_observation.get("summary", "No observation recorded."),
+            "## 13. Resume Instructions",
+            "1. Read this handoff first.",
+            "2. Load `state/current_task.json`, `tasks.json`, and relevant source files.",
+            "3. Continue the active task only after checking the acceptance contract.",
+            "4. If no contract exists for a coding task, create one before writing code.",
+            "5. Prefer verification or small repair actions before new feature work.",
             "",
-            "## Next Recommended Step",
-            "Resume with `python -m agent.main --resume --task-file <task-file>` or pass the same task string.",
+            "## 14. Suggested Next Action",
+            self._suggest_next_action(state),
             "",
         ]
         self.handoff_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _record_budget_usage(
+        self,
+        state: TaskState,
+        context: str,
+        action: dict[str, Any],
+        observation: ToolResult,
+    ) -> None:
+        payload = context + json.dumps(action, ensure_ascii=False) + json.dumps(observation.to_dict(), ensure_ascii=False)
+        state.session_used_tokens += max(1, len(payload) // 4)
+        threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
+        if state.session_used_tokens >= threshold_tokens:
+            state.handoff_ready = True
+
+    def _active_node(self, state: TaskState) -> dict[str, Any] | None:
+        for node in state.nodes:
+            if node.get("status") in {"in_progress", "pending"}:
+                return node
+        return None
+
+    def _format_node(self, node: dict[str, Any]) -> str:
+        evidence = node.get("evidence", [])
+        evidence_text = "; ".join(str(item) for item in evidence[-3:]) if evidence else "no evidence yet"
+        return f"- {node.get('id')}: [{node.get('status')}] {node.get('title')} | evidence: {evidence_text}"
+
+    def _format_contract(self, contract: dict[str, Any]) -> str:
+        checks = "; ".join(str(item) for item in contract.get("checks", []))
+        return f"- {contract.get('task_id')}: {contract.get('summary')} | checks: {checks}"
+
+    def _suggest_next_action(self, state: TaskState) -> str:
+        active = self._active_node(state)
+        if not active:
+            return "Run verifier and finish if all acceptance criteria pass."
+        if not self._has_contract_for_active_task(state):
+            return f"Create an acceptance contract for {active.get('id')} before writing code."
+        return f"Resume {active.get('id')} with a small evidence-backed action, then verify."
 
     def _ensure_state_files(self) -> None:
         self.state_dir.mkdir(exist_ok=True)

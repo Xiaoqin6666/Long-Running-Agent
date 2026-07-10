@@ -34,6 +34,7 @@ General rules:
 - If the task is an inspection, explanation, recommendation, or next-step request, use `answer` only after enough evidence has been collected.
 - If the task is a coding task, use `verify` before `finish`.
 - Do not use `finish` unless the verifier has passed or the harness explicitly reports that acceptance checks are satisfied.
+- When the session budget is near or past the handoff threshold, do not start new large edits. Prefer verification, concise repair, or handoff preparation.
 
 Acceptance contract rules:
 
@@ -126,6 +127,7 @@ Long-running task rules:
 
 - Preserve the user goal, constraints, acceptance criteria, current node, completed evidence, failed attempts, changed files, and verification status.
 - Decide what must be placed into handoff when context is compacted.
+- Use the artificial session budget to force handoffs during experiments: 16K estimated tokens per Worker session, handoff preparation at 70%.
 - Keep raw logs out of the plan; refer to trace ids or summaries instead.
 - Record failed attempts as first-class information when they affect future decisions.
 

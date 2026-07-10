@@ -33,5 +33,9 @@
   "last_observation": {},
   "last_verified_at": null,
   "evidence_sources": [],
-  "acceptance_contracts": []
+  "acceptance_contracts": [],
+  "session_budget_tokens": 16000,
+  "handoff_threshold": 0.7,
+  "session_used_tokens": 0,
+  "handoff_ready": false
 }

@@ -240,6 +240,44 @@ Information that must cross context boundaries:
 
 Raw logs are not passed to the model unless needed; they remain in trace files.
 
+### Session Budget For Forced Handoff
+
+For experiments, the harness intentionally uses a small Worker session budget even if the underlying model supports a larger context window:
+
+- `session_budget_tokens = 16000`
+- `handoff_threshold = 0.7`
+- `threshold_tokens = 11200`
+
+The budget is estimated with a lightweight heuristic rather than an exact tokenizer. This is sufficient for controlled experiments because the goal is to force context-boundary behavior consistently.
+
+When the threshold is reached:
+
+- the Worker must not start new large edits;
+- `write` actions are rejected;
+- the current session writes `state/handoff.md`;
+- the next session must rebuild context from persisted state, handoff, memory, contracts, and relevant source files.
+
+### Detailed Handoff Format
+
+`state/handoff.md` should contain:
+
+1. User goal.
+2. Session budget: budget, threshold, estimated usage, and handoff flag.
+3. Active task.
+4. Completed tasks and evidence.
+5. Pending or blocked tasks.
+6. Acceptance contracts.
+7. Evidence sources inspected in this session.
+8. Last action.
+9. Last observation.
+10. Verification status.
+11. Known risks and failed attempts.
+12. Current state summary.
+13. Resume instructions.
+14. Suggested next action.
+
+This structure is intentionally more detailed than a summary. It is designed to test whether a fresh Worker can continue the task without access to the previous conversation.
+
 ## 8. Self-Verification
 
 Verification is layered:

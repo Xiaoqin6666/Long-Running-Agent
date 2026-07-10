@@ -23,11 +23,19 @@ class TaskState:
     last_verified_at: str | None = None
     evidence_sources: list[dict[str, Any]] = field(default_factory=list)
     acceptance_contracts: list[dict[str, Any]] = field(default_factory=list)
+    session_budget_tokens: int = 16000
+    handoff_threshold: float = 0.7
+    session_used_tokens: int = 0
+    handoff_ready: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
         data.setdefault("evidence_sources", [])
         data.setdefault("acceptance_contracts", [])
+        data.setdefault("session_budget_tokens", 16000)
+        data.setdefault("handoff_threshold", 0.7)
+        data.setdefault("session_used_tokens", 0)
+        data.setdefault("handoff_ready", False)
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +52,10 @@ class TaskState:
             "last_verified_at": self.last_verified_at,
             "evidence_sources": self.evidence_sources,
             "acceptance_contracts": self.acceptance_contracts,
+            "session_budget_tokens": self.session_budget_tokens,
+            "handoff_threshold": self.handoff_threshold,
+            "session_used_tokens": self.session_used_tokens,
+            "handoff_ready": self.handoff_ready,
         }
 
     def summary(self) -> str:

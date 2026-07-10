@@ -13,6 +13,8 @@ Build a training-free long-running coding agent harness for Zhejiang University 
 - The real model mode should use an OpenAI-compatible chat completions API.
 - Runtime environment for local commands is Windows PowerShell, though portable commands are preferred.
 - Trace, memory, skill, handoff, task, and contract artifacts should be file-backed.
+- Each Worker session uses an intentionally small context budget for experiments: default 16K estimated tokens.
+- At 70% of the session budget, the Worker must prepare handoff instead of starting new large edits.
 
 ## Architecture Roles
 
@@ -61,3 +63,19 @@ The harness rejects code-writing actions when no contract exists for the active 
 - Experiments can be summarized from trace files.
 - Documentation explains architecture, prompts, setup, and evaluation.
 
+## Session Budget And Handoff
+
+To force long-running experiments to cross context boundaries, each Worker session has a smaller artificial budget than the underlying model may support:
+
+- `session_budget_tokens`: 16000 estimated tokens.
+- `handoff_threshold`: 0.7.
+- `threshold_tokens`: 11200 estimated tokens.
+
+When the threshold is reached:
+
+- the Worker should not start new large modifications;
+- `write` actions are rejected by the harness;
+- the Worker session writes `state/handoff.md`;
+- the next session must read the handoff before resuming.
+
+The handoff must preserve enough information for a new session to continue without raw chat history.

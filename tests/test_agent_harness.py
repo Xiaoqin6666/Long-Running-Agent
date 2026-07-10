@@ -171,6 +171,56 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(contract.ok)
         self.assertFalse(contract.data["checks"]["behavior_level_checks"])
 
+    def test_handoff_ready_blocks_write(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+            state.handoff_ready = True
+            state.acceptance_contracts.append(
+                {
+                    "task_id": "T1",
+                    "summary": "Implement feature.",
+                    "checks": ["unit tests pass"],
+                    "status": "agreed",
+                }
+            )
+
+            observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "feature.py",
+                    "args": {"content": "print('hello')"},
+                },
+                state,
+            )
+
+        self.assertFalse(observation.ok)
+        self.assertTrue(observation.data["handoff_ready"])
+
+    def test_handoff_contains_session_budget_and_resume_sections(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+            state.session_budget_tokens = 100
+            state.handoff_threshold = 0.7
+            state.session_used_tokens = 71
+            state.handoff_ready = True
+            state.evidence_sources.append({"action": "read", "target": "agent/loop.py", "summary": "read"})
+
+            loop._write_handoff(state)
+            handoff = (root / "state" / "handoff.md").read_text(encoding="utf-8")
+
+        self.assertIn("# Worker Session Handoff", handoff)
+        self.assertIn("## 2. Session Budget", handoff)
+        self.assertIn("## 13. Resume Instructions", handoff)
+        self.assertIn("threshold_tokens: 70", handoff)
+
     def test_metrics_counts_answer_actions(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             trace = Path(tmp) / "run.jsonl"
