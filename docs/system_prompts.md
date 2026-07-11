@@ -140,6 +140,7 @@ Status rules:
 - Treat legacy `done` as equivalent to `completed` only for compatibility.
 - Worker-submitted candidates move to `awaiting_verification`; Verifier FAIL returns the task to `in_progress`.
 - Worker has no permission to mark a task `completed`.
+- Task status transitions must be persisted in `tasks.json`, with evidence for scheduling, verification, pass, and fail transitions.
 
 Orchestrator selection rules:
 

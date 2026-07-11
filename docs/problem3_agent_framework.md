@@ -147,6 +147,14 @@ blocked
 
 The Worker cannot directly mark a task `completed`. Only a Verifier PASS can allow the Orchestrator to move a task to `completed`.
 
+The implemented Orchestrator persists task transitions back to `tasks.json`:
+
+- scheduling a `pending` task marks it `in_progress`;
+- a `verify` action marks the current task `awaiting_verification`;
+- Verifier PASS marks it `completed`;
+- Verifier FAIL returns it to `in_progress`;
+- transition evidence is appended to the task's `evidence` list.
+
 Selection rules:
 
 1. Prefer the task that just failed verification. A failed task must be repaired before the system moves to easier unrelated work.
@@ -444,6 +452,8 @@ Human intervention is allowed but must be explicit. The system should return `re
 
 The `finish` action runs this project-level termination policy. It is rejected unless the result is `completed`.
 
+Hidden acceptance is configured through `eval/hidden_acceptance.json`, which points to `eval/hidden_acceptance.py`. The default hidden acceptance checks compileability, unit tests, CLI availability, and task-graph completion.
+
 ## 9. Skill Mechanism
 
 Skills are reusable procedural knowledge saved as Markdown files. They are retrieved by keyword and task type.
@@ -563,6 +573,13 @@ Metrics:
 - percentage of acceptance criteria satisfied;
 - number of repeated actions;
 - number of premature finish attempts;
+- contract rejection count;
+- verifier failure count;
+- skill promotion and rejection count;
+- no-progress session count;
+- completed and blocked task counts;
+- maximum session token budget usage;
+- final task status map;
 - final test pass rate;
 - human interventions.
 

@@ -28,7 +28,7 @@ class Verifier:
         checks.append(("unit_tests", tests_ok))
 
         ok = all(value for _, value in checks)
-        data = {"checks": dict(checks)}
+        data = {"checks": dict(checks), "task_id": state.task_id}
         if compile_error:
             data["compile_error"] = compile_error
         if tests_output:

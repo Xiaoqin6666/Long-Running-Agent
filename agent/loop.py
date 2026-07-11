@@ -147,6 +147,10 @@ class AgentLoop:
                 "priority": task.get("priority", 1000),
             }
         ]
+        if str(task.get("status", "pending")) == "pending":
+            updated = self.orchestrator.transition_task(task_id, "in_progress", "scheduled by orchestrator")
+            if updated:
+                state.nodes[0]["status"] = "in_progress"
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
@@ -177,7 +181,12 @@ class AgentLoop:
         if name == "update_plan":
             return ToolResult(True, "Plan updated by harness.", {"target": action.get("target")})
         if name == "verify":
-            return self.verifier.run(action.get("target", "default"), state)
+            task_id = self._active_task_id(state)
+            self.orchestrator.mark_awaiting_verification(task_id, "worker submitted candidate for verification")
+            result = self.verifier.run(action.get("target", "default"), state)
+            result.data["task_id"] = task_id
+            self.orchestrator.mark_verified(task_id, result.ok, result.summary)
+            return result
         if name == "finish":
             termination = self.terminator.evaluate()
             if termination.status == "completed":
@@ -231,6 +240,12 @@ class AgentLoop:
             state.nodes[2]["status"] = "done"
             state.nodes[2]["evidence"].append(observation.summary)
             state.last_verified_at = utc_now()
+        elif name == "verify":
+            if state.nodes:
+                state.nodes[0]["status"] = "completed" if observation.ok else "in_progress"
+                state.nodes[0]["evidence"].append(observation.summary)
+            if observation.ok:
+                state.last_verified_at = utc_now()
         elif name == "finish" and observation.ok:
             for node in state.nodes:
                 if node["status"] != "done":
@@ -366,6 +381,11 @@ class AgentLoop:
             "action": action,
             "observation": observation.to_dict(),
             "state_summary": state.summary(),
+            "task_id": state.task_id,
+            "session_used_tokens": state.session_used_tokens,
+            "handoff_ready": state.handoff_ready,
+            "orchestrator_decision": state.orchestrator_decision,
+            "nodes": state.nodes,
         }
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")

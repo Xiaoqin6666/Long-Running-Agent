@@ -8,6 +8,7 @@ from typing import Any
 
 TERMINAL_DONE_STATUSES = {"completed", "done"}
 WORKER_READY_STATUSES = {"pending", "in_progress"}
+VALID_TASK_STATUSES = {"pending", "in_progress", "awaiting_verification", "completed", "done", "blocked"}
 
 
 @dataclass(frozen=True)
@@ -41,14 +42,50 @@ class Orchestrator:
         failed_task_id = self.latest_failed_task_id()
         return select_current_task(tasks, failed_task_id=failed_task_id)
 
+    def mark_in_progress(self, task_id: str, evidence: str | None = None) -> None:
+        self.transition_task(task_id, "in_progress", evidence=evidence)
+
+    def mark_awaiting_verification(self, task_id: str, evidence: str | None = None) -> None:
+        self.transition_task(task_id, "awaiting_verification", evidence=evidence)
+
+    def mark_verified(self, task_id: str, passed: bool, evidence: str | None = None) -> None:
+        self.transition_task(task_id, "completed" if passed else "in_progress", evidence=evidence)
+
+    def transition_task(self, task_id: str, status: str, evidence: str | None = None) -> dict[str, Any] | None:
+        status = normalize_status(status)
+        if status not in VALID_TASK_STATUSES:
+            raise ValueError(f"Unsupported task status: {status}")
+        data = self.load_task_file()
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            return None
+        for task in tasks:
+            if not isinstance(task, dict) or str(task.get("id", "")) != task_id:
+                continue
+            task["status"] = status
+            if evidence:
+                task.setdefault("evidence", [])
+                if isinstance(task["evidence"], list):
+                    task["evidence"].append(evidence)
+            self.save_task_file(data)
+            return task
+        return None
+
     def load_tasks(self) -> list[dict[str, Any]]:
-        if not self.tasks_path.exists():
-            return []
-        data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        data = self.load_task_file()
         tasks = data.get("tasks", [])
         if not isinstance(tasks, list):
             return []
         return [task for task in tasks if isinstance(task, dict)]
+
+    def load_task_file(self) -> dict[str, Any]:
+        if not self.tasks_path.exists():
+            return {"tasks": []}
+        data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"tasks": []}
+
+    def save_task_file(self, data: dict[str, Any]) -> None:
+        self.tasks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def latest_failed_task_id(self) -> str | None:
         if not self.verifier_report_path.exists():

@@ -9,9 +9,9 @@ from pathlib import Path
 from agent.context import ContextBuilder
 from agent.llm import validate_action
 from agent.loop import AgentLoop
-from agent.orchestrator import count_unlocked_tasks, select_current_task
+from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
 from agent.planner import create_initial_state
-from agent.termination import decide_termination, evaluate_task_graph
+from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools.bash import BashTool
 from agent.tools.edit import EditTool
 from agent.tools.git import GitTool
@@ -132,6 +132,29 @@ class HarnessBehaviorTests(unittest.TestCase):
         selection = select_current_task(tasks)
 
         self.assertEqual(selection.task["id"], "T2")
+
+    def test_orchestrator_persists_task_status_transitions(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "pending", "priority": 1, "depends_on": []},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            orchestrator = Orchestrator(root)
+
+            orchestrator.mark_in_progress("T1", "scheduled")
+            orchestrator.mark_awaiting_verification("T1", "candidate ready")
+            orchestrator.mark_verified("T1", True, "Verifier passed.")
+            data = json.loads((root / "tasks.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["tasks"][0]["status"], "completed")
+        self.assertEqual(data["tasks"][0]["evidence"], ["scheduled", "candidate ready", "Verifier passed."])
 
     def test_read_directory_lists_entries(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -484,6 +507,21 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("Latest Verifier Report", report)
         self.assertIn("Verifier passed", report)
+        self.assertIn('"task_id": "current"', report)
+
+    def test_hidden_acceptance_config_can_pass_in_temp_project(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "eval").mkdir()
+            (root / "eval" / "hidden_acceptance.json").write_text(
+                json.dumps({"command": ["python", "-c", "import sys; sys.exit(0)"]}),
+                encoding="utf-8",
+            )
+
+            result = ProjectTerminator(root)._run_hidden_acceptance()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["configured"])
 
     def test_metrics_counts_answer_actions(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -504,6 +542,58 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(summary["steps"], 2)
         self.assertEqual(summary["actions"]["answer"], 1)
+
+    def test_metrics_reports_long_running_harness_fields(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = root / "run.jsonl"
+            tasks = root / "tasks.json"
+            tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed"},
+                            {"id": "T2", "status": "blocked"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = [
+                {
+                    "action": {"action": "contract"},
+                    "observation": {"ok": False, "summary": "Acceptance contract rejected.", "data": {}},
+                    "session_used_tokens": 10,
+                    "handoff_ready": False,
+                    "nodes": [{"id": "T1", "status": "in_progress"}],
+                },
+                {
+                    "action": {"action": "verify"},
+                    "observation": {"ok": False, "summary": "Verifier failed.", "data": {}},
+                    "session_used_tokens": 20,
+                    "handoff_ready": True,
+                    "nodes": [{"id": "T1", "status": "in_progress"}],
+                },
+                {
+                    "action": {"action": "skill"},
+                    "observation": {"ok": True, "summary": "Skill promoted.", "data": {}},
+                    "session_used_tokens": 30,
+                    "handoff_ready": False,
+                    "nodes": [{"id": "T1", "status": "completed"}],
+                },
+            ]
+            trace.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+
+            summary = summarize(trace, tasks)
+
+        self.assertEqual(summary["contract_rejections"], 1)
+        self.assertEqual(summary["verifier_failures"], 1)
+        self.assertEqual(summary["skill_promotions"], 1)
+        self.assertEqual(summary["handoff_count"], 1)
+        self.assertEqual(summary["no_progress_sessions"], 0)
+        self.assertEqual(summary["max_session_used_tokens"], 30)
+        self.assertEqual(summary["completed_tasks"], 1)
+        self.assertEqual(summary["blocked_tasks"], 1)
 
 
 if __name__ == "__main__":

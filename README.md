@@ -16,7 +16,7 @@ See [docs/system_prompts.md](docs/system_prompts.md) for role-specific Main Agen
 ## Planned Milestones
 
 1. Build a CLI agent loop.
-2. Add minimal tools: bash, read, write, search, verify.
+2. Add minimal tools: list_files, search, read, edit, bash, git, verify.
 3. Store task state, memory, skills, and traces on disk.
 4. Add context compaction and handoff.
 5. Run long-coding-task experiments and ablations.
@@ -32,13 +32,19 @@ python -m agent.main "Smoke test the minimal long-running agent" --max-steps 5
 Summarize a trace:
 
 ```powershell
-python eval\metrics.py state\traces\<trace-file>.jsonl
+python eval\metrics.py state\traces\<trace-file>.jsonl --tasks tasks.json
 ```
 
 Run behavior tests:
 
 ```powershell
 python -m unittest discover -s tests
+```
+
+Run hidden acceptance:
+
+```powershell
+python eval\hidden_acceptance.py
 ```
 
 The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.
