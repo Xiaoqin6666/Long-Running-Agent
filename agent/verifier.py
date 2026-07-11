@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import py_compile
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +34,9 @@ class Verifier:
         if tests_output:
             data["test_output"] = tests_output
         summary = "Verifier passed." if ok else "Verifier failed."
-        return ToolResult(ok, summary, data)
+        result = ToolResult(ok, summary, data)
+        self._write_report(result)
+        return result
 
     def validate_contract(self, contract: dict[str, Any]) -> ToolResult:
         checks = []
@@ -47,7 +51,9 @@ class Verifier:
         )
         ok = all(value for _, value in checks)
         summary = "Acceptance contract agreed." if ok else "Acceptance contract rejected."
-        return ToolResult(ok, summary, {"checks": dict(checks), "contract": contract})
+        result = ToolResult(ok, summary, {"checks": dict(checks), "contract": contract})
+        self._write_report(result)
+        return result
 
     def _compile_agent(self) -> tuple[bool, str | None]:
         try:
@@ -74,3 +80,20 @@ class Verifier:
         )
         output = (completed.stdout + completed.stderr).strip()
         return completed.returncode == 0, output[-4000:]
+
+    def _write_report(self, result: ToolResult) -> None:
+        state_dir = self.root / "state"
+        state_dir.mkdir(exist_ok=True)
+        payload = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "ok": result.ok,
+            "summary": result.summary,
+            "data": result.data,
+        }
+        (state_dir / "verifier_report.md").write_text(
+            "# Latest Verifier Report\n\n"
+            + "```json\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
+            + "\n```\n",
+            encoding="utf-8",
+        )

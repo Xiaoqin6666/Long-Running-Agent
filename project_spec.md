@@ -79,3 +79,12 @@ When the threshold is reached:
 - the next session must read the handoff before resuming.
 
 The handoff must preserve enough information for a new session to continue without raw chat history.
+
+## Context Layers
+
+The harness separates context into four layers:
+
+1. Always-on Context: short, stable role, tool, task id, authority, and completion rules.
+2. Startup Context: `project_spec.md`, `tasks.json`, `state/handoff.md`, latest verifier report, git log, and git status.
+3. Just-in-Time Context: repository information loaded gradually through read/search/bash tools.
+4. Persistent Context: task state, verified facts, architecture decisions, failed attempts, verifier reports, commits, and next actions stored in files.

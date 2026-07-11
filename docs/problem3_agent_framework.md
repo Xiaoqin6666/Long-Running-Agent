@@ -187,18 +187,65 @@ The next step is selected by:
 
 ## 7. Context Management
 
-Context is rebuilt every iteration instead of appending raw history forever.
+Context is rebuilt every iteration instead of appending raw history forever. The harness uses four layers.
 
-The context packet contains:
+### 7.1 Always-on Context
 
-- system contract and action schema;
-- user goal and acceptance criteria;
-- current plan tree summary;
-- recent N observations;
-- relevant file snippets;
-- selected memories;
-- selected skills;
-- current verifier status.
+Always-on context is present in every model call and must remain short and stable:
+
+- role and authority;
+- current task id;
+- tool rules;
+- "do not modify acceptance criteria";
+- completion and verification rules;
+- session-budget warning.
+
+This layer should not contain long project files or raw logs.
+
+### 7.2 Startup Context
+
+Startup context is loaded when the Worker begins or resumes:
+
+- `project_spec.md`;
+- `tasks.json`;
+- `state/handoff.md`;
+- latest `state/verifier_report.md`;
+- recent `git log`;
+- current `git status`.
+
+This layer restores project state without relying on previous chat history.
+
+### 7.3 Just-in-Time Context
+
+The Worker should not preload the whole repository. It gathers code context through tools:
+
+1. list small directories;
+2. search relevant symbols;
+3. read relevant source ranges;
+4. read corresponding tests;
+5. use errors or verifier output to guide follow-up search.
+
+Unix-style examples from papers should be translated to local tools or portable commands. In this repository, examples include:
+
+```text
+read target="agent"
+search target="create_issue" args={"path": "agent"}
+read target="agent/loop.py" args={"start": 1, "end": 240}
+```
+
+### 7.4 Persistent Context
+
+Cross-session information is written to files:
+
+- task completion state;
+- verified facts;
+- architecture decisions;
+- failed attempts;
+- verifier reports;
+- Git commits;
+- next recommended action.
+
+Persistent context is the substrate for handoff and ablation analysis.
 
 When context grows too large, the harness creates `state/handoff.md`:
 

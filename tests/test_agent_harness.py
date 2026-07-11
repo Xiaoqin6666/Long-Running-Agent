@@ -6,11 +6,13 @@ import unittest
 import uuid
 from pathlib import Path
 
+from agent.context import ContextBuilder
 from agent.llm import validate_action
 from agent.loop import AgentLoop
 from agent.planner import create_initial_state
 from agent.tools.bash import BashTool
 from agent.tools.read import ReadTool
+from agent.verifier import Verifier
 from eval.metrics import summarize
 
 
@@ -220,6 +222,40 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("## 2. Session Budget", handoff)
         self.assertIn("## 13. Resume Instructions", handoff)
         self.assertIn("threshold_tokens: 70", handoff)
+
+    def test_context_builder_uses_four_context_layers(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "memory.md").write_text("# Memory\n", encoding="utf-8")
+            (root / "state" / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
+            (root / "state" / "verifier_report.md").write_text("# Verifier\n", encoding="utf-8")
+            (root / "project_spec.md").write_text("# Spec\n", encoding="utf-8")
+            (root / "tasks.json").write_text("{}", encoding="utf-8")
+            state = create_initial_state("Implement a feature")
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("# Always-on Context", context)
+        self.assertIn("# Startup Context", context)
+        self.assertIn("# Just-in-Time Context", context)
+        self.assertIn("# Persistent Context", context)
+
+    def test_verifier_writes_latest_report(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            (root / "agent").mkdir()
+            state = create_initial_state("Implement a feature")
+            state.nodes[0]["evidence"].append("test evidence")
+
+            result = Verifier(root).run("default", state)
+            report = (root / "state" / "verifier_report.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertIn("Latest Verifier Report", report)
+        self.assertIn("Verifier passed", report)
 
     def test_metrics_counts_answer_actions(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

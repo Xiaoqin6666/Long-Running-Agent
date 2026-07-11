@@ -65,6 +65,8 @@ Evidence rules:
 Memory and state rules:
 
 - Treat the plan, evidence sources, last action, last observation, memory, and handoff as authoritative context.
+- Treat context as four layers: always-on rules, startup recovery files, just-in-time tool reads, and persistent file-backed state.
+- Do not preload the whole repository. Use just-in-time search and bounded reads.
 - If the handoff says a step failed before, do not repeat it unchanged.
 - If the plan says a node is done, avoid redoing it unless new evidence suggests it was incorrectly marked done.
 - Use `update_plan` when the current plan is clearly stale, incomplete, or too coarse.
