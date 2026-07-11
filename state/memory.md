@@ -1,5 +1,9 @@
-# Memory
+# Memory Index
 
-- [decision] Use filesystem-backed state, trace, skill, and handoff files for the Problem 3 harness.
-- [decision] Start with an offline deterministic decision maker so the CLI loop is testable without API keys.
+Memory is split into hard and soft state:
+
+- `state/hard_memory.md`: verifiable state that may be used as evidence.
+- `state/soft_memory.md`: hypotheses, suspected causes, reflections, and suggested next actions.
+
+Do not treat Soft Memory as fact. Promote soft entries to Hard Memory only after tests, verifier reports, trace evidence, inspected source files, or Git commits confirm them.
 

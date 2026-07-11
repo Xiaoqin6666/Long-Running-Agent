@@ -247,6 +247,13 @@ Cross-session information is written to files:
 
 Persistent context is the substrate for handoff and ablation analysis.
 
+Persistent memory is split into two levels:
+
+- Hard Memory: verifiable hard state, including Git commits, test results, task status, verifier reports, confirmed architecture decisions, and verified facts.
+- Soft Memory: language-level soft state, including current assumptions, unconfirmed fault hypotheses, suggested next steps, and agent reflections.
+
+Only Hard Memory can be used as evidence for completion or recovery decisions. Soft Memory can guide what to inspect next, but it must be verified before promotion.
+
 When context grows too large, the harness creates `state/handoff.md`:
 
 ```text
@@ -315,13 +322,15 @@ When the threshold is reached:
 5. Pending or blocked tasks.
 6. Acceptance contracts.
 7. Evidence sources inspected in this session.
-8. Last action.
-9. Last observation.
-10. Verification status.
-11. Known risks and failed attempts.
-12. Current state summary.
-13. Resume instructions.
-14. Suggested next action.
+8. Hard Memory.
+9. Soft Memory.
+10. Last action.
+11. Last observation.
+12. Verification status.
+13. Known risks and failed attempts.
+14. Current state summary.
+15. Resume instructions.
+16. Suggested next action.
 
 This structure is intentionally more detailed than a summary. It is designed to test whether a fresh Worker can continue the task without access to the previous conversation.
 
@@ -368,27 +377,38 @@ Write to Skill only when:
 
 ## 10. Memory Mechanism
 
-Memory stores durable facts about the current task or project:
+Memory is split into Hard Memory and Soft Memory.
 
-- project architecture decisions;
-- accepted constraints;
-- test commands and environment details;
-- facts confirmed by tools;
-- unresolved risks.
+Hard Memory stores verifiable hard state:
+
+- Git commits;
+- test results;
+- task status;
+- verifier reports;
+- confirmed architecture decisions;
+- verified facts.
+
+Soft Memory stores language-level soft state:
+
+- current assumptions;
+- unconfirmed fault causes;
+- suggested next steps;
+- agent reflections.
 
 Memory should not store:
 
 - full command logs;
-- unverified assumptions;
 - duplicate summaries;
 - stale TODOs that already moved into the plan tree.
 
-To reduce memory pollution, each memory entry has source evidence and status:
+Soft Memory may contain unverified assumptions, but they must be clearly marked and cannot be used as evidence.
+
+To reduce memory pollution, Hard Memory entries must have source evidence:
 
 ```text
 - [confirmed][trace:42] The project uses pytest through `python -m pytest`.
 - [decision][trace:51] Use JSONL traces because they are append-only and easy to analyze.
-- [risk][trace:73] Network-dependent tests are flaky in the current environment.
+- [commit:391325a] Add session budget handoff mechanism.
 ```
 
 ## 11. Minimal Tools

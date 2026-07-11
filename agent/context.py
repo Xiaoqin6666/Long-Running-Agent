@@ -78,12 +78,15 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _persistent_context(self, state: TaskState) -> str:
-        memory = self._read_optional(self.root / "state" / "memory.md")
+        memory_index = self._read_optional(self.root / "state" / "memory.md")
+        hard_memory = self._read_optional(self.root / "state" / "hard_memory.md")
+        soft_memory = self._read_optional(self.root / "state" / "soft_memory.md")
         skills = self._read_skills()
         lines = [
             "# Persistent Context",
             "Persist cross-session information in files rather than relying on chat history.",
             "Persistent files include task status, verified facts, architecture decisions, failed attempts, verifier reports, git commits, and next actions.",
+            "Hard Memory is evidence-grade. Soft Memory is not evidence; treat it only as a hypothesis or suggestion.",
             "",
             "# User Goal",
             state.user_goal,
@@ -116,8 +119,14 @@ class ContextBuilder:
             "# Last Observation",
             str(state.last_observation),
             "",
-            "# Memory",
-            memory,
+            "# Memory Index",
+            memory_index,
+            "",
+            "# Hard Memory",
+            hard_memory,
+            "",
+            "# Soft Memory",
+            soft_memory,
             "",
             "# Skills",
             skills,

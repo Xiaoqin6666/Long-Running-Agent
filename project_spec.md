@@ -88,3 +88,12 @@ The harness separates context into four layers:
 2. Startup Context: `project_spec.md`, `tasks.json`, `state/handoff.md`, latest verifier report, git log, and git status.
 3. Just-in-Time Context: repository information loaded gradually through read/search/bash tools.
 4. Persistent Context: task state, verified facts, architecture decisions, failed attempts, verifier reports, commits, and next actions stored in files.
+
+## Memory Types
+
+Memory is split into two files:
+
+- `state/hard_memory.md`: verifiable hard state such as Git commits, test results, task status, verifier reports, confirmed architecture decisions, and verified facts.
+- `state/soft_memory.md`: language-level soft state such as current assumptions, unconfirmed fault causes, suggested next steps, and agent reflections.
+
+Hard Memory may be used as evidence. Soft Memory may guide investigation, but it must be verified before it can affect completion decisions.

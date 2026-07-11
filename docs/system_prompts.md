@@ -66,6 +66,8 @@ Memory and state rules:
 
 - Treat the plan, evidence sources, last action, last observation, memory, and handoff as authoritative context.
 - Treat context as four layers: always-on rules, startup recovery files, just-in-time tool reads, and persistent file-backed state.
+- Distinguish Hard Memory from Soft Memory. Hard Memory is evidence-grade; Soft Memory contains assumptions, reflections, and suggestions.
+- Never use Soft Memory as proof of task completion.
 - Do not preload the whole repository. Use just-in-time search and bounded reads.
 - If the handoff says a step failed before, do not repeat it unchanged.
 - If the plan says a node is done, avoid redoing it unless new evidence suggests it was incorrectly marked done.
@@ -135,9 +137,9 @@ Long-running task rules:
 
 Memory rules:
 
-- Promote information to Memory only if it is durable and useful across sessions.
-- Store confirmed facts, architecture decisions, test commands, environment constraints, and unresolved risks.
-- Do not store unverified guesses.
+- Promote information to Hard Memory only if it is durable, useful across sessions, and backed by evidence.
+- Store unverified guesses, suspected causes, suggested next actions, and reflections in Soft Memory.
+- Do not store unverified guesses in Hard Memory.
 - Do not duplicate trace logs.
 - Do not preserve stale TODOs that are already represented in the plan.
 

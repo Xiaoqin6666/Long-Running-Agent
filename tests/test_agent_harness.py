@@ -207,6 +207,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             root = Path(tmp)
             (root / "state").mkdir()
             (root / "state" / "traces").mkdir()
+            (root / "state" / "hard_memory.md").write_text("# Hard Memory\n\n- [commit:x] fact\n", encoding="utf-8")
+            (root / "state" / "soft_memory.md").write_text("# Soft Memory\n\n- [next] inspect\n", encoding="utf-8")
             loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
             state = create_initial_state("Implement a feature")
             state.session_budget_tokens = 100
@@ -220,7 +222,9 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertIn("# Worker Session Handoff", handoff)
         self.assertIn("## 2. Session Budget", handoff)
-        self.assertIn("## 13. Resume Instructions", handoff)
+        self.assertIn("## 8. Hard Memory", handoff)
+        self.assertIn("## 9. Soft Memory", handoff)
+        self.assertIn("## 15. Resume Instructions", handoff)
         self.assertIn("threshold_tokens: 70", handoff)
 
     def test_context_builder_uses_four_context_layers(self) -> None:
@@ -228,6 +232,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             root = Path(tmp)
             (root / "state").mkdir()
             (root / "state" / "memory.md").write_text("# Memory\n", encoding="utf-8")
+            (root / "state" / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (root / "state" / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
             (root / "state" / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
             (root / "state" / "verifier_report.md").write_text("# Verifier\n", encoding="utf-8")
             (root / "project_spec.md").write_text("# Spec\n", encoding="utf-8")
@@ -240,6 +246,9 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Startup Context", context)
         self.assertIn("# Just-in-Time Context", context)
         self.assertIn("# Persistent Context", context)
+        self.assertIn("# Hard Memory", context)
+        self.assertIn("# Soft Memory", context)
+        self.assertIn("Soft Memory is not evidence", context)
 
     def test_verifier_writes_latest_report(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

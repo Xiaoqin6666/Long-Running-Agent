@@ -283,6 +283,8 @@ class AgentLoop:
         pending = [node for node in state.nodes if node.get("status") != "done"]
         contracts = state.acceptance_contracts[-5:]
         evidence = state.evidence_sources[-20:]
+        hard_memory = self._read_state_file("hard_memory.md", max_chars=3000)
+        soft_memory = self._read_state_file("soft_memory.md", max_chars=3000)
         lines = [
             "# Worker Session Handoff",
             "",
@@ -311,36 +313,50 @@ class AgentLoop:
             "## 7. Evidence Sources",
             *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in evidence],
             "",
-            "## 8. Last Action",
+            "## 8. Hard Memory",
+            hard_memory,
+            "",
+            "## 9. Soft Memory",
+            soft_memory,
+            "",
+            "## 10. Last Action",
             json.dumps(state.last_action, ensure_ascii=False, indent=2),
             "",
-            "## 9. Last Observation",
+            "## 11. Last Observation",
             json.dumps(state.last_observation, ensure_ascii=False, indent=2),
             "",
-            "## 10. Verification Status",
+            "## 12. Verification Status",
             f"- last_verified_at: {state.last_verified_at}",
             "- deterministic verifier: run `python -m unittest discover -s tests` and `python -m compileall agent eval tests`.",
             "",
-            "## 11. Known Risks And Failed Attempts",
+            "## 13. Known Risks And Failed Attempts",
             "- Review trace for failed observations and protocol errors before resuming.",
             "- Do not repeat failed actions unchanged.",
             "- Do not start new large edits until the next worker session has rebuilt context from this handoff.",
+            "- Treat Soft Memory as hypotheses, not facts.",
             "",
-            "## 12. Current State Summary",
+            "## 14. Current State Summary",
             state.summary(),
             "",
-            "## 13. Resume Instructions",
+            "## 15. Resume Instructions",
             "1. Read this handoff first.",
             "2. Load `state/current_task.json`, `tasks.json`, and relevant source files.",
             "3. Continue the active task only after checking the acceptance contract.",
             "4. If no contract exists for a coding task, create one before writing code.",
             "5. Prefer verification or small repair actions before new feature work.",
+            "6. Promote Soft Memory to Hard Memory only after verification.",
             "",
-            "## 14. Suggested Next Action",
+            "## 16. Suggested Next Action",
             self._suggest_next_action(state),
             "",
         ]
         self.handoff_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _read_state_file(self, name: str, max_chars: int = 3000) -> str:
+        path = self.state_dir / name
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")[:max_chars]
 
     def _record_budget_usage(
         self,
@@ -383,7 +399,13 @@ class AgentLoop:
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "skills").mkdir(exist_ok=True)
         if not self.memory_path.exists():
-            self.memory_path.write_text("# Memory\n\n", encoding="utf-8")
+            self.memory_path.write_text("# Memory Index\n\nSee hard_memory.md and soft_memory.md.\n", encoding="utf-8")
+        hard_memory = self.state_dir / "hard_memory.md"
+        if not hard_memory.exists():
+            hard_memory.write_text("# Hard Memory\n\n## Entries\n\n", encoding="utf-8")
+        soft_memory = self.state_dir / "soft_memory.md"
+        if not soft_memory.exists():
+            soft_memory.write_text("# Soft Memory\n\n## Entries\n\n", encoding="utf-8")
         if not (self.state_dir / "skills" / "coding.md").exists():
             (self.state_dir / "skills" / "coding.md").write_text(
                 "# Coding Skill\n\n- Inspect files before editing.\n- Prefer small verifiable steps.\n- Run syntax checks before finishing.\n",
