@@ -8,9 +8,24 @@ import urllib.request
 from typing import Any
 
 from agent.planner import TaskState
+from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 
 
-ALLOWED_ACTIONS = {"answer", "bash", "contract", "read", "skill", "write", "search", "update_plan", "verify", "finish"}
+ALLOWED_ACTIONS = {
+    "answer",
+    "bash",
+    "contract",
+    "edit",
+    "git",
+    "list_files",
+    "read",
+    "skill",
+    "write",
+    "search",
+    "update_plan",
+    "verify",
+    "finish",
+}
 
 
 def create_decision_maker(provider: str):
@@ -104,19 +119,7 @@ class OpenAICompatibleDecisionMaker:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are the decision component of a coding agent harness. "
-                        "Return exactly one JSON object and no Markdown. "
-                        "Allowed actions: answer, bash, contract, read, skill, write, search, update_plan, verify, finish. "
-                        "Required keys: thought_summary, action, target, args, "
-                        "expected_observation, risk. The args field must be a JSON object; use {} if empty. "
-                        "Use low/medium/high for risk."
-                        " The runtime is Windows PowerShell. Use read target='.' for directory listing. "
-                        "For bash, put the command string in target. "
-                        "Use action=contract before any code-writing action for a coding task. "
-                        "Use action=skill only to propose a reusable skill after verifier-confirmed success or evidence-confirmed failure. "
-                        "Use action=answer when the user asks for an inspection, explanation, recommendation, or next step."
-                    ),
+                    "content": MAIN_AGENT_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",

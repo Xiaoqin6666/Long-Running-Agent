@@ -9,8 +9,13 @@ from pathlib import Path
 from agent.context import ContextBuilder
 from agent.llm import validate_action
 from agent.loop import AgentLoop
+from agent.orchestrator import count_unlocked_tasks, select_current_task
 from agent.planner import create_initial_state
+from agent.termination import decide_termination, evaluate_task_graph
 from agent.tools.bash import BashTool
+from agent.tools.edit import EditTool
+from agent.tools.git import GitTool
+from agent.tools.list_files import ListFilesTool
 from agent.tools.read import ReadTool
 from agent.verifier import Verifier
 from eval.metrics import summarize
@@ -31,6 +36,103 @@ class WorkspaceTemporaryDirectory:
 
 
 class HarnessBehaviorTests(unittest.TestCase):
+    def test_termination_succeeds_only_when_all_project_checks_pass(self) -> None:
+        checks = {
+            "tasks": {"ok": True, "all_remaining_blocked": False},
+            "regression": {"ok": True},
+            "hidden_acceptance": {"ok": True},
+            "git_clean": {"ok": True},
+            "budget": {"ok": True, "exhausted": False},
+            "failure_limits": {"ok": True, "exceeded": {}},
+            "human_intervention": {"ok": True, "reasons": []},
+        }
+
+        result = decide_termination(checks)
+
+        self.assertEqual(result.status, "completed")
+
+    def test_termination_reports_failure_instead_of_fake_completion(self) -> None:
+        checks = {
+            "tasks": {"ok": False, "all_remaining_blocked": False},
+            "regression": {"ok": True},
+            "hidden_acceptance": {"ok": True},
+            "git_clean": {"ok": True},
+            "budget": {"ok": False, "exhausted": True},
+            "failure_limits": {"ok": True, "exceeded": {}},
+            "human_intervention": {"ok": True, "reasons": []},
+        }
+
+        result = decide_termination(checks)
+
+        self.assertEqual(result.status, "stopped_with_failure")
+        self.assertIn("total_token_budget_exhausted", result.reasons)
+
+    def test_termination_can_pause_for_human_intervention(self) -> None:
+        checks = {
+            "tasks": {"ok": False, "all_remaining_blocked": False},
+            "regression": {"ok": True},
+            "hidden_acceptance": {"ok": False},
+            "git_clean": {"ok": True},
+            "budget": {"ok": True, "exhausted": False},
+            "failure_limits": {"ok": True, "exceeded": {}},
+            "human_intervention": {"ok": False, "reasons": ["external_api_key_required"]},
+        }
+
+        result = decide_termination(checks)
+
+        self.assertEqual(result.status, "requires_human_intervention")
+        self.assertIn("external_api_key_required", result.reasons)
+
+    def test_task_graph_requires_all_required_tasks_completed(self) -> None:
+        graph = evaluate_task_graph(
+            [
+                {"id": "T1", "status": "completed"},
+                {"id": "T2", "status": "pending"},
+                {"id": "T3", "status": "pending", "optional": True},
+            ]
+        )
+
+        self.assertFalse(graph["ok"])
+        self.assertEqual(graph["remaining_task_ids"], ["T2"])
+
+    def test_orchestrator_prioritizes_latest_verifier_failure(self) -> None:
+        tasks = [
+            {"id": "T1", "status": "done", "priority": 1, "depends_on": []},
+            {"id": "T2", "status": "pending", "priority": 1, "depends_on": ["T1"]},
+            {"id": "T3", "status": "pending", "priority": 1, "depends_on": ["T1"]},
+        ]
+
+        selection = select_current_task(tasks, failed_task_id="T3")
+
+        self.assertEqual(selection.task["id"], "T3")
+        self.assertIn("verifier failure", selection.reason)
+
+    def test_orchestrator_prioritizes_critical_path_before_priority(self) -> None:
+        tasks = [
+            {"id": "T1", "status": "done", "priority": 1, "depends_on": []},
+            {"id": "T2", "status": "pending", "priority": 5, "depends_on": ["T1"]},
+            {"id": "T3", "status": "pending", "priority": 1, "depends_on": ["T1"]},
+            {"id": "T4", "status": "pending", "priority": 1, "depends_on": ["T2"]},
+            {"id": "T5", "status": "pending", "priority": 1, "depends_on": ["T2"]},
+        ]
+
+        selection = select_current_task(tasks)
+
+        self.assertEqual(count_unlocked_tasks(tasks[1], tasks), 2)
+        self.assertEqual(selection.task["id"], "T2")
+
+    def test_orchestrator_uses_priority_then_stable_id_as_tiebreakers(self) -> None:
+        tasks = [
+            {"id": "T1", "status": "done", "priority": 1, "depends_on": []},
+            {"id": "T3", "status": "pending", "priority": 2, "depends_on": ["T1"]},
+            {"id": "T2", "status": "pending", "priority": 2, "depends_on": ["T1"]},
+            {"id": "T4", "status": "pending", "priority": 3, "depends_on": ["T1"]},
+        ]
+
+        selection = select_current_task(tasks)
+
+        self.assertEqual(selection.task["id"], "T2")
+
     def test_read_directory_lists_entries(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -39,6 +141,44 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("alpha.txt", result.data["content"])
+
+    def test_list_files_returns_structured_entries(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "alpha.txt").write_text("hello", encoding="utf-8")
+            (root / "src").mkdir()
+
+            result = ListFilesTool(root).run({"action": "list_files", "target": ".", "args": {}})
+
+        self.assertTrue(result.ok)
+        self.assertIn({"path": "alpha.txt", "type": "file"}, result.data["entries"])
+        self.assertIn({"path": "src", "type": "dir"}, result.data["entries"])
+
+    def test_edit_replaces_exact_text_once(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "alpha.txt"
+            path.write_text("hello world\n", encoding="utf-8")
+
+            result = EditTool(root).run(
+                {
+                    "action": "edit",
+                    "target": "alpha.txt",
+                    "args": {"old": "hello", "new": "hi"},
+                }
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(content, "hi world\n")
+        self.assertEqual(result.data["replacements"], 1)
+
+    def test_git_rejects_network_or_destructive_commands(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            result = GitTool(Path(tmp)).run({"action": "git", "target": "push", "args": {}})
+
+        self.assertFalse(result.ok)
+        self.assertIn("not allowed", result.summary)
 
     def test_bash_accepts_args_command(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

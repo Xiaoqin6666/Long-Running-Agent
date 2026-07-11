@@ -50,14 +50,20 @@ long_running_agent/
     main.py                 # CLI entrypoint
     loop.py                 # agent loop and state transitions
     llm.py                  # model provider abstraction
+    prompts.py              # runtime prompt constants
+    orchestrator.py         # task scheduling
     context.py              # context packing and compaction
     planner.py              # plan tree update rules
     verifier.py             # independent completion checks
+    termination.py          # project-level termination policy
     tools/
-      bash.py
-      read.py
-      write.py
+      list_files.py
       search.py
+      read.py
+      edit.py
+      bash.py
+      git.py
+      write.py              # compatibility alias-style whole-file writer
   state/
     current_task.json       # machine-readable task state
     memory.md               # durable facts and decisions
@@ -105,7 +111,66 @@ The Initializer runs once at project start and converts the vague request into d
 
 After initialization, the Planner should only update the plan when task state is stale, too coarse, blocked, or contradicted by trace evidence.
 
-## 4.2 Acceptance Contract
+## 4.2 Orchestrator
+
+The Orchestrator is a lightweight scheduler that chooses exactly one Worker task from `tasks.json`. It does not write code, does not run tools for implementation, and does not decide completion. Its output is a durable selection record stored in `TaskState.orchestrator_decision` and shown in context and handoff.
+
+Task states have fixed meanings:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Not started. |
+| `in_progress` | Worker is implementing the task or repairing it after feedback. |
+| `awaiting_verification` | Worker claims a candidate implementation is ready. |
+| `completed` / `done` | Verifier independently confirmed all acceptance criteria. |
+| `blocked` | Dependency, environment, credential, or external condition prevents progress. |
+
+State transitions:
+
+```text
+pending
+  -> scheduled by Orchestrator
+in_progress
+  -> Worker submits candidate
+awaiting_verification
+  -> Verifier PASS
+completed
+
+awaiting_verification
+  -> Verifier FAIL
+in_progress
+
+pending / in_progress
+  -> missing external condition
+blocked
+```
+
+The Worker cannot directly mark a task `completed`. Only a Verifier PASS can allow the Orchestrator to move a task to `completed`.
+
+Selection rules:
+
+1. Prefer the task that just failed verification. A failed task must be repaired before the system moves to easier unrelated work.
+2. Prefer critical-path tasks that unlock the most downstream ready work.
+3. Prefer the user or Planner priority field, where smaller numbers are higher priority.
+4. Use task id ordering as the final stable tie-breaker for reproducibility.
+
+The implemented sort key is:
+
+```python
+ready_tasks.sort(
+    key=lambda task: (
+        task["id"] != failed_task_id,
+        task["status"] != "in_progress",
+        -count_unlocked_tasks(task),
+        task["priority"],
+        task["id"],
+    )
+)
+```
+
+`done` is accepted as a compatibility alias for `completed` because the initial project tasks used `done` before the stricter state machine was introduced.
+
+## 4.3 Acceptance Contract
 
 Before the Main Agent writes code for a task, it must propose a contract that the verifier can check independently:
 
@@ -133,7 +198,7 @@ The LLM outputs JSON-like actions:
 ```json
 {
   "thought_summary": "Short private-to-state reasoning summary.",
-  "action": "answer | bash | contract | read | skill | write | search | update_plan | verify | finish",
+  "action": "answer | bash | contract | list_files | search | read | edit | git | skill | write | update_plan | verify | finish",
   "target": "file path, command, query, or task id",
   "args": {},
   "expected_observation": "What should be learned or changed.",
@@ -346,6 +411,39 @@ Verification is layered:
 
 The key design choice is that generation and verification use different evidence paths. The model can suggest "I think it is done", but the harness only accepts completion when independent checks pass or when failures are explicitly documented.
 
+## 8.1 Project Termination
+
+Project termination is separate from Worker task verification. A Worker can submit a candidate result for one task, and the Verifier can pass or fail that task, but only the project-level Terminator can decide whether the whole run is over.
+
+There are four project-level outcomes:
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | The project succeeded and should stop. |
+| `stopped_with_failure` | The system can no longer make useful autonomous progress under its budgets and limits. |
+| `requires_human_intervention` | The system is paused because external information, credentials, or a user decision is required. |
+| `continue_running` | No terminal condition is met; continue scheduling Worker tasks. |
+
+Successful termination requires all of the following:
+
+- all required tasks are `completed` or legacy `done`;
+- no required task is still `blocked`;
+- full regression checks pass;
+- hidden acceptance checks pass;
+- the Git worktree is clean and runnable.
+
+Failure termination is explicit and must not be reported as success. Examples:
+
+- total token budget is exhausted;
+- a critical task exceeds its consecutive failure limit;
+- environment startup fails for too many sessions;
+- every remaining required task is blocked;
+- several consecutive sessions produce no effective code or state change.
+
+Human intervention is allowed but must be explicit. The system should return `requires_human_intervention` when it needs an external API key, cannot resolve conflicting requirements, needs a product decision from the user, or lacks a dependency that it cannot install.
+
+The `finish` action runs this project-level termination policy. It is rejected unless the result is `completed`.
+
 ## 9. Skill Mechanism
 
 Skills are reusable procedural knowledge saved as Markdown files. They are retrieved by keyword and task type.
@@ -417,11 +515,26 @@ To reduce memory pollution, Hard Memory entries must have source evidence:
 
 The initial implementation only needs:
 
-- `bash(command, timeout)`: run shell commands.
+- `list_files(path, recursive, limit)`: inspect directory structure with structured entries.
+- `search(pattern, path)`: search files with structured match objects.
 - `read(path, start, end)`: read bounded file content.
-- `search(pattern, path)`: search files using ripgrep or fallback.
-- `write(path, patch)`: apply controlled file edits.
+- `edit(path, old, new, count)`: apply a precise text replacement.
+- `bash(command, timeout)`: run bounded shell commands.
+- `git(command, timeout)`: run allowlisted Git operations such as status, diff, log, show, branch, add, and commit.
+- `write(path, content, mode)`: compatibility whole-file writer, still gated by acceptance contracts.
 - `verify(profile)`: run configured checks.
+
+All tools return a common structured result:
+
+```json
+{
+  "ok": true,
+  "summary": "Human-readable short observation.",
+  "data": {
+    "tool_specific": "structured payload"
+  }
+}
+```
 
 Tool outputs must be summarized and saved to trace. Large outputs are truncated in context but stored on disk.
 

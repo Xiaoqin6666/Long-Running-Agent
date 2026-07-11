@@ -27,6 +27,7 @@ class TaskState:
     handoff_threshold: float = 0.7
     session_used_tokens: int = 0
     handoff_ready: bool = False
+    orchestrator_decision: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
@@ -36,6 +37,7 @@ class TaskState:
         data.setdefault("handoff_threshold", 0.7)
         data.setdefault("session_used_tokens", 0)
         data.setdefault("handoff_ready", False)
+        data.setdefault("orchestrator_decision", {})
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +58,7 @@ class TaskState:
             "handoff_threshold": self.handoff_threshold,
             "session_used_tokens": self.session_used_tokens,
             "handoff_ready": self.handoff_ready,
+            "orchestrator_decision": self.orchestrator_decision,
         }
 
     def summary(self) -> str:

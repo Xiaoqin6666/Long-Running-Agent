@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+TERMINAL_DONE_STATUSES = {"completed", "done"}
+WORKER_READY_STATUSES = {"pending", "in_progress"}
+
+
+@dataclass(frozen=True)
+class TaskSelection:
+    task: dict[str, Any] | None
+    reason: str
+    ready_task_ids: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "selected_task_id": self.task.get("id") if self.task else None,
+            "reason": self.reason,
+            "ready_task_ids": self.ready_task_ids,
+        }
+
+
+class Orchestrator:
+    """Selects the single task a Worker session should focus on.
+
+    The Orchestrator does not implement code and does not verify completion.
+    It only chooses the next Worker-ready task from durable task state.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.tasks_path = root / "tasks.json"
+        self.verifier_report_path = root / "state" / "verifier_report.md"
+
+    def choose_current_task(self) -> TaskSelection:
+        tasks = self.load_tasks()
+        failed_task_id = self.latest_failed_task_id()
+        return select_current_task(tasks, failed_task_id=failed_task_id)
+
+    def load_tasks(self) -> list[dict[str, Any]]:
+        if not self.tasks_path.exists():
+            return []
+        data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            return []
+        return [task for task in tasks if isinstance(task, dict)]
+
+    def latest_failed_task_id(self) -> str | None:
+        if not self.verifier_report_path.exists():
+            return None
+        text = self.verifier_report_path.read_text(encoding="utf-8")
+        start = text.find("```json")
+        if start == -1:
+            return None
+        start = text.find("\n", start)
+        end = text.find("```", start + 1)
+        if start == -1 or end == -1:
+            return None
+        try:
+            report = json.loads(text[start:end].strip())
+        except json.JSONDecodeError:
+            return None
+        if report.get("ok") is not False:
+            return None
+        data = report.get("data", {})
+        if not isinstance(data, dict):
+            return None
+        task_id = data.get("task_id") or data.get("selected_task_id")
+        if task_id:
+            return str(task_id)
+        contract = data.get("contract")
+        if isinstance(contract, dict) and contract.get("task_id"):
+            return str(contract["task_id"])
+        return None
+
+
+def select_current_task(tasks: list[dict[str, Any]], failed_task_id: str | None = None) -> TaskSelection:
+    ready_tasks = [task for task in tasks if is_worker_ready(task, tasks, failed_task_id)]
+    ready_tasks.sort(key=lambda task: task_sort_key(task, tasks, failed_task_id))
+    if not ready_tasks:
+        return TaskSelection(None, "No worker-ready task found.", [])
+    selected = ready_tasks[0]
+    return TaskSelection(
+        selected,
+        selection_reason(selected, tasks, failed_task_id),
+        [str(task.get("id", "")) for task in ready_tasks],
+    )
+
+
+def is_worker_ready(task: dict[str, Any], tasks: list[dict[str, Any]], failed_task_id: str | None = None) -> bool:
+    task_id = str(task.get("id", ""))
+    status = normalize_status(task.get("status", "pending"))
+    if task_id == failed_task_id:
+        return dependencies_completed(task, tasks)
+    if status not in WORKER_READY_STATUSES:
+        return False
+    return dependencies_completed(task, tasks)
+
+
+def dependencies_completed(task: dict[str, Any], tasks: list[dict[str, Any]]) -> bool:
+    by_id = {str(item.get("id", "")): item for item in tasks}
+    for dependency in task.get("depends_on", []):
+        dependency_task = by_id.get(str(dependency))
+        if not dependency_task:
+            return False
+        if normalize_status(dependency_task.get("status")) not in TERMINAL_DONE_STATUSES:
+            return False
+    return True
+
+
+def task_sort_key(
+    task: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    failed_task_id: str | None = None,
+) -> tuple[bool, bool, int, int, str]:
+    task_id = str(task.get("id", ""))
+    status = normalize_status(task.get("status", "pending"))
+    return (
+        task_id != failed_task_id,
+        status != "in_progress",
+        -count_unlocked_tasks(task, tasks),
+        task_priority(task),
+        task_id,
+    )
+
+
+def count_unlocked_tasks(task: dict[str, Any], tasks: list[dict[str, Any]]) -> int:
+    task_id = str(task.get("id", ""))
+    completed_ids = {
+        str(item.get("id", ""))
+        for item in tasks
+        if normalize_status(item.get("status")) in TERMINAL_DONE_STATUSES or item is task
+    }
+    unlocked = 0
+    for candidate in tasks:
+        candidate_id = str(candidate.get("id", ""))
+        if candidate_id == task_id:
+            continue
+        if normalize_status(candidate.get("status")) not in WORKER_READY_STATUSES:
+            continue
+        dependencies = {str(item) for item in candidate.get("depends_on", [])}
+        if task_id in dependencies and dependencies.issubset(completed_ids):
+            unlocked += 1
+    return unlocked
+
+
+def task_priority(task: dict[str, Any]) -> int:
+    try:
+        return int(task.get("priority", 1000))
+    except (TypeError, ValueError):
+        return 1000
+
+
+def normalize_status(status: object) -> str:
+    text = str(status or "pending").strip().lower()
+    if text == "done":
+        return "done"
+    return text
+
+
+def selection_reason(task: dict[str, Any], tasks: list[dict[str, Any]], failed_task_id: str | None = None) -> str:
+    task_id = str(task.get("id", ""))
+    if task_id == failed_task_id:
+        return f"Selected {task_id}: latest verifier failure must be repaired before other work."
+    if normalize_status(task.get("status")) == "in_progress":
+        return f"Selected {task_id}: existing in-progress task continues before starting new work."
+    unlocked = count_unlocked_tasks(task, tasks)
+    return (
+        f"Selected {task_id}: ready task with priority={task_priority(task)}, "
+        f"unlocks={unlocked}, stable_id={task_id}."
+    )

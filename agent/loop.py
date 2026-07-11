@@ -8,8 +8,10 @@ from typing import Any
 
 from agent.context import ContextBuilder
 from agent.llm import create_decision_maker
+from agent.orchestrator import Orchestrator
 from agent.planner import TaskState, create_initial_state
-from agent.tools import BashTool, ReadTool, SearchTool, ToolResult, WriteTool
+from agent.termination import ProjectTerminator
+from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, SearchTool, ToolResult, WriteTool
 from agent.verifier import Verifier
 
 
@@ -52,10 +54,15 @@ class AgentLoop:
         self.handoff_path = self.state_dir / "handoff.md"
         self.trace_path = self.trace_dir / self._trace_name()
         self.context_builder = ContextBuilder(root)
+        self.orchestrator = Orchestrator(root)
+        self.terminator = ProjectTerminator(root)
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root)
         self.tools = {
             "bash": BashTool(root),
+            "edit": EditTool(root),
+            "git": GitTool(root),
+            "list_files": ListFilesTool(root),
             "read": ReadTool(root),
             "search": SearchTool(root),
             "write": WriteTool(root),
@@ -111,8 +118,35 @@ class AgentLoop:
 
     def _load_or_create_state(self) -> TaskState:
         if self.resume and self.state_path.exists():
-            return TaskState.from_dict(json.loads(self.state_path.read_text(encoding="utf-8")))
-        return create_initial_state(self.task)
+            state = TaskState.from_dict(json.loads(self.state_path.read_text(encoding="utf-8")))
+        else:
+            state = create_initial_state(self.task)
+        self._apply_orchestrator_selection(state)
+        return state
+
+    def _apply_orchestrator_selection(self, state: TaskState) -> None:
+        selection = self.orchestrator.choose_current_task()
+        state.orchestrator_decision = selection.to_dict()
+        if not selection.task:
+            return
+        task = selection.task
+        task_id = str(task.get("id", state.task_id))
+        state.task_id = task_id
+        if not state.user_goal.startswith(f"{task_id}:"):
+            state.user_goal = f"{task_id}: {task.get('title', state.user_goal)}"
+        acceptance = task.get("acceptance_criteria")
+        if isinstance(acceptance, list) and acceptance:
+            state.acceptance_criteria = [str(item) for item in acceptance]
+        state.nodes = [
+            {
+                "id": task_id,
+                "title": str(task.get("title", task_id)),
+                "status": str(task.get("status", "pending")),
+                "evidence": task.get("evidence", []),
+                "depends_on": task.get("depends_on", []),
+                "priority": task.get("priority", 1000),
+            }
+        ]
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
@@ -128,13 +162,13 @@ class AgentLoop:
             return self._validate_contract_action(action)
         if name == "skill":
             return self._handle_skill_action(action, state)
-        if name == "write" and state.handoff_ready:
+        if name in {"edit", "write"} and state.handoff_ready:
             return ToolResult(
                 False,
                 "Write rejected: session is past handoff threshold; generate handoff instead of starting new edits.",
                 {"handoff_ready": True},
             )
-        if name == "write" and not self._has_contract_for_active_task(state):
+        if name in {"edit", "write"} and not self._has_contract_for_active_task(state):
             return ToolResult(
                 False,
                 "Write rejected: create an acceptance contract with the verifier before generating code.",
@@ -145,10 +179,10 @@ class AgentLoop:
         if name == "verify":
             return self.verifier.run(action.get("target", "default"), state)
         if name == "finish":
-            verification = self.verifier.run("finish", state)
-            if verification.ok:
-                return ToolResult(True, "All acceptance checks passed. Task can finish.", verification.data)
-            return ToolResult(False, "Finish rejected because verification failed.", verification.data)
+            termination = self.terminator.evaluate()
+            if termination.status == "completed":
+                return ToolResult(True, "Project completed.", termination.to_dict())
+            return ToolResult(False, f"Finish rejected: {termination.status}.", termination.to_dict())
         tool = self.tools.get(str(name))
         if not tool:
             return ToolResult(False, f"Unknown action: {name}", {})
@@ -181,7 +215,7 @@ class AgentLoop:
         elif name == "update_plan" and state.nodes:
             state.nodes[0]["status"] = "done"
             state.nodes[0]["evidence"].append("initialized plan")
-        elif name in {"read", "search", "bash", "write"} and observation.ok and len(state.nodes) > 1:
+        elif name in {"list_files", "read", "search", "bash", "git", "edit", "write"} and observation.ok and len(state.nodes) > 1:
             state.evidence_sources.append(
                 {
                     "action": name,
@@ -191,7 +225,7 @@ class AgentLoop:
             )
             state.nodes[1]["status"] = "done"
             state.nodes[1]["evidence"].append(observation.summary)
-        elif name in {"read", "search", "bash", "write", "protocol_error"} and not observation.ok:
+        elif name in {"list_files", "read", "search", "bash", "git", "edit", "write", "protocol_error"} and not observation.ok:
             state.last_observation["counts_as_progress"] = False
         elif name == "verify" and observation.ok and len(state.nodes) > 2:
             state.nodes[2]["status"] = "done"
@@ -359,6 +393,9 @@ class AgentLoop:
             "",
             "## 3. Active Task",
             self._format_node(active_node) if active_node else "No active task.",
+            "",
+            "## Orchestrator Decision",
+            json.dumps(state.orchestrator_decision, ensure_ascii=False, indent=2),
             "",
             "## 4. Completed Tasks",
             *[self._format_node(node) for node in completed],

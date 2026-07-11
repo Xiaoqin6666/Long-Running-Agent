@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.tools.bash import BashTool
+from agent.tools.edit import EditTool
+from agent.tools.git import GitTool
+from agent.tools.list_files import ListFilesTool
 from agent.tools.read import ReadTool
 from agent.tools.search import SearchTool
 from agent.tools.write import WriteTool
@@ -19,5 +22,13 @@ class ToolResult:
         return {"ok": self.ok, "summary": self.summary, "data": self.data}
 
 
-__all__ = ["BashTool", "ReadTool", "SearchTool", "ToolResult", "WriteTool"]
-
+__all__ = [
+    "BashTool",
+    "EditTool",
+    "GitTool",
+    "ListFilesTool",
+    "ReadTool",
+    "SearchTool",
+    "ToolResult",
+    "WriteTool",
+]
