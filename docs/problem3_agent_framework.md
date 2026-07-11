@@ -133,7 +133,7 @@ The LLM outputs JSON-like actions:
 ```json
 {
   "thought_summary": "Short private-to-state reasoning summary.",
-  "action": "answer | bash | contract | read | write | search | update_plan | verify | finish",
+  "action": "answer | bash | contract | read | skill | write | search | update_plan | verify | finish",
   "target": "file path, command, query, or task id",
   "args": {},
   "expected_observation": "What should be learned or changed.",
@@ -372,8 +372,10 @@ Common failure modes:
 Write to Skill only when:
 
 - the rule is reusable across tasks;
-- it was validated by a successful run;
+- it was validated by a verifier-confirmed successful run, or it captures a failure mode confirmed by evidence;
 - it is not just a temporary fact about this repository.
+
+Worker reflections should go to Soft Memory, not Skill. The harness rejects Skill promotion without evidence.
 
 ## 10. Memory Mechanism
 

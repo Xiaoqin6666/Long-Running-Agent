@@ -55,6 +55,38 @@ class Verifier:
         self._write_report(result)
         return result
 
+    def validate_skill_promotion(self, proposal: dict[str, Any], state: TaskState) -> ToolResult:
+        evidence = proposal.get("evidence", [])
+        evidence_text = "\n".join(str(item).lower() for item in evidence)
+        evidence_type = proposal.get("evidence_type")
+        checks = []
+        checks.append(("has_skill_id", bool(str(proposal.get("skill_id", "")).strip())))
+        checks.append(("has_title", bool(str(proposal.get("title", "")).strip())))
+        checks.append(("has_body", bool(str(proposal.get("body", "")).strip())))
+        checks.append(("has_evidence", bool(evidence) and isinstance(evidence, list)))
+        if evidence_type == "verified_success":
+            checks.append(
+                (
+                    "verifier_confirmed_success",
+                    state.last_observation.get("ok") is True
+                    and "verifier passed" in str(state.last_observation.get("summary", "")).lower(),
+                )
+            )
+        elif evidence_type == "evidence_confirmed_failure":
+            checks.append(
+                (
+                    "evidence_confirmed_failure",
+                    any(marker in evidence_text for marker in ["failed", "failure", "error", "rejected", "trace:"]),
+                )
+            )
+        else:
+            checks.append(("valid_evidence_type", False))
+        ok = all(value for _, value in checks)
+        summary = "Skill promotion accepted." if ok else "Skill promotion rejected."
+        result = ToolResult(ok, summary, {"checks": dict(checks), "proposal": proposal})
+        self._write_report(result)
+        return result
+
     def _compile_agent(self) -> tuple[bool, str | None]:
         try:
             for path in (self.root / "agent").glob("*.py"):

@@ -126,6 +126,8 @@ class AgentLoop:
             return ToolResult(True, "Final answer produced.", {"answer": answer})
         if name == "contract":
             return self._validate_contract_action(action)
+        if name == "skill":
+            return self._handle_skill_action(action, state)
         if name == "write" and state.handoff_ready:
             return ToolResult(
                 False,
@@ -163,6 +165,14 @@ class AgentLoop:
             contract = dict(observation.data["contract"])
             contract.setdefault("status", "agreed")
             state.acceptance_contracts.append(contract)
+        elif name == "skill" and observation.ok:
+            state.evidence_sources.append(
+                {
+                    "action": "skill",
+                    "target": observation.data.get("path", ""),
+                    "summary": observation.summary,
+                }
+            )
         elif name == "answer" and observation.ok:
             for node in state.nodes:
                 if node["status"] != "done":
@@ -240,6 +250,55 @@ class AgentLoop:
         if not result.ok:
             return result
         return ToolResult(True, f"Acceptance contract agreed for {task_id}.", {"contract": contract})
+
+    def _handle_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        args = action.get("args", {})
+        if not isinstance(args, dict):
+            return ToolResult(False, "Skill rejected: args must be an object.", {})
+        skill_id = self._safe_skill_id(str(args.get("skill_id") or action.get("target") or ""))
+        title = str(args.get("title", "")).strip()
+        body = str(args.get("body", "")).strip()
+        evidence_type = str(args.get("evidence_type", "")).strip()
+        evidence = args.get("evidence", [])
+        if not skill_id or not title or not body:
+            return ToolResult(False, "Skill rejected: skill_id, title, and body are required.", {})
+        if evidence_type not in {"verified_success", "evidence_confirmed_failure"}:
+            return ToolResult(
+                False,
+                "Skill rejected: evidence_type must be verified_success or evidence_confirmed_failure.",
+                {},
+            )
+        if not isinstance(evidence, list) or not evidence:
+            return ToolResult(False, "Skill rejected: evidence list is required.", {})
+        result = self.verifier.validate_skill_promotion(
+            {
+                "skill_id": skill_id,
+                "title": title,
+                "body": body,
+                "evidence_type": evidence_type,
+                "evidence": evidence,
+            },
+            state,
+        )
+        if not result.ok:
+            return result
+        skill_path = self.state_dir / "skills" / f"{skill_id}.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text(
+            f"# {title}\n\n"
+            f"Evidence type: {evidence_type}\n\n"
+            "## Evidence\n\n"
+            + "\n".join(f"- {item}" for item in evidence)
+            + "\n\n## Procedure\n\n"
+            + body
+            + "\n",
+            encoding="utf-8",
+        )
+        return ToolResult(True, f"Skill promoted: {skill_id}.", {"path": str(skill_path.relative_to(self.root))})
+
+    def _safe_skill_id(self, raw: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw.strip().lower())
+        return cleaned.strip("-_")
 
     def _has_contract_for_active_task(self, state: TaskState) -> bool:
         active = self._active_task_id(state)

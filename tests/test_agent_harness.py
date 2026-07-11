@@ -173,6 +173,85 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(contract.ok)
         self.assertFalse(contract.data["checks"]["behavior_level_checks"])
 
+    def test_skill_rejects_unverified_reflection(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+
+            observation = loop._execute_action(
+                {
+                    "action": "skill",
+                    "target": "random-thought",
+                    "args": {
+                        "skill_id": "random-thought",
+                        "title": "Random thought",
+                        "body": "Maybe do this next time.",
+                        "evidence_type": "verified_success",
+                        "evidence": ["I think it worked"],
+                    },
+                },
+                state,
+            )
+
+        self.assertFalse(observation.ok)
+
+    def test_skill_accepts_verifier_confirmed_success(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+            state.last_observation = {"ok": True, "summary": "Verifier passed.", "data": {}}
+
+            observation = loop._execute_action(
+                {
+                    "action": "skill",
+                    "target": "verified-debugging",
+                    "args": {
+                        "skill_id": "verified-debugging",
+                        "title": "Verified debugging",
+                        "body": "Run tests before claiming completion.",
+                        "evidence_type": "verified_success",
+                        "evidence": ["verifier_report: Verifier passed"],
+                    },
+                },
+                state,
+            )
+            skill_path = root / "state" / "skills" / "verified-debugging.md"
+            skill_exists = skill_path.exists()
+
+        self.assertTrue(observation.ok)
+        self.assertTrue(skill_exists)
+
+    def test_skill_accepts_evidence_confirmed_failure(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+
+            observation = loop._execute_action(
+                {
+                    "action": "skill",
+                    "target": "avoid-weak-contract",
+                    "args": {
+                        "skill_id": "avoid-weak-contract",
+                        "title": "Avoid weak contracts",
+                        "body": "Do not use file existence as the only acceptance check.",
+                        "evidence_type": "evidence_confirmed_failure",
+                        "evidence": ["trace: contract rejected because behavior_level_checks failed"],
+                    },
+                },
+                state,
+            )
+
+        self.assertTrue(observation.ok)
+
     def test_handoff_ready_blocks_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)

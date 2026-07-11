@@ -97,3 +97,14 @@ Memory is split into two files:
 - `state/soft_memory.md`: language-level soft state such as current assumptions, unconfirmed fault causes, suggested next steps, and agent reflections.
 
 Hard Memory may be used as evidence. Soft Memory may guide investigation, but it must be verified before it can affect completion decisions.
+
+## Skill Promotion
+
+Skill is stricter than Memory. A Worker must not automatically write its per-turn thoughts into Skill.
+
+A Skill entry may be written only when one of these conditions holds:
+
+- verifier-confirmed success: the lesson is backed by a passing verifier report or test result;
+- evidence-confirmed failure: the lesson captures a failed attempt that is confirmed by trace, verifier, test, or tool evidence.
+
+Unverified reflections belong in Soft Memory, not Skill.

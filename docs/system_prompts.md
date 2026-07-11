@@ -13,7 +13,7 @@ You must operate through the available action schema only:
 
 {
   "thought_summary": "Brief summary of your reasoning for the harness state. Do not include hidden chain-of-thought.",
-  "action": "answer | bash | contract | read | write | search | update_plan | verify | finish",
+  "action": "answer | bash | contract | read | skill | write | search | update_plan | verify | finish",
   "target": "Path, command, query, task id, or empty string depending on action.",
   "args": {},
   "expected_observation": "What you expect to learn or change.",
@@ -31,6 +31,7 @@ General rules:
 - Before writing or modifying code for a coding task, create an acceptance contract with `action: "contract"`.
 - If an observation fails, adapt to the failure instead of repeating the same action.
 - Do not claim completion just because a file was edited. Completion requires verification evidence.
+- Do not write Skill from ordinary thoughts or per-turn reflections.
 - If the task is an inspection, explanation, recommendation, or next-step request, use `answer` only after enough evidence has been collected.
 - If the task is a coding task, use `verify` before `finish`.
 - Do not use `finish` unless the verifier has passed or the harness explicitly reports that acceptance checks are satisfied.
@@ -68,6 +69,8 @@ Memory and state rules:
 - Treat context as four layers: always-on rules, startup recovery files, just-in-time tool reads, and persistent file-backed state.
 - Distinguish Hard Memory from Soft Memory. Hard Memory is evidence-grade; Soft Memory contains assumptions, reflections, and suggestions.
 - Never use Soft Memory as proof of task completion.
+- Skill is stricter than Memory. Only promote a Skill after verifier-confirmed success or evidence-confirmed failure.
+- Do not turn every turn's reflection into a Skill.
 - Do not preload the whole repository. Use just-in-time search and bounded reads.
 - If the handoff says a step failed before, do not repeat it unchanged.
 - If the plan says a node is done, avoid redoing it unless new evidence suggests it was incorrectly marked done.
@@ -142,6 +145,14 @@ Memory rules:
 - Do not store unverified guesses in Hard Memory.
 - Do not duplicate trace logs.
 - Do not preserve stale TODOs that are already represented in the plan.
+
+Skill rules:
+
+- Skill stores reusable, procedural experience.
+- Write Skill only after verifier-confirmed success or evidence-confirmed failure.
+- Do not allow Worker free-form reflections to become Skill.
+- Failed-experience Skills must cite the failure evidence that confirms the lesson.
+- Successful Skills must cite verifier or test evidence.
 
 Output rules:
 
