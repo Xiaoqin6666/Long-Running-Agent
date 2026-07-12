@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from agent.tools.base import WorkspaceTool
@@ -12,6 +13,10 @@ ALLOWED_GIT_COMMANDS = READ_ONLY_GIT_COMMANDS | WRITE_GIT_COMMANDS
 
 
 class GitTool(WorkspaceTool):
+    def __init__(self, root: Path, allow_write: bool = True) -> None:
+        super().__init__(root)
+        self.allow_write = allow_write
+
     def run(self, action: dict[str, Any]):
         from agent.tools import ToolResult
 
@@ -29,6 +34,16 @@ class GitTool(WorkspaceTool):
                 False,
                 f"Git command rejected: '{verb}' is not allowed.",
                 {"command": command, "allowed": sorted(ALLOWED_GIT_COMMANDS)},
+            )
+        if verb in WRITE_GIT_COMMANDS and not self.allow_write:
+            return ToolResult(
+                False,
+                "Git write rejected: benchmark runs cannot add or commit files in the host Agent repository.",
+                {
+                    "command": command,
+                    "benchmark_git_read_only": True,
+                    "allowed": sorted(READ_ONLY_GIT_COMMANDS),
+                },
             )
         if any(flag in parts for flag in ["reset", "checkout", "clean", "rebase", "merge", "push", "pull"]):
             return ToolResult(False, "Git command rejected: destructive or network operation.", {"command": command})

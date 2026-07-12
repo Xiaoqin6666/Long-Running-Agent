@@ -429,7 +429,7 @@ Verification is layered:
 4. State consistency check: every completed plan node must have evidence.
 5. LLM critique: optional, but cannot be the only verifier.
 
-The key design choice is that generation and verification use different evidence paths. The model can suggest "I think it is done", but the harness only accepts completion when independent checks pass or when failures are explicitly documented.
+The key design choice is that generation and verification use different evidence paths. A successful contract command is persisted as structured evidence with `task_id`, `evidence_type`, and `ok=true`. Scheduling notes, arbitrary observations, and failed verifier messages do not satisfy the Verifier's evidence requirement. The model can suggest "I think it is done", but the harness only accepts completion when independent checks pass.
 
 ## 8.1 Project Termination
 
@@ -450,7 +450,9 @@ Successful termination requires all of the following:
 - no required task is still `blocked`;
 - full regression checks pass;
 - hidden acceptance checks pass;
-- the Git worktree is clean and runnable.
+- for non-benchmark Agent-project runs, the Git worktree is clean and runnable.
+
+Benchmark runs are isolated from the host Agent repository. Their Git tool is read-only, host `git status` is not a completion criterion, and host Agent regression tests are outside benchmark scope. Benchmark completion is based on its runtime/generated task graph, structured task-verification evidence, and benchmark-local hidden acceptance. A benchmark Worker must never use `git add` or `git commit` to clean or finalize the host repository.
 
 Failure termination is explicit and must not be reported as success. Examples:
 
@@ -464,7 +466,7 @@ Human intervention is allowed but must be explicit. The system should return `re
 
 The `finish` action runs this project-level termination policy. It is rejected unless the result is `completed`.
 
-Hidden acceptance is configured through `eval/hidden_acceptance.json`, which points to `eval/hidden_acceptance.py`. The default hidden acceptance checks compileability, unit tests, CLI availability, and task-graph completion.
+For benchmark runs, hidden acceptance is selected from `eval/benchmarks/<benchmark_id>/hidden_acceptance.py` and is executed by the harness during a task whose acceptance criteria require hidden acceptance, then again by the project Terminator. Hidden stdout/stderr is never added to Worker context, trace evidence, or verifier reports; only configured status, return code, and a generic pass/fail summary are exposed. Non-benchmark framework runs continue to use `eval/hidden_acceptance.json`.
 
 ## 9. Skill Mechanism
 
@@ -542,7 +544,7 @@ The initial implementation only needs:
 - `read(path, start, end)`: read bounded file content.
 - `edit(path, old, new, count)`: apply a precise text replacement.
 - `bash(command, timeout)`: run bounded shell commands.
-- `git(command, timeout)`: run allowlisted Git operations such as status, diff, log, show, branch, add, and commit.
+- `git(command, timeout)`: run allowlisted Git operations. Agent-project runs may use status, diff, log, show, branch, add, and commit; benchmark runs are restricted to read-only Git operations and reject add/commit.
 - `write(path, content, mode)`: compatibility whole-file writer, still gated by acceptance contracts.
 - `verify(profile)`: run configured checks.
 

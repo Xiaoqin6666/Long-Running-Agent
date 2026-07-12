@@ -46,6 +46,8 @@ python -m agent.main --benchmark issue_tracker --task-file eval\benchmarks\issue
 
 Repeat resume runs until the task graph reaches `completed`, `stopped_with_failure`, or `requires_human_intervention`.
 
+Benchmark execution never owns the host Long-Running Agent repository. `git add` and `git commit` are rejected in benchmark mode, and host worktree cleanliness is not part of benchmark completion. Do not commit harness source, root `state/`, or unrelated traces to make a benchmark finish.
+
 The handoff threshold is an artificial experiment control: `session_budget_tokens * handoff_threshold`. With the default `64000 * 0.75`, a Worker prepares handoff after roughly `48000` estimated tokens. The handoff Markdown is only a concise resume index; structured details are written to the active benchmark state directory, for example `state/benchmarks/issue_tracker/handoff_payload.json`.
 
 ## Local Checks
@@ -55,6 +57,8 @@ Run the task-specific hidden acceptance:
 ```powershell
 python eval\benchmarks\issue_tracker\hidden_acceptance.py
 ```
+
+During autonomous benchmark execution, the harness selects this script from the active `benchmark_id`. The Worker cannot read or modify it, and verifier/trace state records only a redacted pass/fail summary rather than hidden output.
 
 Run trace metrics after each session:
 

@@ -828,6 +828,20 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(result.status, "requires_human_intervention")
         self.assertIn("external_api_key_required", result.reasons)
 
+    def test_benchmark_termination_ignores_host_git_and_regression_scope(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            terminator = ProjectTerminator(root, benchmark_id="sample")
+
+            git_check = terminator._git_clean()
+            regression_check = terminator._run_regression()
+
+        self.assertTrue(git_check["ok"])
+        self.assertTrue(git_check["skipped"])
+        self.assertIn("outside benchmark scope", git_check["summary"])
+        self.assertTrue(regression_check["ok"])
+        self.assertTrue(regression_check["skipped"])
+
     def test_task_graph_requires_all_required_tasks_completed(self) -> None:
         graph = evaluate_task_graph(
             [
@@ -955,6 +969,26 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("not allowed", result.summary)
+
+    def test_benchmark_git_rejects_add_and_commit(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = GitTool(root, allow_write=False)
+
+            add_result = tool.run({"action": "git", "target": "add --all", "args": {}})
+            commit_result = tool.run({"action": "git", "target": "commit -m benchmark", "args": {}})
+
+        self.assertFalse(add_result.ok)
+        self.assertFalse(commit_result.ok)
+        self.assertTrue(add_result.data["benchmark_git_read_only"])
+        self.assertIn("host Agent repository", commit_result.summary)
+
+    def test_benchmark_loop_configures_read_only_git(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Benchmark", max_steps=1, benchmark_id="sample")
+
+        self.assertFalse(loop.tools["git"].allow_write)
 
     def test_bash_accepts_args_command(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2711,6 +2745,50 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Next action must be write or edit", context)
         self.assertIn("workspace/issue_tracker/store.py", context)
 
+    def test_context_handles_pending_repair_without_mutable_targets(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = create_initial_state("Write public tests")
+            state.task_id = "T4"
+            state.nodes = [
+                {
+                    "id": "T4",
+                    "title": "Public tests",
+                    "status": "in_progress",
+                    "expected_artifacts": ["workspace/tests/test_core.py"],
+                    "implementation_artifacts": [],
+                    "worker_test_artifacts": ["workspace/tests/test_core.py"],
+                    "acceptance_artifacts": ["workspace/tests/test_core.py"],
+                    "frozen_acceptance_artifacts": [],
+                    "test_policy": {
+                        "worker_tests_mutable_until_contract_freeze": True,
+                        "acceptance_tests_mutable_by_worker": False,
+                        "acceptance_test_repair_requires_verifier_approval": True,
+                    },
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T4",
+                    "summary": "Run public tests.",
+                    "checks": ["python -m unittest discover -s workspace/tests"],
+                    "status": "agreed",
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -m unittest discover -s workspace/tests",
+                "summary": "Command exited with code 1.",
+                "output": "ModuleNotFoundError: No module named 'package'",
+                "targets": ["workspace/tests/test_core.py"],
+                "repair_targets": ["workspace/tests/test_core.py"],
+            }
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("no mutable repair target is available", context)
+        self.assertIn("Repair or replace the acceptance command", context)
+
     def test_guard_runs_next_contract_command_before_verify(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2895,6 +2973,16 @@ class HarnessBehaviorTests(unittest.TestCase):
             state = create_initial_state("Implement a feature")
             state.task_id = "T1"
             state.nodes = [{"id": "T1", "title": "First", "status": "in_progress", "evidence": ["scheduled"]}]
+            state.evidence_sources.append(
+                {
+                    "action": "bash",
+                    "target": "python -c \"assert True\"",
+                    "summary": "Command exited with code 0.",
+                    "task_id": "T1",
+                    "evidence_type": "acceptance_command_passed",
+                    "ok": True,
+                }
+            )
 
             observation = loop._execute_action({"action": "verify", "target": "default", "args": {}}, state)
             loop._update_state(state, {"action": "verify", "target": "default", "args": {}}, observation)
@@ -3293,7 +3381,16 @@ class HarnessBehaviorTests(unittest.TestCase):
             (root / "state" / "traces").mkdir()
             (root / "agent").mkdir()
             state = create_initial_state("Implement a feature")
-            state.nodes[0]["evidence"].append("test evidence")
+            state.evidence_sources.append(
+                {
+                    "action": "bash",
+                    "target": "python -c \"assert True\"",
+                    "summary": "Command exited with code 0.",
+                    "task_id": "current",
+                    "evidence_type": "acceptance_command_passed",
+                    "ok": True,
+                }
+            )
 
             result = Verifier(root).run("default", state)
             report = (root / "state" / "verifier_report.md").read_text(encoding="utf-8")
@@ -3302,6 +3399,161 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Latest Verifier Report", report)
         self.assertIn("Verifier passed", report)
         self.assertIn('"task_id": "current"', report)
+
+    def test_verifier_rejects_failed_or_unstructured_evidence(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            state = create_initial_state("Implement a feature")
+            state.nodes[0]["evidence"].extend(["scheduled by orchestrator", "Verifier failed."])
+            state.evidence_sources.append(
+                {
+                    "action": "verify",
+                    "target": "current",
+                    "summary": "Verifier failed.",
+                    "task_id": "current",
+                    "evidence_type": "verifier_failed",
+                    "ok": False,
+                }
+            )
+
+            result = Verifier(root).run("default", state)
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.data["checks"]["has_evidence"])
+
+    def test_benchmark_verifier_does_not_run_host_agent_tests(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            (workspace / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+            host_tests = root / "tests"
+            host_tests.mkdir()
+            (host_tests / "test_host_failure.py").write_text(
+                "import unittest\nclass HostFailure(unittest.TestCase):\n    def test_failure(self):\n        self.fail('host-only failure')\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Benchmark feature")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Feature", "status": "in_progress", "evidence": []}]
+            state.evidence_sources.append(
+                {
+                    "action": "bash",
+                    "target": "python -c \"assert True\"",
+                    "summary": "Command exited with code 0.",
+                    "task_id": "T1",
+                    "evidence_type": "acceptance_command_passed",
+                    "ok": True,
+                }
+            )
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["checks"]["unit_tests"])
+        self.assertIn("structured task evidence", result.data["test_output"])
+
+    def test_successful_contract_command_records_structured_task_evidence(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Final verification", max_steps=1)
+            state = create_initial_state("Final verification")
+            state.task_id = "T5"
+            state.nodes = [{"id": "T5", "title": "Final", "status": "in_progress", "evidence": []}]
+            command = "python -c \"assert True\""
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T5",
+                    "summary": "Final verification.",
+                    "checks": [command],
+                    "status": "agreed",
+                }
+            ]
+
+            loop._update_state(
+                state,
+                {"action": "bash", "target": command, "args": {}},
+                ToolResult(True, "Command exited with code 0.", {"command": command}),
+            )
+
+        evidence = state.evidence_sources[-1]
+        self.assertEqual(evidence["task_id"], "T5")
+        self.assertEqual(evidence["evidence_type"], "acceptance_command_passed")
+        self.assertTrue(evidence["ok"])
+        self.assertIn("Acceptance command passed.", state.nodes[0]["evidence"])
+
+    def test_t5_verifier_runs_benchmark_hidden_acceptance_without_exposing_output(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text("print('SECRET-HIDDEN-DETAIL')\n", encoding="utf-8")
+            state = create_initial_state("Final verification")
+            state.task_id = "T5"
+            state.acceptance_criteria = ["Hidden acceptance script passes"]
+            state.nodes = [{"id": "T5", "title": "Final", "status": "in_progress", "evidence": []}]
+            state.evidence_sources.append(
+                {
+                    "action": "bash",
+                    "target": "python -c \"assert True\"",
+                    "summary": "Command exited with code 0.",
+                    "task_id": "T5",
+                    "evidence_type": "acceptance_command_passed",
+                    "ok": True,
+                }
+            )
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+            report = (state_dir / "verifier_report.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["checks"]["hidden_acceptance"])
+        self.assertEqual(result.data["hidden_acceptance"]["summary"], "Benchmark hidden acceptance passed.")
+        self.assertNotIn("SECRET-HIDDEN-DETAIL", json.dumps(result.data))
+        self.assertNotIn("SECRET-HIDDEN-DETAIL", report)
+
+    def test_t5_verifier_redacts_failed_hidden_acceptance_output(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text(
+                "import sys\nprint('SECRET-FAILURE-DETAIL')\nsys.exit(1)\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Final verification")
+            state.task_id = "T5"
+            state.acceptance_criteria = ["Hidden acceptance script passes"]
+            state.nodes = [{"id": "T5", "title": "Final", "status": "in_progress", "evidence": []}]
+            state.evidence_sources.append(
+                {
+                    "action": "bash",
+                    "target": "python -c \"assert True\"",
+                    "summary": "Command exited with code 0.",
+                    "task_id": "T5",
+                    "evidence_type": "acceptance_command_passed",
+                    "ok": True,
+                }
+            )
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+            report = (state_dir / "verifier_report.md").read_text(encoding="utf-8")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.data["checks"]["hidden_acceptance"])
+        self.assertEqual(result.data["hidden_acceptance"]["summary"], "Benchmark hidden acceptance failed.")
+        self.assertNotIn("SECRET-FAILURE-DETAIL", json.dumps(result.data))
+        self.assertNotIn("SECRET-FAILURE-DETAIL", report)
 
     def test_hidden_acceptance_config_can_pass_in_temp_project(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3316,6 +3568,20 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["configured"])
+
+    def test_terminator_prefers_benchmark_hidden_acceptance_and_redacts_output(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text("print('SECRET-BENCHMARK-OUTPUT')\n", encoding="utf-8")
+
+            result = ProjectTerminator(root, benchmark_id="sample")._run_hidden_acceptance()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["summary"], "Benchmark hidden acceptance passed.")
+        self.assertNotIn("SECRET-BENCHMARK-OUTPUT", json.dumps(result))
 
     def test_metrics_counts_answer_actions(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

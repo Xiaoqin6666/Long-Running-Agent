@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import py_compile
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,15 @@ class Verifier:
         checks.append(("state_dir_exists", self.state_dir.exists()))
         checks.append(("trace_dir_exists", (self.state_dir / "traces").exists()))
         checks.append(("has_plan_nodes", bool(state.nodes)))
-        checks.append(("has_evidence", any(node["evidence"] for node in state.nodes)))
+        checks.append(("has_evidence", self._has_success_evidence(state)))
         compile_ok, compile_error = self._compile_agent()
         checks.append(("python_compile", compile_ok))
         tests_ok, tests_output = self._run_tests()
         checks.append(("unit_tests", tests_ok))
+        hidden_result: dict[str, Any] | None = None
+        if self._requires_hidden_acceptance(state):
+            hidden_result = self._run_benchmark_hidden_acceptance()
+            checks.append(("hidden_acceptance", hidden_result["ok"]))
 
         ok = all(value for _, value in checks)
         data = {"checks": dict(checks), "task_id": state.task_id}
@@ -34,10 +39,85 @@ class Verifier:
             data["compile_error"] = compile_error
         if tests_output:
             data["test_output"] = tests_output
+        if hidden_result is not None:
+            data["hidden_acceptance"] = hidden_result
         summary = "Verifier passed." if ok else "Verifier failed."
         result = ToolResult(ok, summary, data)
         self._write_report(result)
         return result
+
+    def _has_success_evidence(self, state: TaskState) -> bool:
+        accepted_types = {
+            "acceptance_command_passed",
+            "initializer_command_passed",
+            "verifier_passed",
+        }
+        for evidence in state.evidence_sources:
+            if not isinstance(evidence, dict):
+                continue
+            evidence_task = str(evidence.get("task_id", ""))
+            if evidence_task and evidence_task != state.task_id:
+                continue
+            if evidence.get("ok") is True and evidence.get("evidence_type") in accepted_types:
+                return True
+        success_markers = ("acceptance command passed", "command exited with code 0", "verifier passed")
+        for node in state.nodes:
+            for evidence in node.get("evidence", []):
+                normalized = str(evidence).strip().lower()
+                if any(marker in normalized for marker in success_markers):
+                    return True
+        return False
+
+    def _requires_hidden_acceptance(self, state: TaskState) -> bool:
+        return any("hidden acceptance" in str(item).lower() for item in state.acceptance_criteria)
+
+    def _benchmark_id(self) -> str | None:
+        benchmark_root = (self.root / "state" / "benchmarks").resolve()
+        try:
+            relative = self.state_dir.resolve().relative_to(benchmark_root)
+        except ValueError:
+            return None
+        if len(relative.parts) != 1:
+            return None
+        benchmark_id = relative.parts[0]
+        if not benchmark_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in benchmark_id):
+            return None
+        return benchmark_id
+
+    def _run_benchmark_hidden_acceptance(self) -> dict[str, Any]:
+        benchmark_id = self._benchmark_id()
+        script = self.root / "eval" / "benchmarks" / str(benchmark_id) / "hidden_acceptance.py"
+        if not benchmark_id or not script.is_file():
+            return {
+                "ok": False,
+                "configured": False,
+                "returncode": None,
+                "summary": "Benchmark hidden acceptance is not configured.",
+            }
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+        except Exception:
+            return {
+                "ok": False,
+                "configured": True,
+                "returncode": None,
+                "summary": "Benchmark hidden acceptance could not be executed.",
+            }
+        ok = completed.returncode == 0
+        return {
+            "ok": ok,
+            "configured": True,
+            "returncode": completed.returncode,
+            "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
+        }
 
     def validate_contract(self, contract: dict[str, Any]) -> ToolResult:
         checks = []
@@ -111,6 +191,14 @@ class Verifier:
 
     def _compile_agent(self) -> tuple[bool, str | None]:
         try:
+            benchmark_id = self._benchmark_id()
+            if benchmark_id:
+                workspace = self.root / "eval" / "benchmarks" / benchmark_id / "workspace"
+                if not workspace.is_dir():
+                    return True, None
+                for path in workspace.rglob("*.py"):
+                    py_compile.compile(str(path), doraise=True)
+                return True, None
             for path in (self.root / "agent").glob("*.py"):
                 py_compile.compile(str(path), doraise=True)
             for path in (self.root / "agent" / "tools").glob("*.py"):
@@ -120,6 +208,8 @@ class Verifier:
         return True, None
 
     def _run_tests(self) -> tuple[bool, str]:
+        if self._benchmark_id():
+            return True, "Benchmark acceptance commands are verified from structured task evidence."
         tests_dir = self.root / "tests"
         if not tests_dir.exists():
             return True, "No tests directory found."

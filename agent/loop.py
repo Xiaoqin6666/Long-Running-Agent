@@ -75,13 +75,13 @@ class AgentLoop:
         self.trace_path = self.trace_dir / self._trace_name()
         self.context_builder = ContextBuilder(root, state_dir=self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
-        self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path)
+        self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path, benchmark_id=self.benchmark_id)
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
             "bash": BashTool(root),
             "edit": EditTool(root),
-            "git": GitTool(root),
+            "git": GitTool(root, allow_write=self.benchmark_id is None),
             "list_files": ListFilesTool(root),
             "read": ReadTool(root),
             "search": SearchTool(root),
@@ -1485,6 +1485,7 @@ class AgentLoop:
         state.last_observation = observation.to_dict()
 
         name = action.get("action")
+        active_task_id = self._active_task_id(state)
         if name == "contract" and observation.ok:
             contract = dict(observation.data["contract"])
             contract.setdefault("status", "agreed")
@@ -1523,6 +1524,13 @@ class AgentLoop:
                     "action": name,
                     "target": str(action.get("target", "")),
                     "summary": observation.summary,
+                    "task_id": active_task_id,
+                    "evidence_type": (
+                        "initializer_command_passed"
+                        if name == "bash" and self._is_initializer_verification_command(action, state)
+                        else "initializer_artifact_observation"
+                    ),
+                    "ok": True,
                 }
             )
             if state.nodes:
@@ -1531,6 +1539,23 @@ class AgentLoop:
                 state.initializer_command_passed = False
             elif name == "bash" and self._is_initializer_verification_command(action, state):
                 state.initializer_command_passed = True
+        elif (
+            name == "bash"
+            and observation.ok
+            and self._is_contract_command(
+                str(observation.data.get("command") or action.get("target", "")),
+                state,
+            )
+        ):
+            command = str(observation.data.get("command") or action.get("target", ""))
+            self._record_success_evidence(
+                state,
+                task_id=active_task_id,
+                action="bash",
+                target=self._canonical_contract_command(command, state),
+                summary=observation.summary,
+                evidence_type="acceptance_command_passed",
+            )
         elif name in {"list_files", "read", "search", "bash", "git", "edit", "write"} and observation.ok and len(state.nodes) > 1:
             state.evidence_sources.append(
                 {
@@ -1570,7 +1595,56 @@ class AgentLoop:
                 if node["status"] != "done":
                     node["status"] = "done"
                     node["evidence"].append("finish verifier passed")
+        if name == "verify" and observation.ok:
+            self._record_success_evidence(
+                state,
+                task_id=active_task_id,
+                action="verify",
+                target=active_task_id,
+                summary=observation.summary,
+                evidence_type="verifier_passed",
+            )
         self._update_pending_repair(state, action, observation)
+
+    def _record_success_evidence(
+        self,
+        state: TaskState,
+        *,
+        task_id: str,
+        action: str,
+        target: str,
+        summary: str,
+        evidence_type: str,
+    ) -> None:
+        record = {
+            "action": action,
+            "target": target,
+            "summary": summary,
+            "task_id": task_id,
+            "evidence_type": evidence_type,
+            "ok": True,
+        }
+        duplicate = any(
+            isinstance(item, dict)
+            and item.get("task_id") == task_id
+            and item.get("evidence_type") == evidence_type
+            and item.get("target") == target
+            for item in state.evidence_sources
+        )
+        if not duplicate:
+            state.evidence_sources.append(record)
+        node_summary = (
+            "Acceptance command passed."
+            if evidence_type == "acceptance_command_passed"
+            else "Verifier passed."
+        )
+        for node in state.nodes:
+            if str(node.get("id", "")) != task_id:
+                continue
+            evidence = node.setdefault("evidence", [])
+            if node_summary not in evidence:
+                evidence.append(node_summary)
+            break
 
     def _update_pending_repair(self, state: TaskState, action: dict[str, Any], observation: ToolResult) -> None:
         name = action.get("action")

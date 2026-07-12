@@ -122,6 +122,10 @@ class ContextBuilder:
             "- If an agreed acceptance contract already exists for the current task, do not submit another contract unless the verifier rejected it.",
             "- Completion requires verifier evidence; do not self-certify completion.",
         ]
+        if self.state_dir != self.root / "state":
+            lines.append(
+                "- Benchmark isolation: Git is read-only. Never run git add or git commit, and never try to clean the host Agent repository."
+            )
         return "\n".join(lines)
 
     def _always_on_context(self, state: TaskState) -> str:
@@ -148,6 +152,10 @@ class ContextBuilder:
             "Worker cannot mark tasks completed. Only Verifier PASS followed by Orchestrator state transition may complete a task.",
             "Avoid Unix-only commands such as head, grep, sed, and find unless you know they exist.",
         ]
+        if self.state_dir != self.root / "state":
+            lines.append(
+                "Benchmark isolation: Git is read-only; host Agent repository cleanliness and commits are outside this benchmark."
+            )
         return "\n".join(lines)
 
     def _startup_context(self, state: TaskState | None = None) -> str:
@@ -601,6 +609,14 @@ class ContextBuilder:
                     "A repair was attempted for the failed acceptance command. "
                     f"Next action must be bash target='{command}' to rerun the same acceptance command. "
                     "Do not list directories or continue editing until this command is rerun."
+                )
+            if not repair_targets:
+                command = str(state.pending_repair.get("command", ""))
+                return (
+                    "The last acceptance or verification command failed, but no mutable repair target is available. "
+                    "Do not attempt to edit a frozen or contract-owned test artifact. "
+                    f"Repair or replace the acceptance command, then rerun bash target='{command}'. "
+                    f"Failure excerpt: {excerpt}"
                 )
             return (
                 "The last acceptance or verification command failed. "

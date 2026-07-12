@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,9 +35,15 @@ class TerminationResult:
 
 
 class ProjectTerminator:
-    def __init__(self, root: Path, tasks_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        tasks_path: Path | None = None,
+        benchmark_id: str | None = None,
+    ) -> None:
         self.root = root
         self.tasks_path = tasks_path or root / "tasks.json"
+        self.benchmark_id = benchmark_id
 
     def evaluate(self, signals: dict[str, Any] | None = None) -> TerminationResult:
         signals = signals or {}
@@ -63,12 +70,35 @@ class ProjectTerminator:
         return [task for task in tasks if isinstance(task, dict)]
 
     def _run_regression(self) -> dict[str, Any]:
+        if self.benchmark_id:
+            return {
+                "ok": True,
+                "skipped": True,
+                "summary": "Host Agent regression is outside benchmark scope; task verification and benchmark hidden acceptance provide benchmark evidence.",
+            }
         compile_result = run_command(["python", "-m", "compileall", "agent", "eval", "tests"], self.root)
         test_result = run_command(["python", "-m", "unittest", "discover", "-s", "tests"], self.root)
         ok = compile_result["ok"] and test_result["ok"]
         return {"ok": ok, "compile": compile_result, "tests": test_result}
 
     def _run_hidden_acceptance(self) -> dict[str, Any]:
+        if self.benchmark_id:
+            script = self.root / "eval" / "benchmarks" / self.benchmark_id / "hidden_acceptance.py"
+            if not script.is_file():
+                return {
+                    "ok": False,
+                    "configured": False,
+                    "returncode": None,
+                    "summary": "Benchmark hidden acceptance is not configured.",
+                }
+            result = run_command([sys.executable, str(script)], self.root, timeout=180)
+            ok = bool(result.get("ok"))
+            return {
+                "ok": ok,
+                "configured": True,
+                "returncode": result.get("returncode"),
+                "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
+            }
         config_path = self.root / "eval" / "hidden_acceptance.json"
         if not config_path.exists():
             return {
@@ -81,10 +111,21 @@ class ProjectTerminator:
         if not isinstance(command, list) or not command:
             return {"ok": False, "configured": True, "summary": "Hidden acceptance command is empty."}
         result = run_command([str(item) for item in command], self.root, timeout=int(data.get("timeout", 120)))
-        result["configured"] = True
-        return result
+        ok = bool(result.get("ok"))
+        return {
+            "ok": ok,
+            "configured": True,
+            "returncode": result.get("returncode"),
+            "summary": "Hidden acceptance passed." if ok else "Hidden acceptance failed.",
+        }
 
     def _git_clean(self) -> dict[str, Any]:
+        if self.benchmark_id:
+            return {
+                "ok": True,
+                "skipped": True,
+                "summary": "Host Agent repository cleanliness is outside benchmark scope.",
+            }
         result = run_command(["git", "status", "--short"], self.root)
         if not result["ok"]:
             return result
