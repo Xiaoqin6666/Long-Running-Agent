@@ -46,6 +46,8 @@ Acceptance contract rules:
 
 - Use `contract` before the first `write` action for a coding task.
 - The contract must define the active task id, scope, expected behavior, checks, required evidence, and forbidden shortcuts.
+- The contract action must include `args.task_id`, `args.summary`, and a non-empty `args.checks` list.
+- At least one check should be behavior-level, such as a unit test, smoke command, hidden acceptance script, or CLI behavior check.
 - The contract is an agreement with the Verifier. Do not shape the contract only around the implementation you already prefer.
 - If the Verifier or harness rejects the contract, revise the contract before coding.
 - Do not use `write` to generate code when no contract exists for the active task.

@@ -1,0 +1,144 @@
+﻿{
+  "project": "Issue Tracker Long-Running Evaluation",
+  "initializer_has_run": true,
+  "tasks": [
+    {
+      "id": "IT1",
+      "title": "Create issue tracker project skeleton",
+      "priority": 1,
+      "depends_on": [],
+      "status": "pending",
+      "acceptance_criteria": [
+        "Project files are created under eval/benchmarks/issue_tracker/workspace.",
+        "Package directory and tests directory exist.",
+        "README describes intended CLI commands."
+      ],
+      "expected_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/issue_tracker/__init__.py",
+        "eval/benchmarks/issue_tracker/workspace/tests/__init__.py",
+        "eval/benchmarks/issue_tracker/workspace/README.md"
+      ],
+      "verification_commands": [
+        "python -c \"import os; assert os.path.isdir('eval/benchmarks/issue_tracker/workspace/issue_tracker') and os.path.isfile('eval/benchmarks/issue_tracker/workspace/issue_tracker/__init__.py') and os.path.isdir('eval/benchmarks/issue_tracker/workspace/tests') and os.path.isfile('eval/benchmarks/issue_tracker/workspace/tests/__init__.py') and os.path.isfile('eval/benchmarks/issue_tracker/workspace/README.md')\""
+      ],
+      "evidence": []
+    },
+    {
+      "id": "IT2",
+      "title": "Implement JSON persistence layer",
+      "priority": 2,
+      "depends_on": [
+        "IT1"
+      ],
+      "status": "pending",
+      "acceptance_criteria": [
+        "Store can create, list, get, update, and delete issues.",
+        "Issue ids are deterministic increasing integers.",
+        "Persistence survives reloading the JSON file.",
+        "Unit tests cover store behavior."
+      ],
+      "expected_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/issue_tracker/store.py",
+        "eval/benchmarks/issue_tracker/workspace/tests/test_store.py"
+      ],
+      "implementation_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/issue_tracker/store.py"
+      ],
+      "worker_test_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_store.py"
+      ],
+      "acceptance_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_store.py"
+      ],
+      "frozen_acceptance_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_store.py"
+      ],
+      "test_policy": {
+        "worker_tests_mutable_until_contract_freeze": true,
+        "acceptance_tests_mutable_by_worker": false,
+        "acceptance_test_repair_requires_verifier_approval": true
+      },
+      "verification_commands": [
+        "python -m unittest discover -s eval/benchmarks/issue_tracker/workspace/tests"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "IT3",
+      "title": "Implement CLI commands",
+      "priority": 3,
+      "depends_on": [
+        "IT2"
+      ],
+      "status": "pending",
+      "acceptance_criteria": [
+        "CLI supports create, list, show, update, and delete.",
+        "CLI accepts a --data-file option for tests.",
+        "CLI returns nonzero for invalid ids or invalid commands.",
+        "CLI tests cover success and failure paths."
+      ],
+      "expected_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/issue_tracker/cli.py",
+        "eval/benchmarks/issue_tracker/workspace/tests/test_cli.py"
+      ],
+      "implementation_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/issue_tracker/cli.py"
+      ],
+      "worker_test_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_cli.py"
+      ],
+      "acceptance_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_cli.py"
+      ],
+      "frozen_acceptance_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/tests/test_cli.py"
+      ],
+      "test_policy": {
+        "worker_tests_mutable_until_contract_freeze": true,
+        "acceptance_tests_mutable_by_worker": false,
+        "acceptance_test_repair_requires_verifier_approval": true
+      },
+      "verification_commands": [
+        "python -m unittest discover -s eval/benchmarks/issue_tracker/workspace/tests"
+      ]
+    },
+    {
+      "id": "IT4",
+      "title": "Add documentation and examples",
+      "priority": 4,
+      "depends_on": [
+        "IT3"
+      ],
+      "status": "pending",
+      "acceptance_criteria": [
+        "README includes setup-free run instructions.",
+        "README includes example create/list/update/delete commands.",
+        "README explains where data is stored."
+      ],
+      "expected_artifacts": [
+        "eval/benchmarks/issue_tracker/workspace/README.md"
+      ],
+      "verification_commands": [
+        "python -m unittest discover -s eval/benchmarks/issue_tracker/workspace/tests"
+      ]
+    },
+    {
+      "id": "IT5",
+      "title": "Pass task-specific hidden acceptance",
+      "priority": 5,
+      "depends_on": [
+        "IT4"
+      ],
+      "status": "pending",
+      "acceptance_criteria": [
+        "python -m unittest discover -s eval/benchmarks/issue_tracker/workspace/tests passes.",
+        "python eval/benchmarks/issue_tracker/hidden_acceptance.py passes.",
+        "Trace and metrics are generated for the run."
+      ],
+      "verification_commands": [
+        "python -m unittest discover -s eval/benchmarks/issue_tracker/workspace/tests",
+        "python eval/benchmarks/issue_tracker/hidden_acceptance.py"
+      ]
+    }
+  ]
+}

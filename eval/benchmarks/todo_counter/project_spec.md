@@ -1,4 +1,4 @@
-# Todo Counter Project Specification
+﻿# Todo Counter Project Specification
 
 ## Goal
 
@@ -86,8 +86,8 @@ If the input file does not exist, the CLI should exit with a nonzero status and 
 
 - Use only the Python standard library.
 - Keep the implementation small and easy to inspect.
-- The generated application should live under `eval/workspaces/todo_counter_app/`.
-- Public tests should live under `eval/workspaces/todo_counter_app/tests/`.
+- The generated application should live under `eval/benchmarks/todo_counter/workspace/`.
+- Public tests should live under `eval/benchmarks/todo_counter/workspace/tests/`.
 - The project should be runnable without installing external dependencies.
 - Generated tests may be public contract tests, but once accepted as contract evidence they must be treated as read-only by the Worker unless the verifier explicitly allows test repair.
 
@@ -95,13 +95,13 @@ If the input file does not exist, the CLI should exit with a nonzero status and 
 
 The project is complete only when all of the following are true:
 
-- The package `todo_counter` exists under `eval/workspaces/todo_counter_app/`.
+- The package `todo_counter` exists under `eval/benchmarks/todo_counter/workspace/`.
 - `parse_todos` and `summarize_todos` satisfy the API behavior above.
 - The CLI produces valid JSON summaries.
-- Public tests pass with `python -m unittest discover -s eval/workspaces/todo_counter_app/tests`.
+- Public tests pass with `python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests`.
 - A final hidden acceptance check passes.
 - Agent trace, state, and verifier evidence are written under `state/`.
 
 ## Hidden Acceptance
 
-The evaluation may include hidden acceptance checks not visible to the Worker. Hidden checks may test edge cases such as empty input, whitespace-only input, ignored non-todo lines, CLI JSON validity, and missing-file behavior.
+The evaluation includes a benchmark-local hidden acceptance script at `eval/benchmarks/todo_counter/hidden_acceptance.py`. The Worker should not inspect or modify this file. Hidden checks may test edge cases such as empty input, whitespace-only input, ignored non-todo lines, CLI JSON validity, and missing-file behavior.

@@ -281,8 +281,8 @@ Startup context is loaded when the Worker begins or resumes:
 
 - `project_spec.md`;
 - `tasks.json`;
-- `state/handoff.md`;
-- latest `state/verifier_report.md`;
+- `<active_state_dir>/handoff.md`;
+- latest `<active_state_dir>/verifier_report.md`;
 - recent `git log`;
 - current `git status`.
 
@@ -327,7 +327,8 @@ Persistent memory is split into two levels:
 
 Only Hard Memory can be used as evidence for completion or recovery decisions. Soft Memory can guide what to inspect next, but it must be verified before promotion.
 
-When context grows too large, the harness creates `state/handoff.md`:
+When context grows too large, the harness creates `<active_state_dir>/handoff.md`.
+For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>/`; for ordinary non-benchmark runs it remains `state/`.
 
 ```text
 # Handoff
@@ -371,9 +372,9 @@ Raw logs are not passed to the model unless needed; they remain in trace files.
 
 For experiments, the harness intentionally uses a small Worker session budget even if the underlying model supports a larger context window:
 
-- `session_budget_tokens = 16000`
-- `handoff_threshold = 0.7`
-- `threshold_tokens = 11200`
+- `session_budget_tokens = 64000`
+- `handoff_threshold = 0.75`
+- `threshold_tokens = 24000`
 
 The budget is estimated with a lightweight heuristic rather than an exact tokenizer. This is sufficient for controlled experiments because the goal is to force context-boundary behavior consistently.
 
@@ -381,29 +382,33 @@ When the threshold is reached:
 
 - the Worker must not start new large edits;
 - `write` actions are rejected;
-- the current session writes `state/handoff.md`;
+- the current session writes `<active_state_dir>/handoff.md` as a concise resume index;
+- full structured handoff data is written separately to `<active_state_dir>/handoff_payload.json`;
 - the next session must rebuild context from persisted state, handoff, memory, contracts, and relevant source files.
+
+The threshold is not the model provider's real context limit. It is an artificial experiment budget: `session_budget_tokens * handoff_threshold`. With the default `64000 * 0.75`, the Worker prepares handoff after roughly `48000` estimated tokens. Token usage is estimated by character count, so it is a reproducible control signal rather than an exact tokenizer count.
 
 ### Detailed Handoff Format
 
-`state/handoff.md` should contain:
+`<active_state_dir>/handoff.md` should contain concise resume information and references:
 
 1. User goal.
 2. Session budget: budget, threshold, estimated usage, and handoff flag.
 3. Active task.
-4. Completed tasks and evidence.
-5. Pending or blocked tasks.
-6. Acceptance contracts.
-7. Evidence sources inspected in this session.
-8. Hard Memory.
-9. Soft Memory.
-10. Last action.
-11. Last observation.
-12. Verification status.
-13. Known risks and failed attempts.
-14. Current state summary.
-15. Resume instructions.
-16. Suggested next action.
+4. Structured handoff data references.
+5. Orchestrator decision.
+6. Completed tasks and evidence.
+7. Pending or blocked tasks.
+8. Acceptance contracts.
+9. Evidence sources inspected in this session.
+10. Last step summary.
+11. Verification status.
+12. Known risks and failed attempts.
+13. Current state summary.
+14. Resume instructions.
+15. Suggested next action.
+
+Detailed machine-readable handoff data should be stored in `<active_state_dir>/handoff_payload.json`, not embedded wholesale into `<active_state_dir>/handoff.md`. This keeps the human handoff short while preserving full state for tooling.
 
 This structure is intentionally more detailed than a summary. It is designed to test whether a fresh Worker can continue the task without access to the previous conversation.
 
@@ -547,6 +552,20 @@ All tools return a common structured result:
 ```
 
 Tool outputs must be summarized and saved to trace. Large outputs are truncated in context but stored on disk.
+
+## 11a. Test Ownership And Freeze Policy
+
+Tests are not a single permission class. The task graph should separate:
+
+- `implementation_artifacts`: production/source files the Worker repairs first.
+- `worker_test_artifacts`: tests the Worker may create or edit before contract freeze.
+- `acceptance_artifacts`: tests or scripts used as agreed contract evidence.
+- `frozen_acceptance_artifacts`: acceptance evidence that the Worker may read but not modify.
+- `hidden_acceptance`: final evaluator checks unavailable to the Worker.
+
+Once a test becomes frozen acceptance evidence, failed verification should drive repairs toward implementation artifacts. Test repair is still possible, but it must be explicit: the harness or verifier records `allow_test_repair=true` or a list of allowed test paths in pending repair state, with a reason that the test baseline itself is faulty.
+
+The failed-test repair gate preserves already-read diagnostic files across repeated failures. If the Worker has already read both the failing acceptance test and the relevant implementation file, the next action should be `write` or `edit` on the implementation target, not another read/list/test cycle.
 
 ## 12. Baselines and Ablations
 

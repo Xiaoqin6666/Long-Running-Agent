@@ -5,6 +5,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+DEFAULT_SESSION_BUDGET_TOKENS = 64000
+DEFAULT_HANDOFF_THRESHOLD = 0.75
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -23,21 +27,23 @@ class TaskState:
     last_verified_at: str | None = None
     evidence_sources: list[dict[str, Any]] = field(default_factory=list)
     acceptance_contracts: list[dict[str, Any]] = field(default_factory=list)
-    session_budget_tokens: int = 16000
-    handoff_threshold: float = 0.7
+    session_budget_tokens: int = DEFAULT_SESSION_BUDGET_TOKENS
+    handoff_threshold: float = DEFAULT_HANDOFF_THRESHOLD
     session_used_tokens: int = 0
     handoff_ready: bool = False
     orchestrator_decision: dict[str, Any] = field(default_factory=dict)
+    pending_repair: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
         data.setdefault("evidence_sources", [])
         data.setdefault("acceptance_contracts", [])
-        data.setdefault("session_budget_tokens", 16000)
-        data.setdefault("handoff_threshold", 0.7)
+        data.setdefault("session_budget_tokens", DEFAULT_SESSION_BUDGET_TOKENS)
+        data.setdefault("handoff_threshold", DEFAULT_HANDOFF_THRESHOLD)
         data.setdefault("session_used_tokens", 0)
         data.setdefault("handoff_ready", False)
         data.setdefault("orchestrator_decision", {})
+        data.setdefault("pending_repair", {})
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +65,7 @@ class TaskState:
             "session_used_tokens": self.session_used_tokens,
             "handoff_ready": self.handoff_ready,
             "orchestrator_decision": self.orchestrator_decision,
+            "pending_repair": self.pending_repair,
         }
 
     def summary(self) -> str:
@@ -99,6 +106,63 @@ def create_initial_state(task: str) -> TaskState:
     return TaskState(
         task_id="current",
         user_goal=task,
+        acceptance_criteria=acceptance_criteria,
+        nodes=nodes,
+    )
+
+
+def create_initializer_state(
+    project_spec: str,
+    project_spec_artifact: str = "project_spec.md",
+    generated_tasks_artifact: str = "state/generated_tasks.json",
+    init_artifact: str = "init.sh",
+) -> TaskState:
+    acceptance_criteria = [
+        f"The project specification is materialized as {project_spec_artifact}.",
+        f"A structured task graph is generated at {generated_tasks_artifact}.",
+        "The task graph contains executable tasks with ids, dependencies, priorities, statuses, acceptance criteria, expected artifacts, and verification commands.",
+        f"An init script is generated at {init_artifact} with repeatable setup or smoke-test commands.",
+    ]
+    verification_command = (
+        "python -c \"import json, pathlib; "
+        f"data=json.loads(pathlib.Path('{generated_tasks_artifact}').read_text(encoding='utf-8')); "
+        "assert isinstance(data.get('tasks'), list) and data['tasks']; "
+        f"assert pathlib.Path('{project_spec_artifact}').is_file(); "
+        f"assert pathlib.Path('{init_artifact}').is_file()\""
+    )
+    nodes = [
+        {
+            "id": "INIT",
+            "title": "Initialize project plan from project specification",
+            "status": "in_progress",
+            "evidence": [],
+            "depends_on": [],
+            "priority": 0,
+            "expected_artifacts": [
+                project_spec_artifact,
+                generated_tasks_artifact,
+                init_artifact,
+            ],
+            "implementation_artifacts": [
+                generated_tasks_artifact,
+                init_artifact,
+            ],
+            "worker_test_artifacts": [],
+            "acceptance_artifacts": [],
+            "frozen_acceptance_artifacts": [],
+            "test_policy": {
+                "worker_tests_mutable_until_contract_freeze": True,
+                "acceptance_tests_mutable_by_worker": False,
+                "acceptance_test_repair_requires_verifier_approval": True,
+            },
+            "verification_commands": [
+                verification_command
+            ],
+        }
+    ]
+    return TaskState(
+        task_id="INIT",
+        user_goal="INIT: Generate project plan from project_spec.md",
         acceptance_criteria=acceptance_criteria,
         nodes=nodes,
     )

@@ -32,10 +32,11 @@ class Orchestrator:
     It only chooses the next Worker-ready task from durable task state.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, tasks_path: Path | None = None, state_dir: Path | None = None) -> None:
         self.root = root
-        self.tasks_path = root / "tasks.json"
-        self.verifier_report_path = root / "state" / "verifier_report.md"
+        self.tasks_path = tasks_path or root / "tasks.json"
+        self.state_dir = state_dir or root / "state"
+        self.verifier_report_path = self.state_dir / "verifier_report.md"
 
     def choose_current_task(self) -> TaskSelection:
         tasks = self.load_tasks()

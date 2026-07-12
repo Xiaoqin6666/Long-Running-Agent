@@ -12,14 +12,15 @@ from agent.tools import ToolResult
 
 
 class Verifier:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, state_dir: Path | None = None) -> None:
         self.root = root
+        self.state_dir = state_dir or root / "state"
 
     def run(self, profile: str, state: TaskState) -> ToolResult:
         del profile
         checks = []
-        checks.append(("state_dir_exists", (self.root / "state").exists()))
-        checks.append(("trace_dir_exists", (self.root / "state" / "traces").exists()))
+        checks.append(("state_dir_exists", self.state_dir.exists()))
+        checks.append(("trace_dir_exists", (self.state_dir / "traces").exists()))
         checks.append(("has_plan_nodes", bool(state.nodes)))
         checks.append(("has_evidence", any(node["evidence"] for node in state.nodes)))
         compile_ok, compile_error = self._compile_agent()
@@ -114,15 +115,14 @@ class Verifier:
         return completed.returncode == 0, output[-4000:]
 
     def _write_report(self, result: ToolResult) -> None:
-        state_dir = self.root / "state"
-        state_dir.mkdir(exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "time": datetime.now(timezone.utc).isoformat(),
             "ok": result.ok,
             "summary": result.summary,
             "data": result.data,
         }
-        (state_dir / "verifier_report.md").write_text(
+        (self.state_dir / "verifier_report.md").write_text(
             "# Latest Verifier Report\n\n"
             + "```json\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)

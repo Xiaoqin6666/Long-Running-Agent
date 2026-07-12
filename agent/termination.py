@@ -34,8 +34,9 @@ class TerminationResult:
 
 
 class ProjectTerminator:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, tasks_path: Path | None = None) -> None:
         self.root = root
+        self.tasks_path = tasks_path or root / "tasks.json"
 
     def evaluate(self, signals: dict[str, Any] | None = None) -> TerminationResult:
         signals = signals or {}
@@ -52,7 +53,7 @@ class ProjectTerminator:
         return decide_termination(checks)
 
     def _load_tasks(self) -> list[dict[str, Any]]:
-        path = self.root / "tasks.json"
+        path = self.tasks_path
         if not path.exists():
             return []
         data = json.loads(path.read_text(encoding="utf-8"))

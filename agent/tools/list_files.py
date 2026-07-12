@@ -16,7 +16,11 @@ class ListFilesTool(WorkspaceTool):
         try:
             path = self.resolve_path(target)
             if not path.exists():
-                return ToolResult(False, "List failed: path does not exist.", {"target": target})
+                return ToolResult(
+                    False,
+                    "List failed: path does not exist. If this task is to create the path and an acceptance contract exists, use write to create the first required file instead of listing again.",
+                    {"target": target, "missing_path": True, "recommended_action": "write"},
+                )
             if path.is_file():
                 rel = str(path.relative_to(self.root))
                 return ToolResult(True, f"Listed file '{target}'.", {"target": target, "entries": [entry_dict(rel, "file")]})

@@ -7,12 +7,33 @@ from typing import Any
 
 
 def load_events(path: Path) -> list[dict]:
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    try:
+        loaded = json.loads(text)
+        return loaded if isinstance(loaded, list) else [loaded]
+    except json.JSONDecodeError:
+        pass
+
     events = []
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            event, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            line = text[index:].splitlines()[0].strip()
+            if not line:
+                index += 1
+                continue
+            event = json.loads(line)
+            index += len(line)
+        events.append(event)
     return events
 
 

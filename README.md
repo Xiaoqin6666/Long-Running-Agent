@@ -12,6 +12,7 @@ The current design focuses on a minimal but research-friendly agent harness:
 
 See [docs/problem3_agent_framework.md](docs/problem3_agent_framework.md) for the full framework design.
 See [docs/system_prompts.md](docs/system_prompts.md) for role-specific Main Agent, Planner, and Verifier system prompts.
+See [docs/evaluation_runbook.md](docs/evaluation_runbook.md) for the long-running evaluation task.
 
 ## Planned Milestones
 
@@ -32,7 +33,7 @@ python -m agent.main "Smoke test the minimal long-running agent" --max-steps 5
 Summarize a trace:
 
 ```powershell
-python eval\metrics.py state\traces\<trace-file>.jsonl --tasks tasks.json
+python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl --tasks state\benchmarks\issue_tracker\runtime_tasks.json
 ```
 
 Run behavior tests:
@@ -44,7 +45,7 @@ python -m unittest discover -s tests
 Run hidden acceptance:
 
 ```powershell
-python eval\hidden_acceptance.py
+python eval\benchmarks\issue_tracker\hidden_acceptance.py
 ```
 
 The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.

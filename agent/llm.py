@@ -159,13 +159,35 @@ def parse_action_json(text: str) -> dict[str, Any]:
         match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
         if match:
             text = match.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Model did not return valid JSON: {text[:500]}") from exc
+    data = _loads_json_object(text)
+    if data is None:
+        extracted = _extract_first_json_object(text)
+        if extracted is not None:
+            data = _loads_json_object(extracted)
+    if data is None:
+        raise ValueError(f"Model did not return valid JSON: {text[:500]}")
     if not isinstance(data, dict):
         raise ValueError("Model action must be a JSON object.")
     return data
+
+
+def _loads_json_object(text: str) -> Any | None:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        _, end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return text[start : start + end]
 
 
 def validate_action(action: dict[str, Any], state: TaskState) -> dict[str, Any]:
