@@ -1,107 +1,105 @@
-# Todo Counter Project Specification
+# Long-Running Agent Project Specification
 
 ## Goal
 
-Build a small Python command-line project named `todo_counter` that parses plain-text todo lists and reports completion counts.
+Build a research-oriented coding-agent harness that can plan, implement, verify, hand off, resume, and evaluate work across multiple model context windows with minimal human intervention.
 
-The project is intended as a long-running agent evaluation task. The agent should plan the work, create the project structure, implement the behavior, write public tests, run verification, and leave durable state and trace evidence.
+## Roles
 
-## Input Format
+- Initializer / Planner converts a project specification into a durable task graph and run-local initializer entrypoint.
+- Orchestrator selects exactly one ready task and owns task-state transitions.
+- Worker executes one selected coding task at a time.
+- Verifier independently evaluates acceptance evidence and is the only role that can authorize completion.
+- Project Terminator distinguishes successful completion, stopped-with-failure, and human-intervention outcomes.
 
-The core parser receives a text string containing zero or more lines.
+## Repository Bootstrap Artifacts
 
-Supported todo lines:
+These tracked root files describe and bootstrap the Long-Running Agent harness itself:
+
+- `project_spec.md`: this framework specification.
+- `tasks.json`: the framework's own development task graph.
+- `init.sh`: static repository setup, test, compile, and smoke entrypoint.
+
+Benchmark agents must not overwrite these files.
+
+## Benchmark Inputs
+
+Each benchmark owns an input directory:
 
 ```text
-[ ] buy milk
-[x] write report
-[ ] call Alice
+eval/benchmarks/<benchmark_id>/
+  project_spec.md or task.md
+  tasks.json                 # optional preplanned source graph
+  hidden_acceptance.py       # evaluator-owned; Worker cannot read or modify
+  workspace/                 # generated application and public tests
 ```
 
-Rules:
+The source project specification and preplanned task graph are read-only benchmark inputs.
 
-- `[ ]` means the task is open.
-- `[x]` means the task is done.
-- Leading and trailing whitespace around a line should be ignored.
-- Empty lines should be ignored.
-- Lines that do not match the todo marker format should be ignored.
-- Todo item text is the remaining text after the marker, stripped of surrounding whitespace.
+## Benchmark Runtime State
 
-## Required Python API
+Every benchmark run is isolated under:
 
-The package must expose these functions:
-
-```python
-from todo_counter.core import parse_todos, summarize_todos
+```text
+state/benchmarks/<benchmark_id>/
+  project_spec.md
+  generated_tasks.json       # autonomous Initializer flow
+  runtime_tasks.json         # copied preplanned graph
+  init.sh                    # run-local POSIX shell initializer entrypoint
+  current_task.json
+  handoff.md
+  handoff_payload.json
+  verifier_report.md
+  memory.md
+  hard_memory.md
+  soft_memory.md
+  skills/
+  traces/
 ```
 
-`parse_todos(text: str) -> list[dict]`
+The run-local `init.sh` is distinct from the repository-root `init.sh`. It must begin with `#!/usr/bin/env sh` and `set -eu`. It may invoke Python commands, but it must not contain Python source code or create an application workspace under `state/`.
 
-Return a list of dictionaries, one per parsed todo item:
+## Initializer Rules
 
-```python
-[
-    {"done": False, "text": "buy milk"},
-    {"done": True, "text": "write report"}
-]
-```
+- INIT may write only the three paths named by its active task: the materialized project specification, generated task graph, and run-local init script.
+- INIT does not require a Worker acceptance contract.
+- INIT cannot write application code, public tests, skeleton files, or workspace files.
+- INIT cannot terminate through `answer` or `finish`.
+- The required transition is `artifacts_ready -> verification_command_passed -> verifier_passed -> first_worker_scheduled`.
+- Generated task artifacts must remain under the workspace root declared by the benchmark project specification.
+- Generated task commands must respect dependency and runtime constraints from the specification and must not contain placeholder checks.
 
-`summarize_todos(items: list[dict]) -> dict`
+## Worker And Verifier Rules
 
-Return:
+- The Worker acts only on the Orchestrator-selected task.
+- Coding starts only after Worker and Verifier agree on an implementation-independent acceptance contract.
+- Worker may not mark a task completed.
+- Worker-owned tests may be edited before contract freeze.
+- Frozen acceptance tests are read-only unless Verifier explicitly authorizes repair.
+- Hidden acceptance tests remain evaluator-owned and inaccessible to Worker.
+- Verifier PASS followed by an Orchestrator transition is required for task completion.
 
-```python
-{
-    "total": 2,
-    "done": 1,
-    "open": 1
-}
-```
+## Context And Memory
 
-## Required CLI
+- Always-on context contains stable role, task, tool, and completion rules.
+- Startup context restores benchmark-local specification, task graph, handoff, verifier report, and Git state.
+- Just-in-time context is gathered through list, search, read, and test-error evidence.
+- Persistent context stores task status, verified facts, architecture decisions, failed attempts, verifier reports, commits, and next actions.
+- Hard Memory contains only evidence-backed state.
+- Soft Memory contains hypotheses, suspected causes, reflection, and suggested next actions.
+- Skills are promoted only from verifier-confirmed success or evidence-confirmed failure.
 
-The project must support:
+## Long-Running Behavior
 
-```powershell
-python -m todo_counter.cli path\to\todos.txt
-```
+- Default Worker session budget is 64K estimated tokens.
+- Handoff preparation begins at 75% of the session budget.
+- A session past the threshold must not start a large new edit.
+- Handoff must preserve active task, budget, evidence, failures, contracts, verifier state, and resume instructions.
 
-Default stdout must be compact JSON:
+## Project Completion
 
-```json
-{"total":3,"done":1,"open":2}
-```
+Successful completion requires all required tasks completed, no unresolved blocked task, regression tests passing, hidden acceptance passing, and a clean runnable repository.
 
-The CLI must also support:
+Budget exhaustion, repeated critical failure, unrecoverable environment failure, all remaining tasks blocked, or repeated no-progress sessions produce `stopped_with_failure`.
 
-```powershell
-python -m todo_counter.cli path\to\todos.txt --pretty
-```
-
-Pretty mode stdout must be indented JSON.
-
-If the input file does not exist, the CLI should exit with a nonzero status and print a helpful error to stderr.
-
-## Project Constraints
-
-- Use only the Python standard library.
-- Keep the implementation small and easy to inspect.
-- The generated application should live under `eval/workspaces/todo_counter_app/`.
-- Public tests should live under `eval/workspaces/todo_counter_app/tests/`.
-- The project should be runnable without installing external dependencies.
-- Generated tests may be public contract tests, but once accepted as contract evidence they must be treated as read-only by the Worker unless the verifier explicitly allows test repair.
-
-## Verifiable Completion Conditions
-
-The project is complete only when all of the following are true:
-
-- The package `todo_counter` exists under `eval/workspaces/todo_counter_app/`.
-- `parse_todos` and `summarize_todos` satisfy the API behavior above.
-- The CLI produces valid JSON summaries.
-- Public tests pass with `python -m unittest discover -s eval/workspaces/todo_counter_app/tests`.
-- A final hidden acceptance check passes.
-- Agent trace, state, and verifier evidence are written under `state/`.
-
-## Hidden Acceptance
-
-The evaluation may include hidden acceptance checks not visible to the Worker. Hidden checks may test edge cases such as empty input, whitespace-only input, ignored non-todo lines, CLI JSON validity, and missing-file behavior.
+Missing credentials, irreconcilable requirements, required product decisions, or unavailable external dependencies produce `requires_human_intervention` with a concrete reason.

@@ -102,18 +102,25 @@ The Main Agent works on one active task per loop. It should not mix unrelated ta
 
 ## 4.1 Initializer / Planner
 
-The Initializer runs once at project start and converts the vague request into durable artifacts:
+The Initializer runs once at project start and converts the project specification into run-local durable artifacts:
 
-- `project_spec.md`: project target, constraints, roles, and global completion criteria.
-- `tasks.json`: task ids, dependencies, priority, status, and acceptance criteria.
-- `init.sh`: repeatable setup and validation command.
-- initial Git commit: stable baseline for future experiments.
+- `<active_state_dir>/project_spec.md`: materialized project target, constraints, roles, and global completion criteria.
+- `<active_state_dir>/generated_tasks.json`: generated task ids, dependencies, priority, status, artifact ownership, and acceptance criteria.
+- `<active_state_dir>/init.sh`: run-local POSIX shell setup and validation command.
+
+For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>`. The repository-root `project_spec.md`, `tasks.json`, and `init.sh` describe and bootstrap the Long-Running Agent harness itself; they are not overwritten by a benchmark INIT. Preplanned benchmark source tasks remain read-only and are copied to `<active_state_dir>/runtime_tasks.json`.
+
+INIT is a planning phase, not a coding Worker task, so it does not require an acceptance contract. Its write/edit capability is restricted to the materialized project specification, generated task graph, and init script. It cannot create application code, tests, skeletons, or workspace files, and its shell access is restricted to the deterministic initializer verification command. The harness validates the generated task schema, dependency graph, hidden-test isolation, and project-spec workspace boundary before scheduling the first Worker task.
+
+INIT cannot terminate through `answer` or `finish`. Its fixed transition is `artifacts_ready -> verification_command_passed -> verifier_passed -> first_worker_scheduled`. The command-pass flag is persisted in task state so resume and handoff cannot silently skip or unnecessarily repeat a successful step.
+
+Rejected generated task graphs are retained under `<active_state_dir>/rejected_candidates/generated_tasks.json`. `TaskState.initializer_repair` stores the normalized error signature, detailed errors, and consecutive repeat count. A repeated error count of two activates a repair gate: the next session may read the candidate once and must then edit or overwrite that candidate. A valid repaired candidate is promoted atomically to the active `generated_tasks.json`.
 
 After initialization, the Planner should only update the plan when task state is stale, too coarse, blocked, or contradicted by trace evidence.
 
 ## 4.2 Orchestrator
 
-The Orchestrator is a lightweight scheduler that chooses exactly one Worker task from `tasks.json`. It does not write code, does not run tools for implementation, and does not decide completion. Its output is a durable selection record stored in `TaskState.orchestrator_decision` and shown in context and handoff.
+The Orchestrator is a lightweight scheduler that chooses exactly one Worker task from the active task graph (`runtime_tasks.json` or `generated_tasks.json`). It does not write code, does not run tools for implementation, and does not decide completion. Its output is a durable selection record stored in `TaskState.orchestrator_decision` and shown in context and handoff.
 
 Task states have fixed meanings:
 
@@ -147,7 +154,7 @@ blocked
 
 The Worker cannot directly mark a task `completed`. Only a Verifier PASS can allow the Orchestrator to move a task to `completed`.
 
-The implemented Orchestrator persists task transitions back to `tasks.json`:
+The implemented Orchestrator persists task transitions back to the active runtime or generated task graph:
 
 - scheduling a `pending` task marks it `in_progress`;
 - a `verify` action marks the current task `awaiting_verification`;
@@ -279,8 +286,8 @@ This layer should not contain long project files or raw logs.
 
 Startup context is loaded when the Worker begins or resumes:
 
-- `project_spec.md`;
-- `tasks.json`;
+- `<active_state_dir>/project_spec.md`;
+- `<active_state_dir>/runtime_tasks.json` or `<active_state_dir>/generated_tasks.json`;
 - `<active_state_dir>/handoff.md`;
 - latest `<active_state_dir>/verifier_report.md`;
 - recent `git log`;

@@ -11,7 +11,13 @@ from typing import Any
 from agent.context import ContextBuilder
 from agent.llm import create_decision_maker
 from agent.orchestrator import Orchestrator
-from agent.planner import TaskState, create_initial_state, create_initializer_state
+from agent.planner import (
+    TaskState,
+    create_initial_state,
+    create_initializer_state,
+    validate_generated_task_graph,
+    validate_initializer_script,
+)
 from agent.termination import ProjectTerminator
 from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, SearchTool, ToolResult, WriteTool
 from agent.verifier import Verifier
@@ -65,6 +71,7 @@ class AgentLoop:
         self.memory_path = self.state_dir / "memory.md"
         self.handoff_path = self.state_dir / "handoff.md"
         self.handoff_payload_path = self.state_dir / "handoff_payload.json"
+        self.initializer_candidate_path = self.state_dir / "rejected_candidates" / "generated_tasks.json"
         self.trace_path = self.trace_dir / self._trace_name()
         self.context_builder = ContextBuilder(root, state_dir=self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
@@ -122,17 +129,21 @@ class AgentLoop:
             self._append_trace(step, action, observation, state, model_action=model_action)
             self._write_state(state)
 
-            if action["action"] in {"answer", "finish"} and observation.ok:
+            if (
+                action["action"] in {"answer", "finish"}
+                and observation.ok
+                and not self._is_initializer_task(state)
+            ):
                 completed = True
                 message = observation.data.get("answer", observation.summary)
-                break
-            if state.handoff_ready:
-                self._write_handoff(state)
-                message = "Session handoff threshold reached. Handoff written."
                 break
             if action["action"] == "verify" and observation.ok:
                 self._apply_orchestrator_selection(state)
                 self._write_state(state)
+            if state.handoff_ready:
+                self._write_handoff(state)
+                message = "Session handoff threshold reached. Handoff written."
+                break
 
         if not completed:
             self._write_handoff(state)
@@ -160,7 +171,10 @@ class AgentLoop:
         else:
             state = create_initial_state(self.task)
         self._dedupe_contracts(state)
-        self._apply_orchestrator_selection(state)
+        if self._is_initializer_task(state) and not state.initializer_repair:
+            self._recover_initializer_repair_from_state(state)
+        if not self._is_initializer_task(state):
+            self._apply_orchestrator_selection(state)
         if self.resume and not state.pending_repair:
             self._recover_pending_repair_from_recent_trace(state)
         return state
@@ -227,7 +241,56 @@ class AgentLoop:
                     "counts_as_progress": False,
                 },
             )
+        if name == "required_command_repair":
+            args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+            return ToolResult(
+                False,
+                "Action rejected: the acceptance command has invalid syntax. Run a corrected equivalent bash command before verification or implementation repair.",
+                {
+                    "required_action": "bash_corrected_acceptance_command",
+                    "bad_command": args.get("bad_command", action.get("target", "")),
+                    "failure_summary": args.get("failure_summary", ""),
+                    "counts_as_progress": False,
+                },
+            )
+        if name == "required_initializer_repair":
+            args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+            candidate = str(action.get("target", ""))
+            errors = args.get("errors", [])
+            return ToolResult(
+                False,
+                "INIT repair required: edit or overwrite the saved candidate instead of regenerating the full task graph.",
+                {
+                    "required_action": "edit_or_write_candidate",
+                    "candidate_path": candidate,
+                    "initializer_validation_errors": errors if isinstance(errors, list) else [],
+                    "repeat_count": args.get("repeat_count", 2),
+                    "counts_as_progress": False,
+                },
+            )
+        if name == "blocked_repeat":
+            return ToolResult(
+                False,
+                "Action rejected: do not repeat a failed or no-progress action unchanged; use the handoff suggested next action or explain a blocker.",
+                {
+                    "blocked_repeat": True,
+                    "required_next_action": self._suggest_next_action(state),
+                    "counts_as_progress": False,
+                },
+            )
         if name == "answer":
+            if self._is_initializer_task(state):
+                outputs = self._validate_initializer_outputs()
+                data = dict(outputs.data)
+                data.update({"initializer_requires_verification": True, "counts_as_progress": False})
+                return ToolResult(
+                    False,
+                    outputs.summary if not outputs.ok else (
+                        "INIT answer rejected: Initializer must run its verification command and receive "
+                        "Verifier PASS before handoff to the first Worker task."
+                    ),
+                    data,
+                )
             evidence_ok, evidence_message = self._check_answer_evidence(state)
             if not evidence_ok:
                 return ToolResult(False, evidence_message, {"missing_evidence": True})
@@ -236,8 +299,16 @@ class AgentLoop:
                 return ToolResult(False, "Answer rejected because it was empty.", {})
             return ToolResult(True, "Final answer produced.", {"answer": answer})
         if name == "contract":
+            if self._is_initializer_task(state):
+                return ToolResult(
+                    False,
+                    "INIT does not create an acceptance contract; write only initializer artifacts.",
+                    {"initializer_restricted": True, "allowed_targets": sorted(self._initializer_allowed_targets(state))},
+                )
             return self._validate_contract_action(action)
         if name == "skill":
+            if self._is_initializer_task(state):
+                return ToolResult(False, "Skill promotion is disabled during INIT.", {"initializer_restricted": True})
             return self._handle_skill_action(action, state)
         if name in {"edit", "write"} and state.handoff_ready:
             return ToolResult(
@@ -245,22 +316,58 @@ class AgentLoop:
                 "Write rejected: session is past handoff threshold; generate handoff instead of starting new edits.",
                 {"handoff_ready": True},
             )
-        if name in {"edit", "write"} and not self._has_contract_for_active_task(state):
+        if name in {"edit", "write"} and self._is_initializer_task(state):
+            initializer_check = self._validate_initializer_write_action(action, state)
+            if initializer_check is not None:
+                return initializer_check
+        elif name in {"edit", "write"} and not self._has_contract_for_active_task(state):
             return ToolResult(
                 False,
                 "Write rejected: create an acceptance contract with the verifier before generating code.",
                 {"missing_contract": True},
             )
+        if name == "bash" and self._is_initializer_task(state):
+            allowed_commands = set(self._active_verification_commands(state))
+            if str(action.get("target", "")) not in allowed_commands:
+                return ToolResult(
+                    False,
+                    "INIT may run only its deterministic initializer verification command.",
+                    {"initializer_restricted": True, "allowed_commands": sorted(allowed_commands)},
+                )
         if name == "update_plan":
             return ToolResult(True, "Plan updated by harness.", {"target": action.get("target")})
         if name == "verify":
             task_id = self._active_task_id(state)
+            if self._is_initializer_task(state):
+                if not state.initializer_command_passed:
+                    result = ToolResult(
+                        False,
+                        "Initializer verification rejected: run the deterministic INIT verification command successfully first.",
+                        {
+                            "task_id": task_id,
+                            "initializer_command_passed": False,
+                            "required_command": self._initializer_verification_command(state),
+                        },
+                    )
+                    self.verifier.record_result(result)
+                    return result
+                initializer_result = self._validate_initializer_outputs()
+                if not initializer_result.ok:
+                    initializer_result.data["task_id"] = task_id
+                    self.verifier.record_result(initializer_result)
+                    return initializer_result
             self.orchestrator.mark_awaiting_verification(task_id, "worker submitted candidate for verification")
             result = self.verifier.run(action.get("target", "default"), state)
             result.data["task_id"] = task_id
             self.orchestrator.mark_verified(task_id, result.ok, result.summary)
             return result
         if name == "finish":
+            if self._is_initializer_task(state):
+                return ToolResult(
+                    False,
+                    "INIT finish rejected: only Verifier PASS may complete initialization.",
+                    {"initializer_requires_verification": True, "counts_as_progress": False},
+                )
             termination = self.terminator.evaluate()
             if termination.status == "completed":
                 return ToolResult(True, "Project completed.", termination.to_dict())
@@ -268,9 +375,17 @@ class AgentLoop:
         tool = self.tools.get(str(name))
         if not tool:
             return ToolResult(False, f"Unknown action: {name}", {})
-        return tool.run(action)
+        result = tool.run(action)
+        if result.ok and name in {"edit", "write"} and self._is_initializer_task(state):
+            post_write_check = self._validate_initializer_artifact_after_write(action, state)
+            if post_write_check is not None:
+                return post_write_check
+        return result
 
     def _guard_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any]:
+        initializer_action = self._guard_initializer_progress(action, state)
+        if initializer_action:
+            return initializer_action
         pending_repair_action = self._guard_pending_repair(action, state)
         if pending_repair_action:
             return pending_repair_action
@@ -307,14 +422,22 @@ class AgentLoop:
                 "risk": "low",
                 "guard_override": "smoke_passed_to_verify",
             }
+        resume_action = self._guard_resume_suggested_action(action, state)
+        if resume_action:
+            return resume_action
         if action.get("action") == "write":
             return self._guard_duplicate_create(action, state)
+        repeated_failed_action = self._guard_repeated_failed_action(action, state)
+        if repeated_failed_action and action.get("action") != "list_files":
+            return repeated_failed_action
         if action.get("action") != "list_files":
             return action
+        if self._is_initializer_task(state):
+            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
         if not self._has_contract_for_active_task(state):
             if self._should_create_contract_after_inspection(action, state):
                 return self._synthesize_contract_action(state)
-            return action
+            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
         target = self._next_contract_file_target(state)
         if not target and self._should_rewrite_list_to_write(action, state):
             target = self._next_implementation_file_target(state)
@@ -349,9 +472,9 @@ class AgentLoop:
                     "guard_override": "implementation_files_exist_to_test",
                 }
         if not target:
-            return action
+            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
         if not self._should_rewrite_list_to_write(action, state):
-            return action
+            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
         content = self._initial_content_for_target(target, state)
         if content is None:
             existing = (self.root / target).resolve()
@@ -383,6 +506,98 @@ class AgentLoop:
         guarded["risk"] = "low"
         guarded["guard_override"] = "missing_path_list_files_to_write"
         return guarded
+
+    def _guard_resume_suggested_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        if not self.resume:
+            return None
+        if self._is_initializer_task(state):
+            return None
+        if self._has_contract_for_active_task(state):
+            return None
+        if action.get("action") == "contract":
+            return None
+        if not state.acceptance_criteria:
+            return None
+        active = self._active_node(state)
+        if not active:
+            return None
+        return self._synthesize_contract_action(state)
+
+    def _guard_repeated_failed_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        if state.last_observation.get("ok") is not False:
+            return None
+        if not self._same_action(action, state.last_action):
+            return None
+        return {
+            "thought_summary": (
+                "Guard override: the previous action failed or made no progress. "
+                "Do not repeat it unchanged; follow the handoff suggested next action or choose a repair."
+            ),
+            "action": "blocked_repeat",
+            "target": str(action.get("target", "")),
+            "args": {
+                "previous_action": state.last_action,
+                "previous_observation_summary": state.last_observation.get("summary", ""),
+            },
+            "expected_observation": "Harness rejects unchanged failed actions.",
+            "risk": "low",
+            "guard_override": "failed_action_repeat_blocked",
+        }
+
+    def _guard_repeated_list_files(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        if action.get("action") != "list_files":
+            return None
+        target = self._normalize_target(action.get("target", ""))
+        if not target:
+            return None
+        if self._recent_action_target_count(state, "list_files", target) < 2:
+            return None
+        return {
+            "thought_summary": (
+                "Guard override: list_files has already inspected this target enough times. "
+                "Use the collected evidence or the handoff suggested next action instead of listing again."
+            ),
+            "action": "blocked_repeat",
+            "target": target,
+            "args": {
+                "repeat_limit": 2,
+                "suggested_next_action": self._suggest_next_action(state),
+            },
+            "expected_observation": "Harness rejects repeated directory listings of the same target.",
+            "risk": "low",
+            "guard_override": "list_files_repeat_limit",
+        }
+
+    def _same_action(self, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        if left.get("action") != right.get("action"):
+            return False
+        if self._normalize_target(left.get("target", "")) != self._normalize_target(right.get("target", "")):
+            return False
+        return self._canonical_args(left.get("args", {})) == self._canonical_args(right.get("args", {}))
+
+    def _canonical_args(self, value: object) -> str:
+        try:
+            return json.dumps(value if isinstance(value, dict) else {}, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            return str(value)
+
+    def _recent_action_target_count(self, state: TaskState, action_name: str, target: str) -> int:
+        normalized_target = self._normalize_target(target)
+        count = 0
+        if (
+            state.last_action.get("action") == action_name
+            and self._normalize_target(state.last_action.get("target", "")) == normalized_target
+        ):
+            count += 1
+        for item in reversed(state.evidence_sources):
+            if item.get("action") != action_name:
+                continue
+            if self._normalize_target(item.get("target", "")) != normalized_target:
+                continue
+            count += 1
+            if count >= 2:
+                break
+        return count
 
     def _required_write_target(self, state: TaskState) -> str | None:
         if not self._has_contract_for_active_task(state):
@@ -425,6 +640,24 @@ class AgentLoop:
         }
 
     def _guard_pending_repair(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        if self._pending_repair_is_command_syntax_error(state):
+            if action.get("action") == "bash":
+                return action
+            return {
+                "thought_summary": (
+                    "Guard override: the acceptance command itself has invalid Python syntax, "
+                    "so run a corrected equivalent bash command before verification or implementation repair."
+                ),
+                "action": "required_command_repair",
+                "target": str(state.pending_repair.get("command", "")),
+                "args": {
+                    "bad_command": state.pending_repair.get("command", ""),
+                    "failure_summary": state.pending_repair.get("summary", ""),
+                },
+                "expected_observation": "Harness requires a corrected equivalent acceptance command.",
+                "risk": "low",
+                "guard_override": "failed_contract_command_syntax_requires_corrected_bash",
+            }
         targets = self._pending_repair_targets(state)
         if not targets:
             return None
@@ -518,28 +751,54 @@ class AgentLoop:
         repaired_targets = repair.get("repaired_targets", [])
         return isinstance(repaired_targets, list) and bool(repaired_targets)
 
+    def _pending_repair_is_command_syntax_error(self, state: TaskState) -> bool:
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        if repair.get("command_failure_type") == "command_syntax_error":
+            return True
+        return self._command_failure_type(str(repair.get("output", ""))) == "command_syntax_error"
+
+    def _command_failure_type(self, output: str) -> str | None:
+        if "SyntaxError:" in output and "invalid syntax" in output:
+            return "command_syntax_error"
+        return None
+
     def _pending_repair_targets(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         targets = repair.get("targets", [])
         if not isinstance(targets, list):
             return []
         active = {self._normalize_target(target) for target in self._active_task_expected_artifacts(state)}
+        command = str(repair.get("command", ""))
+        output = str(repair.get("output", ""))
+        if command or output:
+            targets = list(targets) + self._module_repair_targets_from_failure(command, output, state)
         result: list[str] = []
         for target in targets:
             normalized = self._normalize_target(target)
-            if normalized in active and normalized not in result:
+            if (normalized in active or "/workspace/" in normalized) and normalized not in result:
                 result.append(normalized)
         return result
 
     def _pending_repair_write_targets(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        command = str(repair.get("command", ""))
+        output = str(repair.get("output", ""))
+        dynamic_targets = (
+            self._module_repair_targets_from_failure(command, output, state)
+            if command or output
+            else []
+        )
         explicit = repair.get("repair_targets", [])
-        if isinstance(explicit, list) and explicit:
+        if isinstance(explicit, list) and (explicit or dynamic_targets):
             active = {self._normalize_target(item) for item in self._active_task_expected_artifacts(state)}
+            combined = list(dynamic_targets) + list(explicit)
+            seen: set[str] = set()
             return [
                 target
-                for target in (self._normalize_target(item) for item in explicit)
-                if target in active and (not self._looks_like_test_artifact(target) or self._is_test_repair_allowed(target, state))
+                for target in (self._normalize_target(item) for item in combined)
+                if (target in active or "/workspace/" in target)
+                and (not self._looks_like_test_artifact(target) or self._is_test_repair_allowed(target, state))
+                and not (target in seen or seen.add(target))
             ]
         targets = self._pending_repair_targets(state)
         implementation_targets = [
@@ -588,6 +847,9 @@ class AgentLoop:
         command = str(state.last_observation.get("data", {}).get("command") or state.last_action.get("target", ""))
         if not self._is_contract_command(command, state):
             return None
+        output = str(state.last_observation.get("data", {}).get("output", ""))
+        if self._command_failure_type(output) == "command_syntax_error":
+            return None
         target = self._artifact_referenced_by_command(command, state)
         if not target:
             return None
@@ -629,6 +891,9 @@ class AgentLoop:
             return []
         combined = f"{command}\n{output}".replace("\\", "/")
         targets: list[str] = []
+        for target in self._module_repair_targets_from_failure(command, output, state):
+            if target not in targets:
+                targets.append(target)
 
         for pattern in [
             r"from ['\"]([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)['\"]",
@@ -682,20 +947,62 @@ class AgentLoop:
         ]
         return implementation_targets + test_targets or artifacts
 
+    def _module_repair_targets_from_failure(self, command: str, output: str, state: TaskState) -> list[str]:
+        combined = f"{command}\n{output}".replace("\\", "/")
+        if "ModuleNotFoundError" not in combined and "No module named" not in combined:
+            return []
+        workspace_root = self._workspace_root_from_command(command) or self._workspace_root_from_artifacts(state)
+        if not workspace_root:
+            return []
+        missing_roots = {
+            match.group(1).split(".", 1)[0]
+            for match in re.finditer(r"No module named ['\"]([^'\"]+)['\"]", combined)
+        }
+        modules: list[str] = []
+        for pattern in (
+            r"\bfrom\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s+import\b",
+            r"\bpython\s+-m\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\b",
+        ):
+            for match in re.finditer(pattern, command.replace("\\", "/")):
+                module = match.group(1)
+                if missing_roots and module.split(".", 1)[0] not in missing_roots:
+                    continue
+                if module not in modules:
+                    modules.append(module)
+        targets: list[str] = []
+        for module in modules:
+            parts = module.split(".")
+            module_target = f"{workspace_root}/{'/'.join(parts)}.py"
+            if module_target not in targets:
+                targets.append(module_target)
+            package_init = f"{workspace_root}/{parts[0]}/__init__.py"
+            if package_init not in targets:
+                targets.append(package_init)
+        return targets
+
+    def _workspace_root_from_command(self, command: str) -> str | None:
+        normalized = command.replace("\\", "/")
+        for pattern in (
+            r"sys\.path\.insert\(\s*0\s*,\s*['\"]([^'\"]*workspace[^'\"]*)['\"]\s*\)",
+            r"PYTHONPATH['\"]?\s*:\s*['\"]([^'\"]*workspace[^'\"]*)['\"]",
+            r"PYTHONPATH=([^'\"\s]*workspace[^'\"\s]*)",
+        ):
+            for match in re.finditer(pattern, normalized):
+                root = self._normalize_target(match.group(1))
+                if root:
+                    return root
+        return None
+
+    def _workspace_root_from_artifacts(self, state: TaskState) -> str | None:
+        for artifact in self._active_task_expected_artifacts(state):
+            normalized = self._normalize_target(artifact)
+            marker = "/workspace/"
+            if marker in normalized:
+                return normalized.split(marker, 1)[0] + "/workspace"
+        return None
+
     def _default_repair_write_targets(self, targets: list[str], state: TaskState | None = None) -> list[str]:
         normalized_targets = [self._normalize_target(target) for target in targets]
-        if state is not None:
-            active_implementation = {
-                self._normalize_target(target)
-                for target in self._active_task_implementation_artifacts(state)
-            }
-            implementation_targets = [
-                target
-                for target in normalized_targets
-                if target in active_implementation
-            ]
-            if implementation_targets:
-                return list(dict.fromkeys(implementation_targets))
         implementation_targets = [
             target
             for target in normalized_targets
@@ -719,10 +1026,13 @@ class AgentLoop:
         referenced = [artifact for artifact in artifacts if artifact in combined]
         referenced.sort(key=lambda target: (not self._looks_like_test_artifact(target), target))
         result: list[str] = []
+        active_artifacts = {self._normalize_target(target) for target in self._active_task_expected_artifacts(state)}
         for target in referenced:
             if target not in result:
                 result.append(target)
         for target in self._repair_targets_from_failed_output(command, output, state):
+            if target not in active_artifacts and not (self.root / target).exists():
+                continue
             if target not in result:
                 result.append(target)
         if result:
@@ -1141,6 +1451,13 @@ class AgentLoop:
 
     def _initial_content_for_target(self, target: str, state: TaskState | None = None) -> str | None:
         name = Path(target).name.lower()
+        if name == "init.sh" and self._normalize_target(target) == self._normalize_target(self._rel(self.state_dir / "init.sh")):
+            workspace = self._expected_initializer_workspace_root() or "workspace"
+            return (
+                "#!/usr/bin/env sh\n"
+                "set -eu\n"
+                f"python -c \"import pathlib; pathlib.Path({workspace!r}).mkdir(parents=True, exist_ok=True)\"\n"
+            )
         if name == "readme.md":
             title = state.user_goal if state else "Project"
             criteria = state.acceptance_criteria if state else []
@@ -1188,7 +1505,7 @@ class AgentLoop:
                     "summary": observation.summary,
                 }
             )
-        elif name == "answer" and observation.ok:
+        elif name == "answer" and observation.ok and not self._is_initializer_task(state):
             for node in state.nodes:
                 if node["status"] != "done":
                     node["status"] = "done"
@@ -1196,6 +1513,24 @@ class AgentLoop:
         elif name == "update_plan" and state.nodes:
             state.nodes[0]["status"] = "done"
             state.nodes[0]["evidence"].append("initialized plan")
+        elif (
+            name in {"list_files", "read", "search", "bash", "git", "edit", "write"}
+            and observation.ok
+            and self._is_initializer_task(state)
+        ):
+            state.evidence_sources.append(
+                {
+                    "action": name,
+                    "target": str(action.get("target", "")),
+                    "summary": observation.summary,
+                }
+            )
+            if state.nodes:
+                state.nodes[0]["evidence"].append(observation.summary)
+            if name in {"write", "edit"}:
+                state.initializer_command_passed = False
+            elif name == "bash" and self._is_initializer_verification_command(action, state):
+                state.initializer_command_passed = True
         elif name in {"list_files", "read", "search", "bash", "git", "edit", "write"} and observation.ok and len(state.nodes) > 1:
             state.evidence_sources.append(
                 {
@@ -1217,6 +1552,7 @@ class AgentLoop:
             "protocol_error",
             "required_write",
             "required_repair",
+            "required_command_repair",
         } and not observation.ok:
             state.last_observation["counts_as_progress"] = False
         elif name == "verify" and observation.ok and len(state.nodes) > 2:
@@ -1240,6 +1576,9 @@ class AgentLoop:
         name = action.get("action")
         if name == "bash":
             command = str(observation.data.get("command") or action.get("target", ""))
+            if observation.ok and self._pending_repair_is_command_syntax_error(state):
+                state.pending_repair = {}
+                return
             if not self._is_contract_command(command, state):
                 return
             canonical_command = self._canonical_contract_command(command, state)
@@ -1247,8 +1586,13 @@ class AgentLoop:
                 state.pending_repair = {}
                 return
             output = str(observation.data.get("output", ""))
-            targets = self._repair_targets_from_failed_output(command, output, state)
-            required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+            failure_type = self._command_failure_type(output)
+            if failure_type == "command_syntax_error":
+                targets: list[str] = []
+                required_reads: list[str] = []
+            else:
+                targets = self._repair_targets_from_failed_output(command, output, state)
+                required_reads = self._repair_read_targets_from_failed_output(command, output, state)
             read_targets = self._preserve_pending_repair_reads(state, required_reads)
             state.pending_repair = {
                 "reason": "failed_acceptance_command",
@@ -1261,6 +1605,8 @@ class AgentLoop:
                 "read_targets": read_targets,
                 "repaired_targets": [],
             }
+            if failure_type:
+                state.pending_repair["command_failure_type"] = failure_type
             return
         if name == "read" and observation.ok and state.pending_repair:
             target = self._normalize_target(action.get("target", ""))
@@ -1331,14 +1677,19 @@ class AgentLoop:
                 if observation.get("ok") is True:
                     return
                 output = str(data.get("output", ""))
-                targets = self._repair_targets_from_failed_output(command, output, state)
-                required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+                failure_type = self._command_failure_type(output)
+                if failure_type == "command_syntax_error":
+                    targets = []
+                    required_reads = []
+                else:
+                    targets = self._repair_targets_from_failed_output(command, output, state)
+                    required_reads = self._repair_read_targets_from_failed_output(command, output, state)
                 read_targets = [
                     target
                     for target in reversed(read_after_failure)
                     if target in {self._normalize_target(item) for item in required_reads}
                 ]
-                if targets:
+                if targets or failure_type:
                     state.pending_repair = {
                         "reason": "failed_acceptance_command",
                         "command": self._canonical_contract_command(command, state),
@@ -1351,6 +1702,8 @@ class AgentLoop:
                         "repaired_targets": list(dict.fromkeys(repaired_after_failure)),
                         "recovered_from_trace": str(trace_path.relative_to(self.root)).replace("\\", "/"),
                     }
+                    if failure_type:
+                        state.pending_repair["command_failure_type"] = failure_type
                     return
 
     def _load_trace_events(self, trace_path: Path) -> list[dict[str, Any]]:
@@ -1407,6 +1760,506 @@ class AgentLoop:
             elif isinstance(item, dict) and item.get("path"):
                 formatted.append(str(item["path"]))
         return formatted
+
+    def _is_initializer_task(self, state: TaskState) -> bool:
+        if state.task_id == "INIT":
+            return True
+        return any(node.get("id") == "INIT" for node in state.nodes)
+
+    def _guard_initializer_progress(
+        self,
+        action: dict[str, Any],
+        state: TaskState,
+    ) -> dict[str, Any] | None:
+        if not self._is_initializer_task(state):
+            return None
+        outputs = self._validate_initializer_outputs()
+        if not outputs.ok:
+            repair_action = self._guard_initializer_repair(action, state)
+            if repair_action:
+                return repair_action
+            repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+            candidate = self._normalize_target(repair.get("candidate_path", ""))
+            if candidate:
+                if action.get("action") in {"read", "edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
+                    return None
+                generated_target = self._normalize_target(
+                    self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
+                )
+                args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+                content = args.get("content")
+                if (
+                    action.get("action") == "write"
+                    and self._normalize_target(action.get("target", "")) == generated_target
+                    and isinstance(content, str)
+                    and content.strip()
+                ):
+                    return None
+                return {
+                    "thought_summary": (
+                        "Guard override: INIT has a saved rejected candidate. "
+                        "Repair that candidate before synthesizing missing initializer artifacts."
+                    ),
+                    "action": "read",
+                    "target": candidate,
+                    "args": {},
+                    "expected_observation": f"Read saved INIT candidate {candidate}.",
+                    "risk": "low",
+                    "guard_override": "initializer_candidate_repair_before_missing_artifact",
+                }
+            if int(repair.get("repeat_count", 0)) >= 2:
+                return None
+            missing = outputs.data.get("missing_initializer_artifacts", [])
+            if isinstance(missing, list) and missing:
+                missing_target = self._normalize_target(missing[0])
+                if action.get("action") in {"write", "edit"} and self._normalize_target(action.get("target", "")) == missing_target:
+                    return None
+                content = self._initial_content_for_target(missing_target, state)
+                if content:
+                    return {
+                        "thought_summary": (
+                            "Guard override: the INIT handoff requires the next missing initializer artifact. "
+                            f"Write {missing_target} before further directory listings or verification."
+                        ),
+                        "action": "write",
+                        "target": missing_target,
+                        "args": {"mode": "create", "content": content},
+                        "expected_observation": f"Create missing initializer artifact {missing_target}.",
+                        "risk": "low",
+                        "guard_override": "initializer_missing_artifact_to_write",
+                    }
+            return None
+        command = self._initializer_verification_command(state)
+        if not state.initializer_command_passed:
+            if action.get("action") == "bash" and str(action.get("target", "")) == command:
+                return None
+            return {
+                "thought_summary": (
+                    "Guard override: all INIT artifacts are present and valid, so run the deterministic "
+                    "initializer verification command before any answer, finish, or further inspection."
+                ),
+                "action": "bash",
+                "target": command,
+                "args": {},
+                "expected_observation": "Initializer verification command exits with code 0.",
+                "risk": "low",
+                "guard_override": "initializer_artifacts_ready_to_command",
+            }
+        if action.get("action") == "verify":
+            return None
+        return {
+            "thought_summary": (
+                "Guard override: the INIT verification command passed, so submit INIT to the Verifier "
+                "instead of answering, finishing, or collecting more context."
+            ),
+            "action": "verify",
+            "target": "default",
+            "args": {},
+            "expected_observation": "Verifier independently validates INIT and permits Orchestrator scheduling.",
+            "risk": "low",
+            "guard_override": "initializer_command_passed_to_verify",
+        }
+
+    def _guard_initializer_repair(
+        self,
+        action: dict[str, Any],
+        state: TaskState,
+    ) -> dict[str, Any] | None:
+        repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        if int(repair.get("repeat_count", 0)) < 2:
+            return None
+        candidate = self._normalize_target(repair.get("candidate_path", ""))
+        if not candidate:
+            return None
+        if action.get("action") in {"edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
+            return None
+        candidate_already_read = candidate in {
+            self._normalize_target(item.get("target", ""))
+            for item in state.evidence_sources
+            if item.get("action") == "read"
+        }
+        if (
+            action.get("action") == "read"
+            and self._normalize_target(action.get("target", "")) == candidate
+            and not candidate_already_read
+        ):
+            return None
+        errors = repair.get("validation_errors", [])
+        return {
+            "thought_summary": (
+                "Guard override: the same INIT validation error repeated. Repair the saved candidate "
+                "in place instead of regenerating the whole task graph."
+            ),
+            "action": "required_initializer_repair",
+            "target": candidate,
+            "args": {
+                "errors": errors if isinstance(errors, list) else [],
+                "repeat_count": repair.get("repeat_count", 2),
+            },
+            "expected_observation": "Harness requires an edit or overwrite of the saved candidate.",
+            "risk": "low",
+            "guard_override": "repeated_initializer_error_to_candidate_repair",
+        }
+
+    def _initializer_verification_command(self, state: TaskState) -> str:
+        commands = self._active_verification_commands(state)
+        return commands[0] if commands else ""
+
+    def _is_initializer_verification_command(self, action: dict[str, Any], state: TaskState) -> bool:
+        command = self._initializer_verification_command(state)
+        return bool(command) and action.get("action") == "bash" and str(action.get("target", "")) == command
+
+    def _initializer_allowed_targets(self, state: TaskState | None = None) -> set[str]:
+        targets = {
+            self._normalize_target(
+                self._rel(self.project_spec_materialized_path or self.state_dir / "project_spec.md")
+            ),
+            self._normalize_target(self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")),
+            self._normalize_target(self._rel(self.state_dir / "init.sh")),
+        }
+        if state and state.initializer_repair:
+            targets.add(self._normalize_target(self._rel(self.initializer_candidate_path)))
+        return targets
+
+    def _validate_initializer_write_action(
+        self,
+        action: dict[str, Any],
+        state: TaskState,
+    ) -> ToolResult | None:
+        target = self._normalize_target(action.get("target", ""))
+        allowed_targets = self._initializer_allowed_targets(state)
+        if target not in allowed_targets:
+            return ToolResult(
+                False,
+                "INIT write rejected: Initializer may write only project_spec.md, generated_tasks.json, and init.sh in its state directory.",
+                {
+                    "initializer_restricted": True,
+                    "target": target,
+                    "allowed_targets": sorted(allowed_targets),
+                    "counts_as_progress": False,
+                },
+            )
+        if action.get("action") != "write":
+            return None
+        args = action.get("args", {})
+        content = args.get("content") if isinstance(args, dict) else None
+        if content is None or not str(content).strip():
+            return ToolResult(
+                False,
+                f"INIT write rejected: {target} must not be empty.",
+                {"initializer_validation_errors": [f"{target} must not be empty."], "counts_as_progress": False},
+            )
+        generated_target = self._normalize_target(
+            self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
+        )
+        init_target = self._normalize_target(self._rel(self.state_dir / "init.sh"))
+        if target == init_target:
+            errors = self._initializer_script_errors(content)
+            if errors:
+                return ToolResult(
+                    False,
+                    "INIT write rejected: init.sh failed deterministic validation.",
+                    {
+                        "initializer_validation_errors": errors,
+                        "init_script_path": init_target,
+                        "counts_as_progress": False,
+                    },
+                )
+            return None
+        if target != generated_target:
+            return None
+        try:
+            data = json.loads(str(content))
+        except json.JSONDecodeError as exc:
+            repair = self._record_initializer_candidate(state, str(content), [str(exc)])
+            return ToolResult(
+                False,
+                f"INIT write rejected: generated_tasks.json is invalid JSON: {exc}.",
+                {
+                    "initializer_validation_errors": [str(exc)],
+                    **repair,
+                    "counts_as_progress": False,
+                },
+            )
+        errors = self._initializer_graph_errors(data)
+        if errors:
+            repair = self._record_initializer_candidate(state, str(content), errors)
+            return ToolResult(
+                False,
+                "INIT write rejected: generated task graph failed deterministic validation.",
+                {
+                    "initializer_validation_errors": errors,
+                    "expected_workspace_root": self._expected_initializer_workspace_root(),
+                    **repair,
+                    "counts_as_progress": False,
+                },
+            )
+        return None
+
+    def _validate_initializer_artifact_after_write(
+        self,
+        action: dict[str, Any],
+        state: TaskState,
+    ) -> ToolResult | None:
+        target = self._normalize_target(action.get("target", ""))
+        generated_target = self._normalize_target(
+            self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
+        )
+        candidate_target = self._normalize_target(self._rel(self.initializer_candidate_path))
+        init_target = self._normalize_target(self._rel(self.state_dir / "init.sh"))
+        if target == init_target:
+            try:
+                content = (self.state_dir / "init.sh").read_text(encoding="utf-8")
+            except OSError as exc:
+                return ToolResult(
+                    False,
+                    f"Initializer artifact validation failed: {exc}.",
+                    {"initializer_validation_errors": [str(exc)], "counts_as_progress": False},
+                )
+            errors = self._initializer_script_errors(content)
+            if not errors:
+                return None
+            return ToolResult(
+                False,
+                "Initializer init.sh validation failed after edit.",
+                {"initializer_validation_errors": errors, "counts_as_progress": False},
+            )
+        if target not in {generated_target, candidate_target}:
+            return None
+        source_path = (
+            self.initializer_candidate_path
+            if target == candidate_target
+            else self.generated_tasks_path or self.state_dir / "generated_tasks.json"
+        )
+        try:
+            content = source_path.read_text(encoding="utf-8")
+            data = json.loads(content)
+        except (OSError, json.JSONDecodeError) as exc:
+            repair = self._record_initializer_candidate(state, content if "content" in locals() else "", [str(exc)])
+            return ToolResult(
+                False,
+                f"Initializer artifact validation failed: {exc}.",
+                {
+                    "initializer_validation_errors": [str(exc)],
+                    **repair,
+                    "counts_as_progress": False,
+                },
+            )
+        errors = self._initializer_graph_errors(data)
+        if not errors:
+            if target == candidate_target:
+                destination = self.generated_tasks_path or self.state_dir / "generated_tasks.json"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, destination)
+                state.initializer_repair = {}
+                return ToolResult(
+                    True,
+                    "Initializer candidate repaired and promoted to generated_tasks.json.",
+                    {
+                        "candidate_path": candidate_target,
+                        "promoted_path": self._normalize_target(self._rel(destination)),
+                    },
+                )
+            state.initializer_repair = {}
+            return None
+        repair = self._record_initializer_candidate(state, content, errors)
+        return ToolResult(
+            False,
+            "Initializer artifact validation failed after edit.",
+            {
+                "initializer_validation_errors": errors,
+                "expected_workspace_root": self._expected_initializer_workspace_root(),
+                **repair,
+                "counts_as_progress": False,
+            },
+        )
+
+    def _validate_initializer_outputs(self) -> ToolResult:
+        missing = self._missing_initializer_artifacts()
+        if missing:
+            return ToolResult(
+                False,
+                "Initializer verification failed: required artifacts are missing or empty.",
+                {"missing_initializer_artifacts": missing},
+            )
+        generated_path = self.generated_tasks_path or self.state_dir / "generated_tasks.json"
+        try:
+            data = json.loads(generated_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return ToolResult(
+                False,
+                f"Initializer verification failed: generated_tasks.json is invalid: {exc}.",
+                {"initializer_validation_errors": [str(exc)]},
+            )
+        expected_workspace = self._expected_initializer_workspace_root()
+        errors = self._initializer_graph_errors(data)
+        init_path = self.state_dir / "init.sh"
+        try:
+            init_content = init_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(str(exc))
+        else:
+            errors.extend(self._initializer_script_errors(init_content))
+        if errors:
+            return ToolResult(
+                False,
+                "Initializer verification failed: generated task graph or init.sh is invalid.",
+                {"initializer_validation_errors": errors, "expected_workspace_root": expected_workspace},
+            )
+        return ToolResult(
+            True,
+            "Initializer artifacts passed deterministic validation.",
+            {"task_count": len(data["tasks"]), "expected_workspace_root": expected_workspace},
+        )
+
+    def _record_initializer_candidate(
+        self,
+        state: TaskState,
+        content: str,
+        errors: list[str],
+    ) -> dict[str, Any]:
+        self.initializer_candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        if content:
+            self.initializer_candidate_path.write_text(content, encoding="utf-8")
+        signature = self._initializer_error_signature(errors)
+        previous = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        repeat_count = int(previous.get("repeat_count", 0)) + 1 if previous.get("error_signature") == signature else 1
+        candidate = self._normalize_target(self._rel(self.initializer_candidate_path))
+        state.initializer_repair = {
+            "candidate_path": candidate,
+            "validation_errors": list(errors),
+            "error_signature": signature,
+            "repeat_count": repeat_count,
+            "updated_at": utc_now(),
+        }
+        return {
+            "candidate_path": candidate,
+            "initializer_error_signature": signature,
+            "initializer_error_repeat_count": repeat_count,
+        }
+
+    def _recover_initializer_repair_from_state(self, state: TaskState) -> None:
+        if state.last_action.get("action") != "write":
+            return
+        generated_target = self._normalize_target(
+            self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
+        )
+        if self._normalize_target(state.last_action.get("target", "")) != generated_target:
+            return
+        errors = state.last_observation.get("data", {}).get("initializer_validation_errors", [])
+        args = state.last_action.get("args", {})
+        content = args.get("content") if isinstance(args, dict) else None
+        if isinstance(errors, list) and errors and isinstance(content, str) and content:
+            normalized_errors = [str(error) for error in errors]
+            self._record_initializer_candidate(state, content, normalized_errors)
+            signature = self._initializer_error_signature(normalized_errors)
+            recovered_count = self._recent_initializer_error_repeat_count(signature)
+            state.initializer_repair["repeat_count"] = max(
+                int(state.initializer_repair.get("repeat_count", 1)),
+                recovered_count,
+            )
+
+    def _recent_initializer_error_repeat_count(self, signature: str) -> int:
+        traces = sorted(self.trace_dir.glob("run_*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for trace_path in traces:
+            events = self._load_trace_events(trace_path)
+            if not events:
+                continue
+            count = 0
+            for event in reversed(events):
+                observation = event.get("observation", {})
+                data = observation.get("data", {}) if isinstance(observation, dict) else {}
+                errors = data.get("initializer_validation_errors", []) if isinstance(data, dict) else []
+                if not isinstance(errors, list) or not errors:
+                    if count:
+                        break
+                    continue
+                event_signature = self._initializer_error_signature([str(error) for error in errors])
+                if event_signature != signature:
+                    if count:
+                        break
+                    continue
+                count += 1
+            if count:
+                return count
+        return 1
+
+    def _initializer_error_signature(self, errors: list[str]) -> str:
+        normalized = {
+            re.sub(r"tasks\[\d+\]", "tasks[*]", str(error)).strip()
+            for error in errors
+            if str(error).strip()
+        }
+        return " | ".join(sorted(normalized))
+
+    def _missing_initializer_artifacts(self) -> list[str]:
+        paths = [
+            self.project_spec_materialized_path or self.state_dir / "project_spec.md",
+            self.generated_tasks_path or self.state_dir / "generated_tasks.json",
+            self.state_dir / "init.sh",
+        ]
+        missing: list[str] = []
+        for path in paths:
+            try:
+                exists_with_content = path.is_file() and bool(path.read_text(encoding="utf-8").strip())
+            except OSError:
+                exists_with_content = False
+            if not exists_with_content:
+                missing.append(self._normalize_target(self._rel(path)))
+        return missing
+
+    def _expected_initializer_workspace_root(self) -> str | None:
+        spec_path = (
+            self.project_spec_path
+            if self.project_spec_path and self.project_spec_path.exists()
+            else self.project_spec_materialized_path or self.state_dir / "project_spec.md"
+        )
+        try:
+            spec = spec_path.read_text(encoding="utf-8")
+        except OSError:
+            spec = ""
+        for candidate in re.findall(r"`([^`\r\n]+)`", spec):
+            normalized = self._normalize_target(candidate)
+            if normalized.lower().endswith("/workspace") and not any(char.isspace() for char in normalized):
+                return normalized
+        if self.benchmark_id:
+            return f"eval/benchmarks/{self.benchmark_id}/workspace"
+        return None
+
+    def _project_requires_standard_library(self) -> bool:
+        spec_path = (
+            self.project_spec_path
+            if self.project_spec_path and self.project_spec_path.exists()
+            else self.project_spec_materialized_path or self.state_dir / "project_spec.md"
+        )
+        try:
+            spec = spec_path.read_text(encoding="utf-8").lower()
+        except OSError:
+            return False
+        return "use only the python standard library" in spec or "standard library only" in spec
+
+    def _initializer_graph_errors(self, data: object) -> list[str]:
+        return validate_generated_task_graph(
+            data,
+            self._expected_initializer_workspace_root(),
+            standard_library_only=self._project_requires_standard_library(),
+        )
+
+    def _initializer_script_errors(self, content: object) -> list[str]:
+        return validate_initializer_script(
+            content,
+            self._expected_initializer_workspace_root(),
+            standard_library_only=self._project_requires_standard_library(),
+        )
+
+    def _active_verification_commands(self, state: TaskState) -> list[str]:
+        active = self._active_node(state)
+        if not active and self._is_initializer_task(state):
+            active = next((node for node in state.nodes if node.get("id") == "INIT"), None)
+        if not active:
+            return []
+        commands = active.get("verification_commands", [])
+        return [str(command) for command in commands] if isinstance(commands, list) else []
 
     def _validate_contract_action(self, action: dict[str, Any]) -> ToolResult:
         args = action.get("args", {})
@@ -1490,6 +2343,8 @@ class AgentLoop:
         )
 
     def _active_task_id(self, state: TaskState) -> str:
+        if state.task_id == "INIT":
+            return "INIT"
         for node in state.nodes:
             if node.get("status") in {"in_progress", "pending"}:
                 return str(node.get("id", "current"))
@@ -1553,6 +2408,7 @@ class AgentLoop:
             f"- current_state: {self._rel(self.state_path)}",
             f"- task_graph_runtime: {self._rel(self.runtime_tasks_path) if self.runtime_tasks_path else 'not used'}",
             f"- task_graph_generated: {self._rel(self.generated_tasks_path) if self.generated_tasks_path else 'not used'}",
+            f"- rejected_initializer_candidate: {self._rel(self.initializer_candidate_path)}",
             "- task_graph_source: the original `--tasks-json` file is benchmark input and should remain read-only",
             f"- latest_verifier_report: {self._rel(self.state_dir / 'verifier_report.md')}",
             f"- hard_memory: {self._rel(self.state_dir / 'hard_memory.md')}",
@@ -1583,6 +2439,9 @@ class AgentLoop:
             "",
             "## 10a. Pending Repair",
             *self._format_pending_repair(state),
+            "",
+            "## 10b. Initializer Repair",
+            *self._format_initializer_repair(state),
             "",
             "## 11. Verification Status",
             f"- last_verified_at: {state.last_verified_at}",
@@ -1641,6 +2500,7 @@ class AgentLoop:
             "acceptance_contracts": contracts,
             "evidence_sources": evidence,
             "pending_repair": state.pending_repair,
+            "initializer_repair": state.initializer_repair,
             "last_action": state.last_action,
             "last_observation": state.last_observation,
             "last_verified_at": state.last_verified_at,
@@ -1706,10 +2566,32 @@ class AgentLoop:
             f"- summary: {repair.get('summary', '')}",
         ]
 
+    def _format_initializer_repair(self, state: TaskState) -> list[str]:
+        repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        if not repair:
+            return ["- none"]
+        errors = repair.get("validation_errors", [])
+        return [
+            f"- candidate_path: {repair.get('candidate_path', '')}",
+            f"- repeat_count: {repair.get('repeat_count', 0)}",
+            f"- error_signature: {repair.get('error_signature', '')}",
+            *[f"- validation_error: {error}" for error in errors if isinstance(errors, list)],
+        ]
+
     def _suggest_next_action(self, state: TaskState) -> str:
         active = self._active_node(state)
         if not active:
             return "Run verifier and finish if all acceptance criteria pass."
+        if self._is_initializer_task(state):
+            if state.initializer_repair:
+                candidate = state.initializer_repair.get("candidate_path", "")
+                return f"Repair the saved INIT candidate at {candidate}; do not regenerate the full graph."
+            missing = self._missing_initializer_artifacts()
+            if missing:
+                return f"Resume INIT by writing {missing[0]}; INIT does not require an acceptance contract."
+            if not state.initializer_command_passed:
+                return "Run the deterministic INIT verification command; answer and finish are not allowed."
+            return "Submit INIT to the verifier; only Verifier PASS may schedule the first Worker task."
         repair_targets = self._pending_repair_write_targets(state)
         if repair_targets:
             return (
@@ -1774,14 +2656,18 @@ class AgentLoop:
     def _initializer_needed(self) -> bool:
         if not self.project_spec_path or not self.generated_tasks_path:
             return False
-        if not self.generated_tasks_path.exists():
+        init_path = self.state_dir / "init.sh"
+        if not self.generated_tasks_path.exists() or not init_path.exists():
             return True
         try:
             data = json.loads(self.generated_tasks_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return True
-        tasks = data.get("tasks") if isinstance(data, dict) else None
-        return not isinstance(tasks, list) or not tasks
+        try:
+            init_content = init_path.read_text(encoding="utf-8")
+        except OSError:
+            return True
+        return bool(self._initializer_graph_errors(data) or self._initializer_script_errors(init_content))
 
     @staticmethod
     def _trace_name() -> str:

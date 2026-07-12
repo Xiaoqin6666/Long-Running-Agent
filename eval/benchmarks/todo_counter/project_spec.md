@@ -91,6 +91,14 @@ If the input file does not exist, the CLI should exit with a nonzero status and 
 - The project should be runnable without installing external dependencies.
 - Generated tests may be public contract tests, but once accepted as contract evidence they must be treated as read-only by the Worker unless the verifier explicitly allows test repair.
 
+## Evaluation Artifact Boundaries
+
+- This source specification is read-only benchmark input.
+- The harness materializes run state, the generated task graph, and the run-local POSIX shell `init.sh` under `state/benchmarks/todo_counter/`.
+- The repository-root `init.sh` belongs to the Long-Running Agent harness and must not be modified by this benchmark.
+- Application source and public tests must be created only under `eval/benchmarks/todo_counter/workspace/`.
+- No application workspace may be created under `state/`.
+
 ## Verifiable Completion Conditions
 
 The project is complete only when all of the following are true:

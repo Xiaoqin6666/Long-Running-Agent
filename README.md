@@ -24,6 +24,8 @@ See [docs/evaluation_runbook.md](docs/evaluation_runbook.md) for the long-runnin
 
 ## Quick Start
 
+The tracked repository-root `init.sh` bootstraps the Long-Running Agent harness. An autonomous benchmark INIT generates a separate run-local script at `state/benchmarks/<benchmark_id>/init.sh`; generated application code and public tests belong under `eval/benchmarks/<benchmark_id>/workspace/`.
+
 Run the deterministic offline loop:
 
 ```powershell

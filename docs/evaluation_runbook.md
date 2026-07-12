@@ -97,8 +97,12 @@ state/
   benchmarks/
     issue_tracker/
       current_task.json
-      runtime_tasks.json
-      generated_tasks.json
+      runtime_tasks.json       # preplanned flow only
+      generated_tasks.json     # autonomous Initializer flow only
+      project_spec.md
+      init.sh
+      rejected_candidates/
+        generated_tasks.json
       handoff.md
       handoff_payload.json
       verifier_report.md
@@ -109,8 +113,12 @@ state/
       traces/
     todo_counter/
       current_task.json
-      runtime_tasks.json
-      generated_tasks.json
+      runtime_tasks.json       # preplanned flow only
+      generated_tasks.json     # autonomous Initializer flow only
+      project_spec.md
+      init.sh
+      rejected_candidates/
+        generated_tasks.json
       handoff.md
       handoff_payload.json
       verifier_report.md
@@ -145,10 +153,17 @@ python -m agent.main --benchmark todo_counter --project-spec eval\benchmarks\tod
 
 When `--project-spec` is used without `--tasks-json`, the harness starts a one-time `INIT` task. The initializer must produce:
 
-- `project_spec.md`
 - `state/benchmarks/todo_counter/project_spec.md`
 - `state/benchmarks/todo_counter/generated_tasks.json`
 - `state/benchmarks/todo_counter/init.sh`
+
+The last path is the run-local benchmark initializer script. It is distinct from the tracked repository-root `init.sh`, which bootstraps the Long-Running Agent harness itself. Benchmark INIT must never overwrite the repository-root script. Generated application code and public tests belong under `eval/benchmarks/todo_counter/workspace/`, not under `state/`.
+
+`INIT` does not negotiate a Worker acceptance contract. The harness permits it to write only those three benchmark-local initializer artifacts and permits shell execution only for the deterministic INIT verification command. Application code, tests, skeletons, and workspace files remain forbidden until Orchestrator selects the first ordinary Worker task.
+
+`answer` and `finish` cannot terminate INIT. Once all artifacts pass deterministic validation, the guard forces the INIT verification command; after that command succeeds, it forces `verify`. Only Verifier PASS marks INIT completed, and Orchestrator selects the first Worker task before any token-budget handoff is written.
+
+Before INIT can pass, the harness validates the generated JSON schema, task ids, dependencies, initial statuses, acceptance criteria, verification commands, hidden-test isolation, and artifact paths. For this benchmark, every generated application artifact must remain under `eval/benchmarks/todo_counter/workspace/` as required by the project specification.
 
 After `state/benchmarks/todo_counter/generated_tasks.json` exists and the initializer passes verification, Orchestrator uses that generated task graph for ordinary Worker scheduling. This keeps benchmark input implementation-independent while still making the generated plan durable and inspectable.
 

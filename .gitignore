@@ -9,6 +9,10 @@ state/traces/*.jsonl
 !state/traces/.gitkeep
 state/handoff_payload.json
 state/runtime_tasks.json
+state/generated_tasks.json
+state/project_spec.md
+state/init.sh
+state/rejected_candidates/
 state/metrics_*.json
 state/benchmarks/*/current_task.json
 state/benchmarks/*/runtime_tasks.json
@@ -23,5 +27,6 @@ state/benchmarks/*/hard_memory.md
 state/benchmarks/*/soft_memory.md
 state/benchmarks/*/traces/*.jsonl
 state/benchmarks/*/skills/*.md
+state/benchmarks/*/rejected_candidates/
 eval/workspaces/
 eval/benchmarks/*/workspace/

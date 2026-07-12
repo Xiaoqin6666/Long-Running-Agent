@@ -41,15 +41,33 @@ class Verifier:
 
     def validate_contract(self, contract: dict[str, Any]) -> ToolResult:
         checks = []
+        # 校验1：存在非空task_id
         checks.append(("has_task_id", bool(str(contract.get("task_id", "")).strip())))
+        # 校验2：存在非空summary
         checks.append(("has_summary", bool(str(contract.get("summary", "")).strip())))
+        # 校验3：checks字段为非空list
         checks.append(("has_checks", bool(contract.get("checks")) and isinstance(contract.get("checks"), list)))
-        checks.append(
-            (
-                "behavior_level_checks",
-                any("test" in str(item).lower() or "smoke" in str(item).lower() for item in contract.get("checks", [])),
+
+        # 新增工具函数：判断单条check是否是可执行校验命令
+        def is_executable_command(line: str) -> bool:
+            line = str(line).strip().lower()
+            # 匹配系统中所有合法验收执行命令前缀
+            exec_prefix = (
+                "python -c",
+                "python -m unittest",
+                "bash",
+                "./",
+                "pwsh",
+                "python3 -c"
             )
-        )
+            return any(line.startswith(prefix) for prefix in exec_prefix)
+
+        # 校验4：至少包含一条可执行校验脚本（替换原test/smoke关键词匹配）
+        check_items = contract.get("checks", [])
+        has_exec_check = any(is_executable_command(item) for item in check_items)
+        checks.append(("behavior_level_checks", has_exec_check))
+
+        # 汇总所有校验结果
         ok = all(value for _, value in checks)
         summary = "Acceptance contract agreed." if ok else "Acceptance contract rejected."
         result = ToolResult(ok, summary, {"checks": dict(checks), "contract": contract})
@@ -87,6 +105,9 @@ class Verifier:
         result = ToolResult(ok, summary, {"checks": dict(checks), "proposal": proposal})
         self._write_report(result)
         return result
+
+    def record_result(self, result: ToolResult) -> None:
+        self._write_report(result)
 
     def _compile_agent(self) -> tuple[bool, str | None]:
         try:

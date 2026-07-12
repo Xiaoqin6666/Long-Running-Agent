@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import shutil
 import unittest
 import uuid
@@ -11,7 +12,8 @@ from agent.llm import parse_action_json, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
-from agent.planner import create_initial_state
+from agent.planner import create_initial_state, create_initializer_state, validate_generated_task_graph, validate_initializer_script
+from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
 from agent.tools.bash import BashTool
@@ -38,6 +40,303 @@ class WorkspaceTemporaryDirectory:
 
 
 class HarnessBehaviorTests(unittest.TestCase):
+    def test_initializer_script_validator_rejects_python_source_and_state_workspace(self) -> None:
+        errors = validate_initializer_script(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "WORKSPACE_ROOT = 'state/benchmarks/todo_counter/workspace'\n"
+            "os.makedirs(WORKSPACE_ROOT, exist_ok=True)\n",
+            expected_workspace_root="eval/benchmarks/todo_counter/workspace",
+            standard_library_only=True,
+        )
+
+        combined = " ".join(errors)
+        self.assertIn("#!/usr/bin/env sh", combined)
+        self.assertIn("Python source code", combined)
+        self.assertIn("state/benchmarks", combined)
+
+    def test_generated_task_validator_rejects_semantic_quality_gaps(self) -> None:
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement summary behavior",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Tests pass with pytest."],
+                        "expected_artifacts": [],
+                        "implementation_artifacts": [],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": ["echo 'not implemented yet'"],
+                    }
+                ]
+            },
+            expected_workspace_root="eval/benchmarks/todo_counter/workspace",
+            standard_library_only=True,
+        )
+
+        combined = " ".join(errors)
+        self.assertIn("implementation_artifacts is empty", combined)
+        self.assertIn("standard-library-only", combined)
+        self.assertIn("placeholder/no-op", combined)
+
+    def test_benchmark_context_does_not_load_repository_task_graph(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tasks.json").write_text(
+                json.dumps({"tasks": [{"id": "ROOT-ONLY-TASK"}]}),
+                encoding="utf-8",
+            )
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            state_dir.mkdir(parents=True)
+            (state_dir / "project_spec.md").write_text("# Benchmark Spec\n", encoding="utf-8")
+
+            context = ContextBuilder(root, state_dir=state_dir).build(create_initial_state("Benchmark"))
+
+        self.assertIn("# Benchmark Spec", context)
+        self.assertNotIn("ROOT-ONLY-TASK", context)
+
+    def test_initializer_prompt_requires_integer_priority_with_complete_example(self) -> None:
+        self.assertIn("priority MUST be an integer", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"priority":1', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"implementation_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"verification_commands"', MAIN_AGENT_SYSTEM_PROMPT)
+
+    def test_initializer_repeated_error_forces_candidate_repair_and_promotion(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "- Use only the Python standard library.\n"
+                "- App lives under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+            candidate_graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": "high",
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Counter works."],
+                        "expected_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "test_policy": {
+                            "worker_tests_mutable_until_contract_freeze": True,
+                            "acceptance_tests_mutable_by_worker": False,
+                            "acceptance_test_repair_requires_verifier_approval": True,
+                        },
+                        "verification_commands": [
+                            "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/todo_counter/core.py').is_file()\""
+                        ],
+                    }
+                ]
+            }
+            write_action = {
+                "action": "write",
+                "target": "state/benchmarks/todo_counter/generated_tasks.json",
+                "args": {"mode": "overwrite", "content": json.dumps(candidate_graph)},
+            }
+
+            first = loop._execute_action(write_action, state)
+            loop._update_state(state, write_action, first)
+            second_action = loop._guard_action(write_action, state)
+            second = loop._execute_action(second_action, state)
+            loop._update_state(state, second_action, second)
+
+            forced = loop._guard_action(
+                {"action": "list_files", "target": "state/benchmarks/todo_counter", "args": {}},
+                state,
+            )
+            candidate_path = root / "state" / "benchmarks" / "todo_counter" / "rejected_candidates" / "generated_tasks.json"
+            candidate_exists = candidate_path.exists()
+            edit_action = {
+                "action": "edit",
+                "target": "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json",
+                "args": {"old": '"priority": "high"', "new": '"priority": 1'},
+            }
+            guarded_edit = loop._guard_action(edit_action, state)
+            promoted = loop._execute_action(guarded_edit, state)
+            generated = root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json"
+            generated_data = json.loads(generated.read_text(encoding="utf-8"))
+
+        self.assertFalse(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(state.initializer_repair, {})
+        self.assertTrue(candidate_exists)
+        self.assertEqual(forced["action"], "required_initializer_repair")
+        self.assertEqual(forced["guard_override"], "repeated_initializer_error_to_candidate_repair")
+        self.assertTrue(promoted.ok)
+        self.assertEqual(generated_data["tasks"][0]["priority"], 1)
+
+    def test_compound_echo_verification_command_is_not_treated_as_placeholder(self) -> None:
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Run final verification",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Command performs a real assertion."],
+                        "expected_artifacts": [],
+                        "implementation_artifacts": [],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": ["echo setup && python -c \"assert 2 + 2 == 4\""],
+                    }
+                ]
+            }
+        )
+
+        self.assertFalse(any("placeholder/no-op" in error for error in errors))
+
+    def test_generated_task_validator_requires_imported_module_artifact_path(self) -> None:
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement core module",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Core import works."],
+                        "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                        "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [
+                            "python -c \"import sys; sys.path.insert(0, 'eval/benchmarks/todo_counter/workspace'); from todo_counter.core import parse_todos\""
+                        ],
+                    }
+                ]
+            },
+            expected_workspace_root="eval/benchmarks/todo_counter/workspace",
+        )
+
+        self.assertIn(
+            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py",
+            " ".join(errors),
+        )
+
+    def test_generated_task_validator_requires_subprocess_module_artifact_path(self) -> None:
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement CLI module",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["CLI runs as a module."],
+                        "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/cli.py"],
+                        "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/cli.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [
+                            "python -c \"import subprocess, sys; subprocess.run([sys.executable, '-m', 'todo_counter.cli', 'todos.txt'])\""
+                        ],
+                    }
+                ]
+            },
+            expected_workspace_root="eval/benchmarks/todo_counter/workspace",
+        )
+
+        self.assertIn(
+            "eval/benchmarks/todo_counter/workspace/todo_counter/cli.py",
+            " ".join(errors),
+        )
+
+    def test_generated_task_validator_rejects_invalid_python_c_syntax(self) -> None:
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement CLI module",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["CLI behavior is checked."],
+                        "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                        "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [
+                            "python -c \"import tempfile; with tempfile.NamedTemporaryFile() as f: pass\""
+                        ],
+                    }
+                ]
+            },
+            expected_workspace_root="eval/benchmarks/todo_counter/workspace",
+        )
+
+        self.assertIn("invalid python -c syntax", " ".join(errors))
+
+    def test_initializer_repeat_count_recovers_from_pretty_trace(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="INIT", max_steps=1, benchmark_id="todo_counter")
+            loop._ensure_state_files()
+            errors_by_step = [
+                ["tasks[0].priority must be an integer."],
+                ["tasks[0].priority must be an integer.", "tasks[1].priority must be an integer."],
+                ["tasks[0].priority must be an integer.", "tasks[2].priority must be an integer."],
+            ]
+            trace = loop.trace_dir / "run_20260712_000000.jsonl"
+            trace.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "step": index,
+                            "observation": {
+                                "ok": False,
+                                "data": {"initializer_validation_errors": errors},
+                            },
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                    for index, errors in enumerate(errors_by_step, start=1)
+                ),
+                encoding="utf-8",
+            )
+            signature = loop._initializer_error_signature(errors_by_step[-1])
+
+            count = loop._recent_initializer_error_repeat_count(signature)
+
+        self.assertEqual(count, 3)
+
     def test_cli_accepts_custom_tasks_json(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["Task", "--tasks-json", "eval/benchmarks/issue_tracker/tasks.json"])
@@ -112,6 +411,60 @@ class HarnessBehaviorTests(unittest.TestCase):
                                 "depends_on": [],
                                 "acceptance_criteria": ["Skeleton exists."],
                                 "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/README.md"],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/README.md"
+                                ],
+                                "verification_commands": [
+                                    "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/README.md').is_file()\""
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (generated.parent / "init.sh").write_text(
+                "#!/usr/bin/env sh\nset -eu\npython -c \"import sys; assert sys.version_info >= (3, 8)\"\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+
+            state = loop._load_or_create_state()
+
+            self.assertEqual(state.task_id, "TC1")
+            self.assertEqual(state.nodes[0]["id"], "TC1")
+            self.assertEqual(state.nodes[0]["status"], "in_progress")
+
+    def test_initializer_remains_active_until_init_script_exists(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text("# Todo Counter\n", encoding="utf-8")
+            generated = root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json"
+            generated.parent.mkdir(parents=True)
+            generated.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "TC1",
+                                "title": "Create skeleton",
+                                "status": "pending",
+                                "priority": 1,
+                                "depends_on": [],
+                                "acceptance_criteria": ["Skeleton exists."],
+                                "expected_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/README.md"
+                                ],
                                 "verification_commands": ["python -c \"assert True\""],
                             }
                         ]
@@ -131,9 +484,247 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             state = loop._load_or_create_state()
 
-            self.assertEqual(state.task_id, "TC1")
-            self.assertEqual(state.nodes[0]["id"], "TC1")
-            self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertEqual(state.task_id, "INIT")
+        self.assertEqual(state.nodes[0]["id"], "INIT")
+
+    def test_initializer_can_write_its_artifacts_without_contract(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+            graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Counter works."],
+                        "expected_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "verification_commands": [
+                            "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+                        ],
+                    }
+                ]
+            }
+
+            observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/generated_tasks.json",
+                    "args": {"mode": "overwrite", "content": json.dumps(graph)},
+                },
+                state,
+            )
+            generated_exists = (root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json").exists()
+
+        self.assertTrue(observation.ok)
+        self.assertTrue(generated_exists)
+
+    def test_initializer_rejects_application_code_write(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text("# Todo Counter\n", encoding="utf-8")
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+
+            observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "eval/benchmarks/todo_counter/workspace/todo_counter/core.py",
+                    "args": {"mode": "overwrite", "content": "def count(): return 1\n"},
+                },
+                state,
+            )
+            workspace_exists = (root / "eval" / "benchmarks" / "todo_counter" / "workspace").exists()
+
+        self.assertFalse(observation.ok)
+        self.assertTrue(observation.data["initializer_restricted"])
+        self.assertFalse(workspace_exists)
+
+    def test_initializer_rejects_task_graph_outside_spec_workspace(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+            graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Counter works."],
+                        "expected_artifacts": [
+                            "state/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "verification_commands": ["python -c \"assert True\""],
+                    }
+                ]
+            }
+
+            observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/generated_tasks.json",
+                    "args": {"mode": "overwrite", "content": json.dumps(graph)},
+                },
+                state,
+            )
+            generated_exists = (root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json").exists()
+
+        self.assertFalse(observation.ok)
+        self.assertIn("initializer_validation_errors", observation.data)
+        self.assertIn("eval/benchmarks/todo_counter/workspace", " ".join(observation.data["initializer_validation_errors"]))
+        self.assertFalse(generated_exists)
+
+    def test_initializer_outputs_pass_verifier_without_contract(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+            graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Counter works."],
+                        "expected_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "verification_commands": [
+                            "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/todo_counter/core.py').is_file()\""
+                        ],
+                    }
+                ]
+            }
+            actions = [
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/generated_tasks.json",
+                    "args": {"mode": "overwrite", "content": json.dumps(graph)},
+                },
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/init.sh",
+                    "args": {
+                        "mode": "overwrite",
+                        "content": (
+                            "#!/usr/bin/env sh\n"
+                            "set -eu\n"
+                            "python -c \"import sys; assert sys.version_info >= (3, 8)\"\n"
+                        ),
+                    },
+                },
+            ]
+            for action in actions:
+                observation = loop._execute_action(action, state)
+                self.assertTrue(observation.ok)
+                loop._update_state(state, action, observation)
+
+            attempted_answer = {
+                "action": "answer",
+                "target": "",
+                "args": {"answer": "INIT is complete."},
+            }
+            early_verify = loop._execute_action(
+                {"action": "verify", "target": "default", "args": {}},
+                state,
+            )
+            self.assertFalse(early_verify.ok)
+            self.assertFalse(early_verify.data["initializer_command_passed"])
+            guarded_command = loop._guard_action(attempted_answer, state)
+            self.assertEqual(guarded_command["action"], "bash")
+            self.assertEqual(guarded_command["guard_override"], "initializer_artifacts_ready_to_command")
+            command_result = loop._execute_action(guarded_command, state)
+            self.assertTrue(command_result.ok)
+            loop._update_state(state, guarded_command, command_result)
+            self.assertTrue(state.initializer_command_passed)
+
+            guarded_verify = loop._guard_action(attempted_answer, state)
+            self.assertEqual(guarded_verify["action"], "verify")
+            self.assertEqual(guarded_verify["guard_override"], "initializer_command_passed_to_verify")
+            verification = loop._execute_action(guarded_verify, state)
+            loop._update_state(state, guarded_verify, verification)
+            report_exists = (
+                root / "state" / "benchmarks" / "todo_counter" / "verifier_report.md"
+            ).exists()
+            answer_result = loop._execute_action(
+                attempted_answer,
+                state,
+            )
+
+        self.assertTrue(verification.ok)
+        self.assertFalse(answer_result.ok)
+        self.assertTrue(answer_result.data["initializer_requires_verification"])
+        self.assertEqual(state.acceptance_contracts, [])
+        self.assertEqual(state.nodes[0]["status"], "completed")
+        self.assertTrue(report_exists)
 
     def test_custom_tasks_json_is_copied_to_runtime_state(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -548,6 +1139,152 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(guarded["target"], "eval/benchmarks/issue_tracker/workspace/README.md")
         self.assertEqual(guarded["guard_override"], "missing_path_list_files_to_write")
         self.assertTrue(observation.ok)
+
+    def test_resume_initializer_missing_init_writes_init_script_before_more_listing(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "# Todo Counter\n\nWorkspace root: `eval/benchmarks/todo_counter/workspace`\n",
+                encoding="utf-8",
+            )
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            state_dir.mkdir(parents=True)
+            (state_dir / "traces").mkdir()
+            (state_dir / "project_spec.md").write_text(spec.read_text(encoding="utf-8"), encoding="utf-8")
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implement core",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "pending",
+                                "acceptance_criteria": ["Core behavior works."],
+                                "expected_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                                ],
+                                "worker_test_artifacts": [],
+                                "acceptance_artifacts": [],
+                                "frozen_acceptance_artifacts": [],
+                                "test_policy": {
+                                    "worker_tests_mutable_until_contract_freeze": True,
+                                    "acceptance_tests_mutable_by_worker": False,
+                                    "acceptance_test_repair_requires_verifier_approval": True,
+                                },
+                                "verification_commands": [
+                                    "python -c \"import sys; sys.path.insert(0,'eval/benchmarks/todo_counter/workspace'); import todo_counter.core\""
+                                ],
+                            }
+                        ]
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="INIT",
+                max_steps=1,
+                resume=True,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            state = create_initializer_state(
+                "INIT",
+                project_spec_artifact="state/benchmarks/todo_counter/project_spec.md",
+                generated_tasks_artifact="state/benchmarks/todo_counter/generated_tasks.json",
+                init_artifact="state/benchmarks/todo_counter/init.sh",
+            )
+            state.last_action = {
+                "action": "list_files",
+                "target": "eval/benchmarks/todo_counter/workspace",
+                "args": {},
+            }
+            state.last_observation = {
+                "ok": False,
+                "summary": "List failed: path does not exist.",
+                "data": {"missing_path": True, "recommended_action": "write"},
+            }
+
+            guarded = loop._guard_action(
+                {
+                    "thought_summary": "List workspace again.",
+                    "action": "list_files",
+                    "target": "eval/benchmarks/todo_counter/workspace",
+                    "args": {},
+                    "expected_observation": "List workspace.",
+                    "risk": "low",
+                },
+                state,
+            )
+            observation = loop._execute_action(guarded, state)
+            init_script = (state_dir / "init.sh").read_text(encoding="utf-8")
+
+        self.assertEqual(guarded["action"], "write")
+        self.assertEqual(guarded["target"], "state/benchmarks/todo_counter/init.sh")
+        self.assertEqual(guarded["guard_override"], "initializer_missing_artifact_to_write")
+        self.assertTrue(observation.ok)
+        self.assertTrue(init_script.startswith("#!/usr/bin/env sh\n"))
+        self.assertIn("set -eu", init_script.splitlines())
+
+    def test_initializer_saved_candidate_is_repaired_before_empty_generated_write(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "# Todo Counter\n\nWorkspace root: `eval/benchmarks/todo_counter/workspace`\n",
+                encoding="utf-8",
+            )
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            candidate = state_dir / "rejected_candidates" / "generated_tasks.json"
+            candidate.parent.mkdir(parents=True)
+            (state_dir / "traces").mkdir()
+            (state_dir / "project_spec.md").write_text(spec.read_text(encoding="utf-8"), encoding="utf-8")
+            candidate.write_text('{"tasks": [', encoding="utf-8")
+            loop = AgentLoop(
+                root=root,
+                task="INIT",
+                max_steps=1,
+                resume=True,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            state = create_initializer_state(
+                "INIT",
+                project_spec_artifact="state/benchmarks/todo_counter/project_spec.md",
+                generated_tasks_artifact="state/benchmarks/todo_counter/generated_tasks.json",
+                init_artifact="state/benchmarks/todo_counter/init.sh",
+            )
+            state.initializer_repair = {
+                "candidate_path": "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json",
+                "validation_errors": ["Expecting ',' delimiter"],
+                "error_signature": "Expecting ',' delimiter",
+                "repeat_count": 1,
+            }
+
+            guarded = loop._guard_action(
+                {
+                    "thought_summary": "Write missing generated tasks.",
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/generated_tasks.json",
+                    "args": {"mode": "create", "content": ""},
+                    "expected_observation": "Create generated tasks.",
+                    "risk": "low",
+                },
+                state,
+            )
+
+        self.assertEqual(guarded["action"], "read")
+        self.assertEqual(guarded["target"], "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json")
+        self.assertEqual(guarded["guard_override"], "initializer_candidate_repair_before_missing_artifact")
 
     def test_guard_rewrites_repeated_existing_list_to_next_missing_file(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1701,6 +2438,52 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("workspace/issue_tracker/store.py", state.pending_repair["targets"])
         self.assertEqual(state.pending_repair["repair_targets"], ["workspace/issue_tracker/store.py"])
 
+    def test_pending_repair_infers_package_module_path_from_import_failure(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement core", max_steps=1)
+            state = create_initial_state("Implement core")
+            state.task_id = "T2"
+            state.nodes = [
+                {
+                    "id": "T2",
+                    "title": "Core",
+                    "status": "in_progress",
+                    "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                    "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                    "verification_commands": [
+                        "python -c \"import sys; sys.path.insert(0, 'eval/benchmarks/todo_counter/workspace'); from todo_counter.core import parse_todos\""
+                    ],
+                }
+            ]
+            state.acceptance_contracts.append(
+                {
+                    "task_id": "T2",
+                    "summary": "Implement core.",
+                    "checks": [
+                        "python -c \"import sys; sys.path.insert(0, 'eval/benchmarks/todo_counter/workspace'); from todo_counter.core import parse_todos\""
+                    ],
+                    "status": "agreed",
+                }
+            )
+            command = state.acceptance_contracts[-1]["checks"][0]
+            output = "ModuleNotFoundError: No module named 'todo_counter'\n"
+
+            loop._update_state(
+                state,
+                {"action": "bash", "target": command, "args": {}},
+                ToolResult(False, "Command exited with code 1.", {"command": command, "output": output}),
+            )
+
+        self.assertIn("eval/benchmarks/todo_counter/workspace/todo_counter/core.py", state.pending_repair["targets"])
+        self.assertIn("eval/benchmarks/todo_counter/workspace/todo_counter/__init__.py", state.pending_repair["targets"])
+        self.assertEqual(
+            state.pending_repair["repair_targets"][0],
+            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py",
+        )
+
     def test_pending_repair_is_cleared_only_after_contract_command_passes(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1772,6 +2555,86 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(guarded["target"], "python -m unittest discover -s workspace/tests")
         self.assertEqual(guarded["guard_override"], "failed_contract_repair_to_retest")
         self.assertEqual(state.pending_repair, {})
+
+    def test_contract_command_syntax_error_allows_corrected_bash_retest(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement CLI", max_steps=1)
+            state = create_initial_state("Implement CLI")
+            state.task_id = "T3"
+            bad_command = (
+                "python -c \"import tempfile; "
+                "with tempfile.NamedTemporaryFile(mode='w') as f: pass\""
+            )
+            fixed_command = "python -c \"import tempfile; f=tempfile.NamedTemporaryFile(mode='w'); f.close()\""
+            state.nodes = [
+                {
+                    "id": "T3",
+                    "title": "CLI",
+                    "status": "in_progress",
+                    "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                    "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                    "verification_commands": [bad_command],
+                }
+            ]
+            state.acceptance_contracts.append(
+                {
+                    "task_id": "T3",
+                    "summary": "Implement CLI.",
+                    "checks": [bad_command],
+                    "status": "agreed",
+                }
+            )
+            output = (
+                "File \"<string>\", line 1\n"
+                "    import tempfile; with tempfile.NamedTemporaryFile(mode='w') as f: pass\n"
+                "                     ^^^^\n"
+                "SyntaxError: invalid syntax"
+            )
+
+            loop._update_state(
+                state,
+                {"action": "bash", "target": bad_command, "args": {}},
+                ToolResult(False, "Command exited with code 1.", {"command": bad_command, "output": output}),
+            )
+            blocked_verify = loop._guard_action(
+                {
+                    "thought_summary": "Submit verification.",
+                    "action": "verify",
+                    "target": "default",
+                    "args": {},
+                    "expected_observation": "Verifier passes.",
+                    "risk": "low",
+                },
+                state,
+            )
+            blocked_observation = loop._execute_action(blocked_verify, state)
+            guarded = loop._guard_action(
+                {
+                    "thought_summary": "Run corrected equivalent command.",
+                    "action": "bash",
+                    "target": fixed_command,
+                    "args": {},
+                    "expected_observation": "Corrected command passes.",
+                    "risk": "low",
+                },
+                state,
+            )
+            loop._update_state(
+                state,
+                guarded,
+                ToolResult(True, "Command exited with code 0.", {"command": fixed_command, "output": ""}),
+            )
+
+        self.assertEqual(state.pending_repair, {})
+        self.assertEqual(blocked_verify["action"], "required_command_repair")
+        self.assertEqual(blocked_verify["guard_override"], "failed_contract_command_syntax_requires_corrected_bash")
+        self.assertFalse(blocked_observation.ok)
+        self.assertEqual(blocked_observation.data["required_action"], "bash_corrected_acceptance_command")
+        self.assertEqual(guarded["action"], "bash")
+        self.assertEqual(guarded["target"], fixed_command)
 
     def test_pending_repair_write_create_mode_becomes_overwrite(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2258,6 +3121,170 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Hard Memory", context)
         self.assertIn("# Soft Memory", context)
         self.assertIn("Soft Memory is not evidence", context)
+
+    def test_context_builder_preserves_last_action_when_reference_context_is_large(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            (state_dir / "rejected_candidates").mkdir(parents=True)
+            (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
+            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            (state_dir / "project_spec.md").write_text("# Spec\n" + ("spec\n" * 500), encoding="utf-8")
+            (state_dir / "handoff.md").write_text(
+                "# Worker Session Handoff\n\n"
+                "## 9. Evidence Sources\n"
+                + ("- noisy evidence\n" * 500)
+                + "\n## 15. Suggested Next Action\nRepair the saved INIT candidate.\n",
+                encoding="utf-8",
+            )
+            (state_dir / "rejected_candidates" / "generated_tasks.json").write_text(
+                "{\"tasks\": [\n" + (" " * 6000),
+                encoding="utf-8",
+            )
+            state = create_initializer_state(
+                "INIT",
+                project_spec_artifact="state/benchmarks/todo_counter/project_spec.md",
+                generated_tasks_artifact="state/benchmarks/todo_counter/generated_tasks.json",
+                init_artifact="state/benchmarks/todo_counter/init.sh",
+            )
+            state.last_action = {"action": "write", "target": "state/benchmarks/todo_counter/generated_tasks.json"}
+            state.last_observation = {
+                "ok": False,
+                "summary": "INIT write rejected: generated_tasks.json is invalid JSON.",
+                "data": {"initializer_validation_errors": ["Expecting ',' delimiter"]},
+            }
+            state.initializer_repair = {
+                "candidate_path": "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json",
+                "validation_errors": ["Expecting ',' delimiter"],
+                "repeat_count": 1,
+            }
+
+            context = ContextBuilder(root, max_chars=3500, state_dir=state_dir).build(state)
+
+        self.assertIn("# Critical Context", context)
+        self.assertIn("## Last Action", context)
+        self.assertIn("## Last Observation", context)
+        self.assertIn("INIT write rejected", context)
+        self.assertIn("Repair the saved INIT candidate", context)
+        self.assertIn("reference context omitted", context)
+
+    def test_context_builder_does_not_truncate_by_default(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
+            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            (state_dir / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
+            (state_dir / "project_spec.md").write_text("# Spec\n" + ("details\n" * 3000), encoding="utf-8")
+            state = create_initial_state("Implement a feature")
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertNotIn("[context truncated by harness]", context)
+        self.assertIn("# Critical Context", context)
+        self.assertIn("# Startup Context", context)
+
+    def test_context_builder_uses_env_budget_only_when_configured(self) -> None:
+        previous = os.environ.get("LONG_AGENT_CONTEXT_MAX_CHARS")
+        os.environ["LONG_AGENT_CONTEXT_MAX_CHARS"] = "3000"
+        try:
+            with WorkspaceTemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state_dir = root / "state"
+                state_dir.mkdir()
+                (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
+                (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+                (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+                (state_dir / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
+                (state_dir / "project_spec.md").write_text("# Spec\n" + ("details\n" * 3000), encoding="utf-8")
+                state = create_initial_state("Implement a feature")
+
+                context = ContextBuilder(root).build(state)
+        finally:
+            if previous is None:
+                os.environ.pop("LONG_AGENT_CONTEXT_MAX_CHARS", None)
+            else:
+                os.environ["LONG_AGENT_CONTEXT_MAX_CHARS"] = previous
+
+        self.assertIn("# Critical Context", context)
+        self.assertIn("## Last Action", context)
+        self.assertIn("[context truncated by harness]", context)
+
+    def test_context_builder_includes_recent_step_trace_with_guard_overrides(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            trace_dir = state_dir / "traces"
+            trace_dir.mkdir(parents=True)
+            (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
+            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            events = [
+                {
+                    "step": 7,
+                    "model_action": {
+                        "action": "read",
+                        "target": "eval/benchmarks/todo_counter/workspace/core.py",
+                    },
+                    "action": {
+                        "action": "required_repair",
+                        "target": "eval/benchmarks/todo_counter/workspace/core.py",
+                        "guard_override": "failed_contract_requires_repair",
+                    },
+                    "observation": {
+                        "ok": False,
+                        "summary": "Action rejected: repair core.py first.",
+                        "data": {"required_action": "write_or_edit", "target": "eval/benchmarks/todo_counter/workspace/core.py"},
+                    },
+                }
+            ]
+            (trace_dir / "run_20260712_000000.jsonl").write_text(
+                "".join(json.dumps(event, indent=2) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            state = create_initial_state("Implement core")
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("## Recent Step Trace", context)
+        self.assertIn("model=read eval/benchmarks/todo_counter/workspace/core.py", context)
+        self.assertIn("action=required_repair eval/benchmarks/todo_counter/workspace/core.py", context)
+        self.assertIn("guard=failed_contract_requires_repair", context)
+        self.assertIn("required_action=write_or_edit", context)
+
+    def test_context_builder_infers_package_repair_targets_from_import_failure(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            state = create_initial_state("Implement todo counter")
+            state.nodes = [
+                {
+                    "id": "T2",
+                    "title": "Core",
+                    "status": "in_progress",
+                    "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                    "verification_commands": [
+                        "python -c \"import sys; sys.path.insert(0, 'eval/benchmarks/todo_counter/workspace'); "
+                        "from todo_counter.core import count_todos\""
+                    ],
+                }
+            ]
+            state.pending_repair = {
+                "command": state.nodes[0]["verification_commands"][0],
+                "output": "ModuleNotFoundError: No module named 'todo_counter'",
+                "targets": ["eval/benchmarks/todo_counter/workspace/core.py"],
+                "repair_targets": ["eval/benchmarks/todo_counter/workspace/core.py"],
+            }
+
+            context = ContextBuilder(root, state_dir=state_dir).build(state)
+
+        self.assertIn("Inferred repair targets from import failure", context)
+        self.assertIn("eval/benchmarks/todo_counter/workspace/todo_counter/core.py", context)
+        self.assertIn("eval/benchmarks/todo_counter/workspace/todo_counter/__init__.py", context)
 
     def test_verifier_writes_latest_report(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
