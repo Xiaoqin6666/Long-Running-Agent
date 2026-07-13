@@ -8,6 +8,11 @@ from pathlib import Path
 from agent.planner import TaskState
 
 
+RECENT_TOOL_OBSERVATION_LIMIT = 3
+RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
+RECENT_TOOL_OBSERVATIONS_MAX_CHARS = 18000
+
+
 class ContextBuilder:
     def __init__(self, root: Path, max_chars: int | None = None, state_dir: Path | None = None) -> None:
         self.root = root
@@ -28,7 +33,7 @@ class ContextBuilder:
     def _critical_context(self, state: TaskState) -> str:
         lines = [
             "# Critical Context",
-            "This section contains only non-negotiable rules and immediate operational state.",
+            "This section contains immediate operational state and the benchmark safety boundary.",
             f"- current_task_id: {self._active_task_id(state)}",
             "",
             "## Last Step Summary",
@@ -36,17 +41,14 @@ class ContextBuilder:
             "",
             "## Repair Summary",
             self._repair_summary(state),
-            "",
-            "## Non-Negotiable Rules",
-            "- Return one schema-valid action. The harness owns verification and state transitions.",
-            "- Do not repeat a failed action unchanged from handoff.md, current state, or the latest observation.",
-            "- Do not list the same target repeatedly; after a missing_path listing, write the required artifact instead.",
-            "- If an agreed acceptance contract already exists for the current task, do not submit another contract unless the verifier rejected it.",
-            "- Completion requires verifier evidence; do not self-certify completion.",
         ]
         if self.state_dir != self.root / "state":
-            lines.append(
-                "- Benchmark isolation: Git is read-only. Never run git add or git commit, and never try to clean the host Agent repository."
+            lines.extend(
+                [
+                    "",
+                    "## Safety Boundary",
+                    "- Benchmark isolation: Git is read-only. Never run git add or git commit, and never try to clean the host Agent repository.",
+                ]
             )
         return "\n".join(lines)
 
@@ -68,18 +70,19 @@ class ContextBuilder:
         pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
         if pending:
-            command = str(pending.get("command", "")).replace("\n", " ")[:220]
+            reason = str(pending.get("reason", "pending_repair")).replace("\n", " ")[:80]
+            command = str(pending.get("command", "")).replace("\n", " ")[:180]
             targets = ", ".join(self._pending_repair_write_targets(state) or self._pending_repair_targets(state))
-            output = str(pending.get("output", pending.get("summary", ""))).replace("\n", " ")[:260]
-            lines.append(f"- pending_repair: command={command}; targets={targets or 'none'}; output={output}")
-            inferred = self._inferred_pending_repair_targets(state)
-            if inferred:
-                lines.append(f"- Inferred repair targets from import failure: {', '.join(inferred)}")
+            failure = str(pending.get("output", pending.get("summary", ""))).replace("\n", " ")[:180]
+            lines.append(
+                f"- pending_repair: reason={reason}; command={command or 'none'}; "
+                f"targets={targets or 'none'}; failure={failure or 'none'}"
+            )
         if initializer:
             candidate = str(initializer.get("candidate_path", ""))
             errors = initializer.get("validation_errors", [])
             error_text = " | ".join(str(error) for error in errors) if isinstance(errors, list) else str(errors)
-            lines.append(f"- initializer_repair: candidate={candidate}; errors={error_text[:260]}")
+            lines.append(f"- initializer_repair: candidate={candidate}; first_error={error_text[:180]}")
         return "\n".join(lines) if lines else "No pending repair."
 
     def _tail_guard_context(self, state: TaskState) -> str:
@@ -167,6 +170,8 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _working_context(self, state: TaskState) -> str:
+        repair_details = self._pending_repair_context(state)
+        recent_tool_observations = self._recent_tool_observations_context(state)
         lines = [
             "# Working Context",
             "Use this to choose the next task-local action.",
@@ -204,6 +209,8 @@ class ContextBuilder:
                 for command in self._format_artifacts(node.get("verification_commands", []))
             ],
             "",
+            *(["# Repair Details", repair_details, ""] if repair_details else []),
+            *(["# Recent Tool Observations", recent_tool_observations, ""] if recent_tool_observations else []),
             "# Just-in-Time Discovery",
             "Do not preload the whole repository. Read only what is needed for the active task.",
             "Recommended discovery flow:",
@@ -353,12 +360,120 @@ class ContextBuilder:
 
     def _pending_repair_context(self, state: TaskState) -> str:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        lines = [str(repair)]
-        inferred = self._inferred_pending_repair_targets(state)
-        if inferred:
-            lines.extend(["", "Inferred repair targets from import failure:"])
-            lines.extend(f"- {target}" for target in inferred)
+        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        lines: list[str] = []
+        if repair:
+            lines.extend(
+                [
+                    f"- reason: {repair.get('reason', 'pending_repair')}",
+                    f"- command: {str(repair.get('command', '')).replace(chr(10), ' ')[:1000] or 'none'}",
+                    f"- summary: {str(repair.get('summary', ''))[:1000] or 'none'}",
+                    f"- failure_output: {str(repair.get('output', ''))[:2000] or 'none'}",
+                    f"- diagnostic_targets: {repair.get('targets', [])}",
+                    f"- repair_targets: {self._pending_repair_write_targets(state)}",
+                    f"- required_reads: {repair.get('required_reads', [])}",
+                    f"- completed_reads: {repair.get('read_targets', [])}",
+                    f"- repaired_targets: {repair.get('repaired_targets', [])}",
+                ]
+            )
+            inferred = self._inferred_pending_repair_targets(state)
+            if inferred:
+                lines.append(f"- inferred_import_targets: {inferred}")
+        if initializer:
+            errors = initializer.get("validation_errors", [])
+            lines.extend(
+                [
+                    f"- initializer_candidate: {initializer.get('candidate_path', '')}",
+                    f"- initializer_validation_errors: {errors if isinstance(errors, list) else [str(errors)]}",
+                ]
+            )
         return "\n".join(lines)
+
+    def _recent_tool_observations_context(self, state: TaskState) -> str:
+        records: list[tuple[dict[str, object], dict[str, object]]] = []
+        seen_targets: set[str] = set()
+
+        def consider(action: object, observation: object) -> None:
+            if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
+                return
+            if not isinstance(action, dict) or not isinstance(observation, dict):
+                return
+            action_name = str(action.get("action", ""))
+            target = str(action.get("target", "")).replace("\\", "/").strip().rstrip("/")
+            if not target:
+                return
+            if action_name in {"write", "edit"} and observation.get("ok") is True:
+                seen_targets.add(target)
+                return
+            if action_name not in {"read", "list_files", "search"} or observation.get("ok") is not True:
+                return
+            if target in seen_targets:
+                return
+            seen_targets.add(target)
+            records.append((action, observation))
+
+        consider(state.last_action, state.last_observation)
+        trace_dir = self.state_dir / "traces"
+        if trace_dir.exists() and len(records) < RECENT_TOOL_OBSERVATION_LIMIT:
+            trace_paths = sorted(
+                trace_dir.glob("run_*.jsonl"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for trace_path in trace_paths[:5]:
+                for event in reversed(self._load_trace_events(trace_path)):
+                    consider(event.get("action"), event.get("observation"))
+                    if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
+                        break
+                if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
+                    break
+
+        chunks: list[str] = []
+        used = 0
+        for index, (action, observation) in enumerate(records, start=1):
+            heading = f"## Observation {index}{' (most recent)' if index == 1 else ''}\n"
+            separator = "\n\n" if chunks else ""
+            remaining = RECENT_TOOL_OBSERVATIONS_MAX_CHARS - used - len(separator) - len(heading)
+            if remaining < 200:
+                break
+            block = self._format_tool_observation(
+                action,
+                observation,
+                max_chars=min(RECENT_TOOL_OBSERVATION_MAX_CHARS, remaining),
+            )
+            chunks.append(heading + block)
+            used += len(separator) + len(heading) + len(block)
+        return "\n\n".join(chunks)
+
+    def _format_tool_observation(
+        self,
+        action: dict[str, object],
+        observation: dict[str, object],
+        *,
+        max_chars: int,
+    ) -> str:
+        action_name = str(action.get("action", ""))
+        data = observation.get("data", {})
+        if not isinstance(data, dict):
+            return ""
+
+        target = str(action.get("target", ""))
+        metadata = [f"- action: {action_name}", f"- target: {target}", f"- ok: {observation.get('ok')}"]
+        if action_name == "read":
+            metadata.append(f"- range: {data.get('start', '?')}-{data.get('end', '?')}")
+            payload = str(data.get("content", ""))
+        elif action_name == "list_files":
+            payload = json.dumps(data.get("entries", []), ensure_ascii=False, indent=2)
+        else:
+            payload = json.dumps(data.get("matches", []), ensure_ascii=False, indent=2)
+
+        prefix = "\n".join([*metadata, "--- BEGIN TOOL OUTPUT ---", ""])
+        suffix = "\n--- END TOOL OUTPUT ---"
+        truncation = "\n[tool output truncated]"
+        available = max(0, max_chars - len(prefix) - len(suffix))
+        if len(payload) > available:
+            payload = payload[: max(0, available - len(truncation))].rstrip() + truncation
+        return prefix + payload + suffix
 
     def _inferred_pending_repair_targets(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -424,24 +539,20 @@ class ContextBuilder:
         lines = []
         for event in events[-limit:]:
             step = event.get("step", "?")
-            model_action = event.get("model_action")
             action = event.get("action", {})
             observation = event.get("observation", {})
             if not isinstance(action, dict):
                 action = {}
             if not isinstance(observation, dict):
                 observation = {}
-            model_text = self._compact_action(model_action) if isinstance(model_action, dict) else "<none>"
             action_text = self._compact_action(action)
-            guard = action.get("guard_override")
-            guard_text = f"; guard={guard}" if guard else ""
             ok = observation.get("ok")
             summary = str(observation.get("summary", "")).replace("\n", " ")[:240]
             data_text = self._compact_observation_data(observation.get("data", {}))
             if data_text:
                 data_text = f"; data={data_text}"
             lines.append(
-                f"- step {step}: model={model_text}; action={action_text}{guard_text}; ok={ok}; summary={summary}{data_text}"
+                f"- step {step}: action={action_text}; ok={ok}; summary={summary}{data_text}"
             )
         return "\n".join(lines)
 
@@ -481,7 +592,6 @@ class ContextBuilder:
             "required_action",
             "target",
             "candidate_path",
-            "guard_override",
             "initializer_validation_errors",
             "initializer_error_repeat_count",
             "command",
@@ -518,7 +628,7 @@ class ContextBuilder:
             "Verification commands run from the repository root. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal complete task example:",
-            '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_until_contract_freeze":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
+            '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
             "Implementation tasks must declare non-empty implementation_artifacts, and every owned implementation/test/acceptance artifact must also appear in expected_artifacts.",
             "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation). Verification commands must be substantive and must not be placeholders such as bare echo, TODO, or 'not implemented'.",
             "INIT does not require an acceptance contract.",
@@ -708,7 +818,7 @@ class ContextBuilder:
             f"- acceptance_artifacts: {', '.join(acceptance) if acceptance else 'none'}",
             f"- frozen_acceptance_artifacts: {', '.join(frozen) if frozen else 'none'}",
             f"- test_policy: {policy}",
-            "- Rule: implementation artifacts are normal repair targets; worker tests are mutable before contract freeze; frozen acceptance tests are read-only for Worker.",
+            "- Rule: implementation artifacts are normal repair targets; worker tests remain mutable unless explicitly listed in frozen_acceptance_artifacts.",
         ]
 
     def _active_task_implementation_artifacts(self, state: TaskState) -> list[str]:
@@ -742,18 +852,11 @@ class ContextBuilder:
     def _active_task_acceptance_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "acceptance_artifacts"):
             return self._active_task_artifacts_by_key(state, "acceptance_artifacts")
-        if any(item.get("status") == "agreed" for item in state.acceptance_contracts):
-            return self._active_task_worker_test_artifacts(state)
         return []
 
     def _active_task_frozen_acceptance_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "frozen_acceptance_artifacts"):
             return self._active_task_artifacts_by_key(state, "frozen_acceptance_artifacts")
-        policy = self._active_task_test_policy(state)
-        if policy.get("acceptance_tests_mutable_by_worker") is False and any(
-            item.get("status") == "agreed" for item in state.acceptance_contracts
-        ):
-            return self._active_task_acceptance_artifacts(state)
         return []
 
     def _active_task_has_key(self, state: TaskState, key: str) -> bool:
@@ -772,14 +875,12 @@ class ContextBuilder:
                 policy = node.get("test_policy", {})
                 if isinstance(policy, dict):
                     merged: dict[str, object] = {
-                        "worker_tests_mutable_until_contract_freeze": True,
                         "acceptance_tests_mutable_by_worker": False,
                         "acceptance_test_repair_requires_verifier_approval": True,
                     }
                     merged.update(policy)
                     return merged
         return {
-            "worker_tests_mutable_until_contract_freeze": True,
             "acceptance_tests_mutable_by_worker": False,
             "acceptance_test_repair_requires_verifier_approval": True,
         }
@@ -804,7 +905,7 @@ class ContextBuilder:
             item.replace("\\", "/").strip().rstrip("/")
             for item in self._active_task_worker_test_artifacts(state)
         }
-        return normalized in worker_tests and not any(item.get("status") == "agreed" for item in state.acceptance_contracts)
+        return normalized in worker_tests
 
     def _looks_like_test_artifact(self, target: str) -> bool:
         normalized = target.replace("\\", "/")

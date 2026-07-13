@@ -179,10 +179,8 @@ class AgentLoop:
         for step in range(1, self.max_steps + 1):
             steps = step
             context = self.context_builder.build(state)
-            model_action: dict[str, Any] | None = None
             try:
-                model_action = self.decision_maker.next_action(context, state)
-                action = self._guard_action(model_action, state)
+                action = self.decision_maker.next_action(context, state)
                 observation = self._execute_action(action, state)
             except Exception as exc:
                 LOGGER.exception("Step %s model/tool protocol error", step)
@@ -197,7 +195,7 @@ class AgentLoop:
                 observation = ToolResult(False, f"Protocol error: {exc}", {"error_type": type(exc).__name__})
             self._record_budget_usage(state, context, action, observation)
             self._update_state(state, action, observation)
-            self._append_trace(step, action, observation, state, model_action=model_action)
+            self._append_trace(step, action, observation, state)
             self._write_state(state)
             LOGGER.info(
                 "Step %s action=%s target=%s ok=%s task_id=%s used_tokens=%s handoff_ready=%s observation=%s",
@@ -308,74 +306,6 @@ class AgentLoop:
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
-        if name == "required_write":
-            target = str(action.get("target", ""))
-            return ToolResult(
-                False,
-                f"Action rejected: expected code artifact is incomplete. Write an implementation to {target} with mode='overwrite' before further inspection or tests.",
-                {"required_action": "write", "target": target, "mode": "overwrite", "counts_as_progress": False},
-            )
-        if name == "required_repair":
-            args = action.get("args", {})
-            targets = args.get("targets", []) if isinstance(args, dict) else []
-            primary = str(action.get("target", ""))
-            return ToolResult(
-                False,
-                (
-                    "Action rejected: the last acceptance command failed. "
-                    f"Repair {primary} with write or edit before further inspection or tests."
-                ),
-                {
-                    "required_action": "write_or_edit",
-                    "target": primary,
-                    "targets": targets,
-                    "counts_as_progress": False,
-                },
-            )
-        if name == "required_command_repair":
-            args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
-            failure_type = str(args.get("failure_type", "command_error"))
-            suggested = str(args.get("suggested_command", ""))
-            hint = str(args.get("repair_hint", ""))
-            return ToolResult(
-                False,
-                "Action rejected: the acceptance command or its runtime environment is invalid. "
-                "Run a corrected equivalent bash command before verification or implementation repair.",
-                {
-                    "required_action": "bash_corrected_acceptance_command",
-                    "bad_command": args.get("bad_command", action.get("target", "")),
-                    "failure_summary": args.get("failure_summary", ""),
-                    "failure_type": failure_type,
-                    "suggested_command": suggested,
-                    "repair_hint": hint,
-                    "counts_as_progress": False,
-                },
-            )
-        if name == "required_initializer_repair":
-            args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
-            candidate = str(action.get("target", ""))
-            errors = args.get("errors", [])
-            return ToolResult(
-                False,
-                "INIT repair required: edit or overwrite the saved candidate instead of regenerating the full task graph.",
-                {
-                    "required_action": "edit_or_write_candidate",
-                    "candidate_path": candidate,
-                    "initializer_validation_errors": errors if isinstance(errors, list) else [],
-                    "repeat_count": args.get("repeat_count", 2),
-                    "counts_as_progress": False,
-                },
-            )
-        if name == "blocked_repeat":
-            return ToolResult(
-                False,
-                "Action rejected: do not repeat a failed or no-progress action unchanged; use the handoff suggested next action or explain a blocker.",
-                {
-                    "blocked_repeat": True,
-                    "required_next_action": self._suggest_next_action(state),
-                    "counts_as_progress": False,
-                },
-            )
         if name == "answer":
             if self._is_initializer_task(state):
                 outputs = self._validate_initializer_outputs()
@@ -480,392 +410,6 @@ class AgentLoop:
                 return post_write_check
         return result
 
-    def _guard_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any]:
-        initializer_action = self._guard_initializer_progress(action, state)
-        if initializer_action:
-            return initializer_action
-        pending_repair_action = self._guard_pending_repair(action, state)
-        if pending_repair_action:
-            return pending_repair_action
-        frozen_test_action = self._guard_frozen_acceptance_test_edit(action, state)
-        if frozen_test_action:
-            return frozen_test_action
-        repair_action = self._repair_action_after_failed_contract(state)
-        if repair_action and action.get("action") != "verify":
-            return repair_action
-        required_write_target = self._required_write_target(state)
-        if required_write_target and not self._is_write_for_target(action, required_write_target):
-            return {
-                "thought_summary": (
-                    "Guard override: an expected code artifact is empty/incomplete, "
-                    "so further inspection or tests are blocked until the worker writes it."
-                ),
-                "action": "required_write",
-                "target": required_write_target,
-                "args": {"mode": "overwrite"},
-                "expected_observation": "Harness rejects no-progress actions until the artifact is implemented.",
-                "risk": "low",
-                "guard_override": "block_until_required_write",
-            }
-        if action.get("action") != "verify" and self._last_contract_check_passed(state):
-            return {
-                "thought_summary": (
-                    "Guard override: an acceptance contract check already passed, "
-                    "so submit the current task to the verifier instead of collecting more context."
-                ),
-                "action": "verify",
-                "target": "default",
-                "args": {},
-                "expected_observation": "Verifier checks the candidate and updates task status.",
-                "risk": "low",
-                "guard_override": "smoke_passed_to_verify",
-            }
-        resume_action = self._guard_resume_suggested_action(action, state)
-        if resume_action:
-            return resume_action
-        if action.get("action") == "write":
-            return self._guard_duplicate_create(action, state)
-        repeated_failed_action = self._guard_repeated_failed_action(action, state)
-        if repeated_failed_action and action.get("action") != "list_files":
-            return repeated_failed_action
-        if action.get("action") != "list_files":
-            return action
-        if self._is_initializer_task(state):
-            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
-        if not self._has_contract_for_active_task(state):
-            if self._should_create_contract_after_inspection(action, state):
-                return self._synthesize_contract_action(state)
-            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
-        target = self._next_contract_file_target(state)
-        if not target and self._should_rewrite_list_to_write(action, state):
-            target = self._next_implementation_file_target(state)
-        if not target and self._all_contract_file_targets_exist(state):
-            smoke_command = self._contract_smoke_command(state)
-            if smoke_command:
-                return {
-                    "thought_summary": (
-                        "Guard override: required contract files already exist, "
-                        "so run the contract smoke test instead of listing again."
-                    ),
-                    "action": "bash",
-                    "target": smoke_command,
-                    "args": {},
-                    "expected_observation": "Smoke test exits with code 0.",
-                    "risk": "low",
-                    "guard_override": "contract_files_exist_to_smoke",
-                }
-        if not target and self._implementation_files_exist(state) and self._should_run_contract_command(action, state):
-            test_command = self._contract_test_command(state)
-            if test_command:
-                return {
-                    "thought_summary": (
-                        "Guard override: implementation files exist, so run the acceptance test "
-                        "instead of listing directories again."
-                    ),
-                    "action": "bash",
-                    "target": test_command,
-                    "args": {},
-                    "expected_observation": "Acceptance test exits with code 0.",
-                    "risk": "low",
-                    "guard_override": "implementation_files_exist_to_test",
-                }
-        if not target:
-            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
-        if not self._should_rewrite_list_to_write(action, state):
-            return self._guard_repeated_list_files(action, state) or repeated_failed_action or action
-        content = self._initial_content_for_target(target, state)
-        if content is None:
-            existing = (self.root / target).resolve()
-            if existing.exists():
-                if self._last_read_empty_artifact(state, target):
-                    return action
-                return {
-                    "thought_summary": (
-                        "Guard override: a required code artifact exists but has no safe generic content, "
-                        "so read it and let the worker implement it instead of writing an empty placeholder."
-                    ),
-                    "action": "read",
-                    "target": target,
-                    "args": {},
-                    "expected_observation": f"Read required code artifact {target}.",
-                    "risk": "low",
-                    "guard_override": "incomplete_code_artifact_to_read",
-                }
-            return action
-        guarded = dict(action)
-        guarded["thought_summary"] = (
-            "Guard override: an acceptance contract exists and required files are still missing, "
-            "so create the next required file instead of repeating list_files."
-        )
-        guarded["action"] = "write"
-        guarded["target"] = target
-        guarded["args"] = {"mode": "create", "content": content}
-        guarded["expected_observation"] = f"Create required file {target}."
-        guarded["risk"] = "low"
-        guarded["guard_override"] = "missing_path_list_files_to_write"
-        return guarded
-
-    def _guard_resume_suggested_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        if not self.resume:
-            return None
-        if self._is_initializer_task(state):
-            return None
-        if self._has_contract_for_active_task(state):
-            return None
-        if action.get("action") == "contract":
-            return None
-        if not state.acceptance_criteria:
-            return None
-        active = self._active_node(state)
-        if not active:
-            return None
-        return self._synthesize_contract_action(state)
-
-    def _guard_repeated_failed_action(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        if state.last_observation.get("ok") is not False:
-            return None
-        if not self._same_action(action, state.last_action):
-            return None
-        return {
-            "thought_summary": (
-                "Guard override: the previous action failed or made no progress. "
-                "Do not repeat it unchanged; follow the handoff suggested next action or choose a repair."
-            ),
-            "action": "blocked_repeat",
-            "target": str(action.get("target", "")),
-            "args": {
-                "previous_action": state.last_action,
-                "previous_observation_summary": state.last_observation.get("summary", ""),
-            },
-            "expected_observation": "Harness rejects unchanged failed actions.",
-            "risk": "low",
-            "guard_override": "failed_action_repeat_blocked",
-        }
-
-    def _guard_repeated_list_files(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        if action.get("action") != "list_files":
-            return None
-        target = self._normalize_target(action.get("target", ""))
-        if not target:
-            return None
-        if self._recent_action_target_count(state, "list_files", target) < 2:
-            return None
-        return {
-            "thought_summary": (
-                "Guard override: list_files has already inspected this target enough times. "
-                "Use the collected evidence or the handoff suggested next action instead of listing again."
-            ),
-            "action": "blocked_repeat",
-            "target": target,
-            "args": {
-                "repeat_limit": 2,
-                "suggested_next_action": self._suggest_next_action(state),
-            },
-            "expected_observation": "Harness rejects repeated directory listings of the same target.",
-            "risk": "low",
-            "guard_override": "list_files_repeat_limit",
-        }
-
-    def _same_action(self, left: dict[str, Any], right: dict[str, Any]) -> bool:
-        if left.get("action") != right.get("action"):
-            return False
-        if self._normalize_target(left.get("target", "")) != self._normalize_target(right.get("target", "")):
-            return False
-        return self._canonical_args(left.get("args", {})) == self._canonical_args(right.get("args", {}))
-
-    def _canonical_args(self, value: object) -> str:
-        try:
-            return json.dumps(value if isinstance(value, dict) else {}, sort_keys=True, ensure_ascii=False)
-        except TypeError:
-            return str(value)
-
-    def _recent_action_target_count(self, state: TaskState, action_name: str, target: str) -> int:
-        normalized_target = self._normalize_target(target)
-        count = 0
-        if (
-            state.last_action.get("action") == action_name
-            and self._normalize_target(state.last_action.get("target", "")) == normalized_target
-        ):
-            count += 1
-        for item in reversed(state.evidence_sources):
-            if item.get("action") != action_name:
-                continue
-            if self._normalize_target(item.get("target", "")) != normalized_target:
-                continue
-            count += 1
-            if count >= 2:
-                break
-        return count
-
-    def _required_write_target(self, state: TaskState) -> str | None:
-        if not self._has_contract_for_active_task(state):
-            return None
-        for target in self._active_task_expected_artifacts(state):
-            if self._is_incomplete_expected_artifact(target):
-                return target
-        return None
-
-    def _is_write_for_target(self, action: dict[str, Any], target: str) -> bool:
-        if action.get("action") != "write":
-            return False
-        return self._normalize_target(action.get("target", "")) == self._normalize_target(target)
-
-    def _guard_frozen_acceptance_test_edit(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        if action.get("action") not in {"write", "edit"}:
-            return None
-        target = self._normalize_target(action.get("target", ""))
-        if not target or not self._is_frozen_acceptance_artifact(target, state):
-            return None
-        if self._test_repair_explicitly_allowed(target, state):
-            return None
-        repair_targets = self._active_task_implementation_artifacts(state)
-        primary = repair_targets[0] if repair_targets else target
-        return {
-            "thought_summary": (
-                "Guard override: this test artifact is frozen acceptance evidence for the agreed contract. "
-                "Repair implementation code instead of rewriting the acceptance test."
-            ),
-            "action": "required_repair",
-            "target": primary,
-            "args": {
-                "targets": repair_targets or [primary],
-                "blocked_test_artifact": target,
-                "test_policy": self._active_task_test_policy(state),
-            },
-            "expected_observation": "Harness rejects edits to frozen acceptance tests unless the verifier explicitly allows test repair.",
-            "risk": "low",
-            "guard_override": "frozen_acceptance_test_write_blocked",
-        }
-
-    def _guard_pending_repair(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        command_failure_type = self._pending_repair_command_failure_type(state)
-        if command_failure_type in {"command_syntax_error", "command_environment_error"}:
-            if action.get("action") == "bash":
-                return action
-            problem = "invalid Python syntax" if command_failure_type == "command_syntax_error" else "an invalid module search path or working directory"
-            suggested = self._suggest_corrected_command(
-                str(state.pending_repair.get("command", "")),
-                command_failure_type,
-                state,
-            )
-            hint = self._command_repair_hint(command_failure_type, suggested)
-            return {
-                "thought_summary": (
-                    f"Guard override: the acceptance command has {problem}, "
-                    "so run a corrected equivalent bash command before verification or implementation repair."
-                ),
-                "action": "required_command_repair",
-                "target": str(state.pending_repair.get("command", "")),
-                "args": {
-                    "bad_command": state.pending_repair.get("command", ""),
-                    "failure_summary": state.pending_repair.get("summary", ""),
-                    "failure_type": command_failure_type,
-                    "suggested_command": suggested,
-                    "repair_hint": hint,
-                },
-                "expected_observation": (
-                    "Harness requires a corrected equivalent acceptance command. "
-                    + (f"Suggested command: {suggested}" if suggested else hint)
-                ),
-                "risk": "low",
-                "guard_override": "failed_contract_command_syntax_requires_corrected_bash",
-            }
-        targets = self._pending_repair_targets(state)
-        if not targets:
-            return None
-        repair_targets = self._pending_repair_write_targets(state)
-        primary = repair_targets[0] if repair_targets else targets[0]
-        missing_read = self._next_pending_repair_read(state)
-        if missing_read:
-            if action.get("action") == "read" and self._normalize_target(action.get("target", "")) == missing_read:
-                return action
-            return {
-                "thought_summary": (
-                    "Guard override: the last acceptance command failed. "
-                    "Read the failing test/source artifact before attempting another repair."
-                ),
-                "action": "read",
-                "target": missing_read,
-                "args": {},
-                "expected_observation": f"Read repair evidence artifact {missing_read}.",
-                "risk": "low",
-                "guard_override": "failed_contract_requires_read_before_repair",
-            }
-        if self._pending_repair_has_attempt(state):
-            if action.get("action") == "bash" and self._is_contract_command(action.get("target", ""), state):
-                return action
-            command = str(state.pending_repair.get("command", "")) or self._contract_test_command(state) or ""
-            return {
-                "thought_summary": (
-                    "Guard override: a repair was attempted for the failed acceptance command, "
-                    "so rerun the same acceptance command before further inspection or edits."
-                ),
-                "action": "bash",
-                "target": command,
-                "args": {},
-                "expected_observation": "Acceptance command exits with code 0 after the repair.",
-                "risk": "low",
-                "guard_override": "failed_contract_repair_to_retest",
-            }
-        if self._is_repair_for_targets(action, repair_targets):
-            return self._normalize_repair_write(action)
-        suffix = Path(primary).suffix.lower()
-        if suffix in {".md", ".txt"}:
-            content = self._initial_content_for_target(primary, state)
-            if content is not None:
-                return {
-                    "thought_summary": (
-                        "Guard override: the last acceptance command failed and referenced a text artifact, "
-                        "so repair that artifact before repeating verification."
-                    ),
-                    "action": "write",
-                    "target": primary,
-                    "args": {"mode": "overwrite", "content": content},
-                    "expected_observation": f"Repair acceptance artifact {primary}.",
-                    "risk": "low",
-                    "guard_override": "failed_contract_to_artifact_repair",
-                }
-        return {
-            "thought_summary": (
-                "Guard override: the last acceptance command failed. "
-                "The worker must repair an implementation artifact before more read/list/test actions."
-            ),
-            "action": "required_repair",
-            "target": primary,
-            "args": {
-                "targets": repair_targets,
-                "diagnostic_targets": targets,
-                "command": state.pending_repair.get("command", ""),
-                "failure_summary": state.pending_repair.get("summary", ""),
-            },
-            "expected_observation": "Harness rejects no-progress actions until the failed acceptance command is repaired in implementation code.",
-            "risk": "low",
-            "guard_override": "failed_contract_requires_repair",
-        }
-
-    def _next_pending_repair_read(self, state: TaskState) -> str | None:
-        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        required_reads = repair.get("required_reads", [])
-        read_targets = repair.get("read_targets", [])
-        if not isinstance(required_reads, list):
-            return None
-        if not isinstance(read_targets, list):
-            read_targets = []
-        already_read = {self._normalize_target(target) for target in read_targets}
-        for target in required_reads:
-            normalized = self._normalize_target(target)
-            if normalized and normalized not in already_read:
-                return normalized
-        return None
-
-    def _pending_repair_has_attempt(self, state: TaskState) -> bool:
-        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        repaired_targets = repair.get("repaired_targets", [])
-        return isinstance(repaired_targets, list) and bool(repaired_targets)
-
-    def _pending_repair_is_command_syntax_error(self, state: TaskState) -> bool:
-        return self._pending_repair_command_failure_type(state) == "command_syntax_error"
-
     def _pending_repair_command_failure_type(self, state: TaskState) -> str | None:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         recorded = str(repair.get("command_failure_type", ""))
@@ -888,19 +432,6 @@ class AgentLoop:
         if state and self._command_has_unconfigured_workspace_module(command, state):
             return "command_environment_error"
         return None
-
-    def _command_repair_hint(self, failure_type: str, suggested_command: str) -> str:
-        if suggested_command:
-            return "Run suggested_command exactly unless you can produce a simpler equivalent command."
-        if failure_type == "command_syntax_error":
-            return (
-                "Rewrite the command as a Python-safe one-liner. Do not put compound statements "
-                "such as with/for/if/try after a semicolon in python -c; use pathlib.Path.write_text(), "
-                "explicit close(), or a small module invocation instead."
-            )
-        if failure_type == "command_environment_error":
-            return "Add sys.path/PYTHONPATH/cwd for the benchmark workspace, then rerun the equivalent command."
-        return "Run a corrected equivalent bash command."
 
     def _suggest_corrected_command(self, command: str, failure_type: str, state: TaskState) -> str:
         if failure_type == "command_environment_error":
@@ -1011,75 +542,6 @@ class AgentLoop:
             return implementation_targets
         mutable_test_targets = [target for target in targets if self._is_test_repair_allowed(target, state)]
         return mutable_test_targets or targets
-
-    def _is_repair_for_targets(self, action: dict[str, Any], targets: list[str]) -> bool:
-        if action.get("action") not in {"write", "edit"}:
-            return False
-        target = self._normalize_target(action.get("target", ""))
-        return target in {self._normalize_target(item) for item in targets}
-
-    def _normalize_repair_write(self, action: dict[str, Any]) -> dict[str, Any]:
-        if action.get("action") != "write":
-            return action
-        args = action.get("args", {})
-        if not isinstance(args, dict) or args.get("mode", "create") != "create":
-            return action
-        target = str(action.get("target", ""))
-        try:
-            exists = bool(target) and (self.root / target).resolve().exists()
-        except OSError:
-            return action
-        if not exists:
-            return action
-        guarded = dict(action)
-        guarded_args = dict(args)
-        guarded_args["mode"] = "overwrite"
-        guarded["args"] = guarded_args
-        guarded["thought_summary"] = (
-            "Guard override: this is a repair for a failed acceptance command, "
-            "so overwrite the existing artifact instead of using create mode."
-        )
-        guarded["guard_override"] = "failed_contract_create_to_overwrite"
-        return guarded
-
-    def _repair_action_after_failed_contract(self, state: TaskState) -> dict[str, Any] | None:
-        if state.last_action.get("action") != "bash" or state.last_observation.get("ok") is not False:
-            return None
-        command = str(state.last_observation.get("data", {}).get("command") or state.last_action.get("target", ""))
-        if not self._is_contract_command(command, state):
-            return None
-        output = str(state.last_observation.get("data", {}).get("output", ""))
-        if self._command_failure_type(output, command=command, state=state) in {
-            "command_syntax_error",
-            "command_environment_error",
-        }:
-            return None
-        target = self._artifact_referenced_by_command(command, state)
-        if not target:
-            return None
-        suffix = Path(target).suffix.lower()
-        if suffix not in {".md", ".txt"}:
-            return None
-        return {
-            "thought_summary": (
-                "Guard override: the last acceptance command failed and referenced a task artifact, "
-                "so repair that artifact before repeating verification."
-            ),
-            "action": "write",
-            "target": target,
-            "args": {"mode": "overwrite", "content": self._initial_content_for_target(target, state)},
-            "expected_observation": f"Repair acceptance artifact {target}.",
-            "risk": "low",
-            "guard_override": "failed_contract_to_artifact_repair",
-        }
-
-    def _last_read_empty_artifact(self, state: TaskState, target: str) -> bool:
-        if state.last_action.get("action") != "read":
-            return False
-        if self._normalize_target(state.last_action.get("target", "")) != self._normalize_target(target):
-            return False
-        content = state.last_observation.get("data", {}).get("content")
-        return isinstance(content, str) and not content.strip()
 
     def _artifact_referenced_by_command(self, command: str, state: TaskState) -> str | None:
         normalized_command = command.replace("\\", "/")
@@ -1257,143 +719,6 @@ class AgentLoop:
         normalized = target.replace("\\", "/")
         return "/tests/" in normalized or Path(normalized).name.startswith("test_")
 
-    def _should_run_contract_command(self, action: dict[str, Any], state: TaskState) -> bool:
-        if self._should_rewrite_list_to_write(action, state):
-            return True
-        return action.get("action") == "list_files" and state.last_action.get("action") == "bash"
-
-    def _guard_duplicate_create(self, action: dict[str, Any], state: TaskState) -> dict[str, Any]:
-        args = action.get("args", {})
-        if not isinstance(args, dict) or args.get("mode", "create") != "create":
-            return action
-        target = str(action.get("target", ""))
-        try:
-            target_exists = bool(target) and (self.root / target).resolve().exists()
-        except OSError:
-            return action
-        if not target_exists or not self._has_contract_for_active_task(state):
-            return action
-        if self._is_incomplete_expected_artifact(target):
-            guarded = dict(action)
-            guarded_args = dict(args)
-            guarded_args["mode"] = "overwrite"
-            guarded["args"] = guarded_args
-            guarded["thought_summary"] = (
-                "Guard override: the requested code artifact already exists but is incomplete, "
-                "so overwrite it with the worker-provided implementation."
-            )
-            guarded["guard_override"] = "incomplete_create_to_overwrite"
-            return guarded
-        next_target = self._next_contract_file_target(state) or self._next_implementation_file_target(state)
-        if not next_target:
-            test_command = self._contract_test_command(state) if self._implementation_files_exist(state) else None
-            if not test_command:
-                return action
-            return {
-                "thought_summary": (
-                    "Guard override: the requested create target already exists and required files exist, "
-                    "so run the active task verification command instead."
-                ),
-                "action": "bash",
-                "target": test_command,
-                "args": {},
-                "expected_observation": "Verification command exits with code 0.",
-                "risk": "low",
-                "guard_override": "duplicate_create_to_verification",
-            }
-        if next_target == target:
-            return action
-        guarded = dict(action)
-        guarded["thought_summary"] = (
-            "Guard override: the requested create target already exists, so create the next "
-            "missing file from the active task requirements."
-        )
-        guarded["target"] = next_target
-        content = self._initial_content_for_target(next_target, state)
-        if content is None:
-            return action
-        guarded["args"] = {"mode": "create", "content": content}
-        guarded["expected_observation"] = f"Create required file {next_target}."
-        guarded["risk"] = "low"
-        guarded["guard_override"] = "duplicate_create_to_next_required_file"
-        return guarded
-
-    def _should_rewrite_list_to_write(self, action: dict[str, Any], state: TaskState) -> bool:
-        last_data = state.last_observation.get("data", {})
-        if last_data.get("missing_path"):
-            return True
-        if state.last_action.get("action") != "list_files":
-            return False
-        current_target = self._normalize_target(action.get("target", ""))
-        previous_target = self._normalize_target(state.last_action.get("target", ""))
-        if current_target == previous_target:
-            return True
-        previous_entries = last_data.get("entries", [])
-        if isinstance(previous_entries, list) and previous_entries:
-            return current_target == self._normalize_target(last_data.get("target", ""))
-        return False
-
-    def _should_create_contract_after_inspection(self, action: dict[str, Any], state: TaskState) -> bool:
-        if action.get("action") != "list_files":
-            return False
-        if state.last_action.get("action") == "protocol_error":
-            return bool(state.acceptance_criteria)
-        if state.last_action.get("action") != "list_files":
-            return False
-        if not state.acceptance_criteria:
-            return False
-        if state.last_observation.get("ok") is not True:
-            return False
-        current_target = self._normalize_target(action.get("target", ""))
-        previous_target = self._normalize_target(state.last_action.get("target", ""))
-        if current_target == previous_target:
-            return True
-        previous_entries = state.last_observation.get("data", {}).get("entries", [])
-        return isinstance(previous_entries, list) and bool(previous_entries)
-
-    def _synthesize_contract_action(self, state: TaskState) -> dict[str, Any]:
-        task_id = self._active_task_id(state)
-        checks = [str(item) for item in state.acceptance_criteria]
-        for command in self._active_task_verification_commands(state):
-            if command not in checks:
-                checks.append(command)
-        return {
-            "thought_summary": (
-                "Guard override: enough structure has been inspected and no acceptance contract exists, "
-                "so create the contract before further coding actions."
-            ),
-            "action": "contract",
-            "target": task_id,
-            "args": {
-                "task_id": task_id,
-                "summary": f"Complete {state.user_goal}.",
-                "checks": checks,
-                "required_evidence": checks,
-                "forbidden_shortcuts": [],
-            },
-            "expected_observation": "Verifier agrees or rejects the acceptance contract.",
-            "risk": "low",
-            "guard_override": "repeated_inspection_to_contract",
-        }
-
-    def _next_contract_file_target(self, state: TaskState) -> str | None:
-        latest = self._active_contract(state)
-        if not latest:
-            return None
-        text_items = list(latest.get("checks", [])) + list(latest.get("required_evidence", []))
-        for item in text_items:
-            for target in self._extract_file_targets(str(item)):
-                path = (self.root / target).resolve()
-                if path.suffix and not path.exists():
-                    return target
-        return None
-
-    def _next_implementation_file_target(self, state: TaskState) -> str | None:
-        for target in self._active_task_expected_artifacts(state):
-            if not self._expected_artifact_satisfied(target):
-                return target
-        return None
-
     def _active_contract(self, state: TaskState) -> dict[str, Any] | None:
         active = self._active_task_id(state)
         contracts = [
@@ -1404,47 +729,6 @@ class AgentLoop:
         if not contracts:
             return None
         return contracts[-1]
-
-    def _all_contract_file_targets_exist(self, state: TaskState) -> bool:
-        latest = self._active_contract(state)
-        if not latest:
-            return False
-        text_items = list(latest.get("checks", [])) + list(latest.get("required_evidence", []))
-        targets: list[str] = []
-        for item in text_items:
-            targets.extend(self._extract_file_targets(str(item)))
-        unique_targets = list(dict.fromkeys(targets))
-        if not unique_targets:
-            return False
-        return all((self.root / target).resolve().exists() for target in unique_targets)
-
-    def _contract_smoke_command(self, state: TaskState) -> str | None:
-        latest = self._active_contract(state)
-        if not latest:
-            return None
-        for check in latest.get("checks", []):
-            text = str(check)
-            match = re.search(r"smoke\s+test:\s*(.+)$", text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        return None
-
-    def _contract_test_command(self, state: TaskState) -> str | None:
-        commands = self._contract_commands(state)
-        if not commands:
-            return None
-        last_command = str(state.last_observation.get("data", {}).get("command") or state.last_action.get("target", ""))
-        normalized_last = self._normalize_command(last_command)
-        normalized_commands = [self._normalize_command(command) for command in commands]
-        if (
-            state.last_action.get("action") == "bash"
-            and state.last_observation.get("ok") is True
-            and normalized_last in normalized_commands
-        ):
-            index = normalized_commands.index(normalized_last)
-            if index + 1 < len(commands):
-                return commands[index + 1]
-        return commands[0]
 
     def _contract_commands(self, state: TaskState) -> list[str]:
         latest = self._active_contract(state)
@@ -1478,62 +762,12 @@ class AgentLoop:
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
-    def _extract_file_targets(self, text: str) -> list[str]:
-        targets: list[str] = []
-        pattern = r"\bFile\s+([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)"
-        for match in re.finditer(pattern, text):
-            target = match.group(1).strip("`'\".,;)")
-            normalized = target.replace("\\", "/")
-            try:
-                path = (self.root / normalized).resolve()
-            except OSError:
-                continue
-            if self.root in path.parents or path == self.root:
-                targets.append(normalized)
-        return list(dict.fromkeys(targets))
-
     def _dedupe_contracts(self, state: TaskState) -> None:
         deduped: dict[tuple[object, object], dict[str, Any]] = {}
         for contract in state.acceptance_contracts:
             key = (contract.get("task_id"), contract.get("summary"))
             deduped[key] = contract
         state.acceptance_contracts = list(deduped.values())
-
-    def _last_contract_check_passed(self, state: TaskState) -> bool:
-        if state.last_action.get("action") != "bash":
-            return False
-        if state.last_observation.get("ok") is not True:
-            return False
-        command = str(state.last_observation.get("data", {}).get("command") or state.last_action.get("target", ""))
-        if not command:
-            return False
-        commands = self._contract_commands(state)
-        return bool(commands) and self._normalize_command(command) == self._normalize_command(commands[-1])
-
-    def _implementation_files_exist(self, state: TaskState) -> bool:
-        targets = self._active_task_expected_artifacts(state)
-        if not targets:
-            return False
-        return all(self._expected_artifact_satisfied(target) for target in targets)
-
-    def _expected_artifact_satisfied(self, target: str) -> bool:
-        path = (self.root / target).resolve()
-        if not path.exists():
-            return False
-        return not self._is_incomplete_expected_artifact(target)
-
-    def _is_incomplete_expected_artifact(self, target: str) -> bool:
-        path = (self.root / target).resolve()
-        if not path.exists() or not path.is_file():
-            return False
-        if Path(target).name == "__init__.py":
-            return False
-        if path.suffix.lower() != ".py":
-            return False
-        try:
-            return not path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return False
 
     def _active_task_expected_artifacts(self, state: TaskState) -> list[str]:
         task = self._active_task_metadata(state)
@@ -1575,16 +809,11 @@ class AgentLoop:
     def _active_task_acceptance_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "acceptance_artifacts"):
             return self._active_task_artifacts_by_key(state, "acceptance_artifacts")
-        if self._has_contract_for_active_task(state):
-            return self._active_task_worker_test_artifacts(state)
         return []
 
     def _active_task_frozen_acceptance_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "frozen_acceptance_artifacts"):
             return self._active_task_artifacts_by_key(state, "frozen_acceptance_artifacts")
-        policy = self._active_task_test_policy(state)
-        if policy.get("acceptance_tests_mutable_by_worker") is False and self._has_contract_for_active_task(state):
-            return self._active_task_acceptance_artifacts(state)
         return []
 
     def _active_task_has_key(self, state: TaskState, key: str) -> bool:
@@ -1600,7 +829,6 @@ class AgentLoop:
         if not isinstance(policy, dict):
             policy = {}
         defaults = {
-            "worker_tests_mutable_until_contract_freeze": True,
             "acceptance_tests_mutable_by_worker": False,
             "acceptance_test_repair_requires_verifier_approval": True,
         }
@@ -1633,10 +861,7 @@ class AgentLoop:
             return False
         normalized = self._normalize_target(target)
         worker_tests = {self._normalize_target(item) for item in self._active_task_worker_test_artifacts(state)}
-        if normalized in worker_tests:
-            policy = self._active_task_test_policy(state)
-            return bool(policy.get("worker_tests_mutable_until_contract_freeze", True)) and not self._has_contract_for_active_task(state)
-        return False
+        return normalized in worker_tests
 
     def _active_task_verification_commands(self, state: TaskState) -> list[str]:
         task = self._active_task_metadata(state)
@@ -1654,35 +879,6 @@ class AgentLoop:
             if str(task.get("id", "")) == active:
                 return task
         return {}
-
-    def _initial_content_for_target(self, target: str, state: TaskState | None = None) -> str | None:
-        name = Path(target).name.lower()
-        if name == "init.sh" and self._normalize_target(target) == self._normalize_target(self._rel(self.state_dir / "init.sh")):
-            workspace = self._expected_initializer_workspace_root() or "workspace"
-            return (
-                "#!/usr/bin/env sh\n"
-                "set -eu\n"
-                f"python -c \"import pathlib; pathlib.Path({workspace!r}).mkdir(parents=True, exist_ok=True)\"\n"
-            )
-        if name == "readme.md":
-            title = state.user_goal if state else "Project"
-            criteria = state.acceptance_criteria if state else []
-            lines = [
-                f"# {title}",
-                "",
-                "## Commands",
-                "",
-                "This project will provide CLI command support for create, list, show, update, and delete workflows.",
-            ]
-            if criteria:
-                lines.extend(["", "## Acceptance Criteria", ""])
-                lines.extend(f"- {item}" for item in criteria)
-            return "\n".join(lines) + "\n"
-        if name == "__init__.py":
-            return '"""Package marker."""\n'
-        if target.endswith(".py"):
-            return None
-        return ""
 
     def _update_state(self, state: TaskState, action: dict[str, Any], observation: ToolResult) -> None:
         state.iterations += 1
@@ -1781,9 +977,6 @@ class AgentLoop:
             "edit",
             "write",
             "protocol_error",
-            "required_write",
-            "required_repair",
-            "required_command_repair",
         } and not observation.ok:
             state.last_observation["counts_as_progress"] = False
         elif name == "verify" and observation.ok and len(state.nodes) > 2:
@@ -2048,151 +1241,6 @@ class AgentLoop:
         if state.task_id == "INIT":
             return True
         return any(node.get("id") == "INIT" for node in state.nodes)
-
-    def _guard_initializer_progress(
-        self,
-        action: dict[str, Any],
-        state: TaskState,
-    ) -> dict[str, Any] | None:
-        if not self._is_initializer_task(state):
-            return None
-        outputs = self._validate_initializer_outputs()
-        if not outputs.ok:
-            repair_action = self._guard_initializer_repair(action, state)
-            if repair_action:
-                return repair_action
-            repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
-            candidate = self._normalize_target(repair.get("candidate_path", ""))
-            if candidate:
-                if action.get("action") in {"read", "edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
-                    return None
-                if self._is_initializer_candidate_diagnostic_bash(action, candidate):
-                    return None
-                generated_target = self._normalize_target(
-                    self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
-                )
-                args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
-                content = args.get("content")
-                if (
-                    action.get("action") == "write"
-                    and self._normalize_target(action.get("target", "")) == generated_target
-                    and isinstance(content, str)
-                    and content.strip()
-                ):
-                    return None
-                return {
-                    "thought_summary": (
-                        "Guard override: INIT has a saved rejected candidate. "
-                        "Repair that candidate before synthesizing missing initializer artifacts."
-                    ),
-                    "action": "read",
-                    "target": candidate,
-                    "args": {},
-                    "expected_observation": f"Read saved INIT candidate {candidate}.",
-                    "risk": "low",
-                    "guard_override": "initializer_candidate_repair_before_missing_artifact",
-                }
-            if int(repair.get("repeat_count", 0)) >= 2:
-                return None
-            missing = outputs.data.get("missing_initializer_artifacts", [])
-            if isinstance(missing, list) and missing:
-                missing_target = self._normalize_target(missing[0])
-                if action.get("action") in {"write", "edit"} and self._normalize_target(action.get("target", "")) == missing_target:
-                    return None
-                content = self._initial_content_for_target(missing_target, state)
-                if content:
-                    return {
-                        "thought_summary": (
-                            "Guard override: the INIT handoff requires the next missing initializer artifact. "
-                            f"Write {missing_target} before further directory listings or verification."
-                        ),
-                        "action": "write",
-                        "target": missing_target,
-                        "args": {"mode": "create", "content": content},
-                        "expected_observation": f"Create missing initializer artifact {missing_target}.",
-                        "risk": "low",
-                        "guard_override": "initializer_missing_artifact_to_write",
-                    }
-            return None
-        command = self._initializer_verification_command(state)
-        if not state.initializer_command_passed:
-            if action.get("action") == "bash" and str(action.get("target", "")) == command:
-                return None
-            return {
-                "thought_summary": (
-                    "Guard override: all INIT artifacts are present and valid, so run the deterministic "
-                    "initializer verification command before any answer, finish, or further inspection."
-                ),
-                "action": "bash",
-                "target": command,
-                "args": {},
-                "expected_observation": "Initializer verification command exits with code 0.",
-                "risk": "low",
-                "guard_override": "initializer_artifacts_ready_to_command",
-            }
-        if action.get("action") == "verify":
-            return None
-        return {
-            "thought_summary": (
-                "Guard override: the INIT verification command passed, so submit INIT to the Verifier "
-                "instead of answering, finishing, or collecting more context."
-            ),
-            "action": "verify",
-            "target": "default",
-            "args": {},
-            "expected_observation": "Verifier independently validates INIT and permits Orchestrator scheduling.",
-            "risk": "low",
-            "guard_override": "initializer_command_passed_to_verify",
-        }
-
-    def _guard_initializer_repair(
-        self,
-        action: dict[str, Any],
-        state: TaskState,
-    ) -> dict[str, Any] | None:
-        repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
-        if int(repair.get("repeat_count", 0)) < 2:
-            return None
-        candidate = self._normalize_target(repair.get("candidate_path", ""))
-        if not candidate:
-            return None
-        if action.get("action") in {"edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
-            return None
-        if self._is_initializer_candidate_diagnostic_bash(action, candidate):
-            return None
-        candidate_already_read = candidate in {
-            self._normalize_target(item.get("target", ""))
-            for item in state.evidence_sources
-            if item.get("action") == "read"
-        }
-        if (
-            action.get("action") == "read"
-            and self._normalize_target(action.get("target", "")) == candidate
-            and not candidate_already_read
-        ):
-            return None
-        errors = repair.get("validation_errors", [])
-        return {
-            "thought_summary": (
-                "Guard override: the same INIT validation error repeated. Repair the saved candidate "
-                "in place instead of regenerating the whole task graph."
-            ),
-            "action": "required_initializer_repair",
-            "target": candidate,
-            "args": {
-                "errors": errors if isinstance(errors, list) else [],
-                "repeat_count": repair.get("repeat_count", 2),
-            },
-            "expected_observation": "Harness requires an edit or overwrite of the saved candidate.",
-            "risk": "low",
-            "guard_override": "repeated_initializer_error_to_candidate_repair",
-        }
-
-    def _is_initializer_candidate_diagnostic_bash(self, action: dict[str, Any], candidate: str) -> bool:
-        if action.get("action") != "bash":
-            return False
-        command = str(action.get("target", "")).replace("\\", "/")
-        return bool(candidate) and candidate in command
 
     def _initializer_verification_command(self, state: TaskState) -> str:
         commands = self._active_verification_commands(state)
@@ -2655,12 +1703,10 @@ class AgentLoop:
         action: dict[str, Any],
         observation: ToolResult,
         state: TaskState,
-        model_action: dict[str, Any] | None = None,
     ) -> None:
         event = {
             "step": step,
             "time": utc_now(),
-            "model_action": model_action,
             "action": action,
             "observation": observation.to_dict(),
             "state_summary": state.summary(),

@@ -180,7 +180,6 @@ def create_initializer_state(
             "acceptance_artifacts": [],
             "frozen_acceptance_artifacts": [],
             "test_policy": {
-                "worker_tests_mutable_until_contract_freeze": True,
                 "acceptance_tests_mutable_by_worker": False,
                 "acceptance_test_repair_requires_verifier_approval": True,
             },
