@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -12,108 +11,31 @@ from agent.planner import TaskState
 class ContextBuilder:
     def __init__(self, root: Path, max_chars: int | None = None, state_dir: Path | None = None) -> None:
         self.root = root
-        self.max_chars = self._resolve_max_chars(max_chars)
+        del max_chars
         self.state_dir = state_dir or root / "state"
-
-    def _resolve_max_chars(self, explicit: int | None) -> int | None:
-        if explicit is not None:
-            return explicit if explicit > 0 else None
-        raw = os.environ.get("LONG_AGENT_CONTEXT_MAX_CHARS", "").strip()
-        if not raw:
-            return None
-        try:
-            value = int(raw)
-        except ValueError:
-            return None
-        return value if value > 0 else None
 
     def build(self, state: TaskState) -> str:
         critical = self._critical_context(state)
-        working = "\n\n".join(
-            section
-            for section in [
-                self._working_context(state),
-                self._just_in_time_context(state),
-            ]
-            if section.strip()
-        )
+        working = self._working_context(state)
         reference = self._reference_context(state)
-        return self._pack_context(critical, working, reference)
+        tail_guard = self._tail_guard_context(state)
+        return self._pack_context(critical, working, reference, tail_guard)
 
-    def _pack_context(self, critical: str, working: str, reference: str) -> str:
-        sections = [section for section in [critical, working, reference] if section.strip()]
-        full = "\n\n".join(sections)
-        if self.max_chars is None or len(full) <= self.max_chars:
-            return full
-
-        marker = "\n\n[context truncated by harness]"
-        required_parts = [section for section in [critical, working] if section.strip()]
-        required = "\n\n".join(required_parts)
-        remaining = self.max_chars - len(required) - len(marker)
-        if remaining <= 0:
-            return (
-                required.rstrip()
-                + "\n\n[reference context omitted; critical/working context exceeds configured context budget]"
-            )
-
-        parts = required_parts[:]
-        reference_budget = min(len(reference), remaining)
-        if reference_budget:
-            parts.append(self._truncate_section(reference, reference_budget, "reference context"))
-        return "\n\n".join(parts).rstrip() + marker
-
-    def _truncate_section(self, text: str, limit: int, label: str) -> str:
-        if len(text) <= limit:
-            return text
-        suffix = f"\n[{label} truncated]"
-        if limit <= len(suffix):
-            return text[:limit]
-        return text[: limit - len(suffix)].rstrip() + suffix
+    def _pack_context(self, critical: str, working: str, reference: str, tail_guard: str) -> str:
+        sections = [section for section in [critical, working, reference, tail_guard] if section.strip()]
+        return "\n\n".join(sections)
 
     def _critical_context(self, state: TaskState) -> str:
         lines = [
             "# Critical Context",
-            "# Always-on Context",
-            "This section is packed first and must drive the next action.",
+            "This section contains only non-negotiable rules and immediate operational state.",
             f"- current_task_id: {self._active_task_id(state)}",
-            f"- required_next_action: {self._required_next_action(state)}",
-            f"- orchestrator_decision: {state.orchestrator_decision}",
-            f"- session_used_tokens: {state.session_used_tokens}",
-            f"- handoff_ready: {state.handoff_ready}",
             "",
-            "## Last Action",
-            str(state.last_action),
+            "## Last Step Summary",
+            self._last_step_summary(state),
             "",
-            "## Last Observation",
-            str(state.last_observation),
-            "",
-            "## Recent Step Trace",
-            self._recent_step_trace_context(),
-            "",
-            "## Pending Repair",
-            self._pending_repair_context(state),
-            "",
-            "## Initializer Repair",
-            str(state.initializer_repair if isinstance(state.initializer_repair, dict) else {}),
-            "",
-            "## Handoff Focus",
-            self._handoff_focus_context(),
-            "",
-            "## Active Expected Artifacts",
-            *[
-                f"- {artifact}"
-                for node in state.nodes
-                if node.get("status") in {"in_progress", "pending"}
-                for artifact in self._format_artifacts(node.get("expected_artifacts", []))
-            ],
-            "",
-            "## Active Verification Commands",
-            *[
-                f"- {command}"
-                for node in state.nodes
-                if node.get("status") in {"in_progress", "pending"}
-                for command in self._format_artifacts(node.get("verification_commands", []))
-            ],
+            "## Repair Summary",
+            self._repair_summary(state),
             "",
             "## Non-Negotiable Rules",
             "- Return one schema-valid action. The harness owns verification and state transitions.",
@@ -127,6 +49,59 @@ class ContextBuilder:
                 "- Benchmark isolation: Git is read-only. Never run git add or git commit, and never try to clean the host Agent repository."
             )
         return "\n".join(lines)
+
+    def _last_step_summary(self, state: TaskState) -> str:
+        action = self._compact_action(state.last_action)
+        observation = state.last_observation if isinstance(state.last_observation, dict) else {}
+        ok = observation.get("ok", "unknown")
+        summary = str(observation.get("summary", "")).replace("\n", " ").strip()
+        data_text = self._compact_observation_data(observation.get("data", {}))
+        parts = [f"action={action}", f"ok={ok}"]
+        if summary:
+            parts.append(f"summary={summary[:280]}")
+        if data_text:
+            parts.append(f"data={data_text}")
+        return "; ".join(parts)
+
+    def _repair_summary(self, state: TaskState) -> str:
+        lines: list[str] = []
+        pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        if pending:
+            command = str(pending.get("command", "")).replace("\n", " ")[:220]
+            targets = ", ".join(self._pending_repair_write_targets(state) or self._pending_repair_targets(state))
+            output = str(pending.get("output", pending.get("summary", ""))).replace("\n", " ")[:260]
+            lines.append(f"- pending_repair: command={command}; targets={targets or 'none'}; output={output}")
+            inferred = self._inferred_pending_repair_targets(state)
+            if inferred:
+                lines.append(f"- Inferred repair targets from import failure: {', '.join(inferred)}")
+        if initializer:
+            candidate = str(initializer.get("candidate_path", ""))
+            errors = initializer.get("validation_errors", [])
+            error_text = " | ".join(str(error) for error in errors) if isinstance(errors, list) else str(errors)
+            lines.append(f"- initializer_repair: candidate={candidate}; errors={error_text[:260]}")
+        return "\n".join(lines) if lines else "No pending repair."
+
+    def _tail_guard_context(self, state: TaskState) -> str:
+        observation = state.last_observation if isinstance(state.last_observation, dict) else {}
+        pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        lines = ["# Tail Guard", "Immediate forced action block. Follow this before earlier context."]
+        if initializer:
+            candidate = str(initializer.get("candidate_path", ""))
+            lines.append(f"- Repair INIT candidate: {candidate}. Read once if needed, then edit/write it.")
+        elif pending:
+            lines.append(f"- {self._required_next_action(state)}")
+        else:
+            required = self._required_next_action(state)
+            if observation.get("ok") is False and required == "No forced next action.":
+                lines.append("- Last step failed. Do not repeat it unchanged; act on the failure summary/data.")
+            else:
+                lines.append(f"- {required}")
+        text = "\n".join(lines)
+        if len(text) <= 500:
+            return text
+        return text[:497].rstrip() + "..."
 
     def _always_on_context(self, state: TaskState) -> str:
         lines = [
@@ -205,6 +180,8 @@ class ContextBuilder:
             "# Plan",
             *[f"- [{n['status']}] {n['id']}: {n['title']}" for n in state.nodes],
             "",
+            self._tool_use_reference_context(),
+            "",
             *self._initializer_instruction_lines(state),
             "",
             "# Active Task Artifact Policy",
@@ -218,6 +195,52 @@ class ContextBuilder:
                 f"- {item.get('task_id')}: {item.get('status', 'proposed')} - {item.get('summary', '')}"
                 for item in state.acceptance_contracts[-3:]
             ],
+            "",
+            "# Active Verification Commands",
+            *[
+                f"- {command}"
+                for node in state.nodes
+                if node.get("status") in {"in_progress", "pending"}
+                for command in self._format_artifacts(node.get("verification_commands", []))
+            ],
+            "",
+            "# Just-in-Time Discovery",
+            "Do not preload the whole repository. Read only what is needed for the active task.",
+            "Recommended discovery flow:",
+            "1. list a small directory with read target='.' or read target='<dir>';",
+            "2. search relevant symbols or filenames;",
+            "3. read the smallest relevant source file ranges;",
+            "4. read corresponding tests;",
+            "5. use errors or verifier output to guide the next search.",
+            "PowerShell/Python examples:",
+            "- list_files target='agent'",
+            "- search target='create_issue' args={'path': 'agent'}",
+            "- read target='agent/loop.py' args={'start': 1, 'end': 220}",
+            "",
+            "## Recent Step Trace",
+            self._recent_step_trace_context(),
+        ]
+        return "\n".join(lines)
+
+    def _tool_use_reference_context(self) -> str:
+        lines = [
+            "# Available Tools And Calling Format",
+            "Return exactly one JSON object using this schema:",
+            '{"thought_summary":"brief non-hidden reasoning","action":"<one action>","target":"<path|command|query|task|empty>","args":{},"expected_observation":"expected result","risk":"low|medium|high"}',
+            "Callable actions:",
+            "- contract: define verifier agreement before coding; target='<task_id>'; args.task_id, args.summary, args.checks=[...].",
+            "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
+            "- read: bounded file or directory read; target='<path>'; args.start=1, args.end=200.",
+            "- search: literal text search; target='<pattern>'; args.path='.'.",
+            "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
+            "- edit: exact text replacement; target='<path>'; args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false.",
+            "- bash: run a needed command from repository root; target='<command>'; args.timeout=30.",
+            "- git: status/diff/log/show/branch/add/commit only; target='<git args or git command>'; args.timeout=30.",
+            "- verify: ask harness verifier to evaluate current task; target='default'; args={}.",
+            "- update_plan: request harness plan update; target='current_task'; args={}.",
+            "- answer: final evidence-based response for inspection/explanation tasks; target='' and args.answer='<response>'.",
+            "- skill: promote reusable learned procedure only after verifier-confirmed success or evidence-confirmed failure; args.skill_id, args.title, args.body, args.evidence_type, args.evidence.",
+            "- finish: project-level termination only after verifier/project completion evidence; target='current_task'; args={}.",
         ]
         return "\n".join(lines)
 
@@ -249,6 +272,7 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _persistent_context(self, state: TaskState) -> str:
+        del state
         memory_index = self._read_optional(self.state_dir / "memory.md")
         hard_memory = self._read_optional(self.state_dir / "hard_memory.md")
         soft_memory = self._read_optional(self.state_dir / "soft_memory.md")
@@ -258,61 +282,6 @@ class ContextBuilder:
             "Persist cross-session information in files rather than relying on chat history.",
             "Persistent files include task status, verified facts, architecture decisions, failed attempts, verifier reports, git commits, and next actions.",
             "Hard Memory is evidence-grade. Soft Memory is not evidence; treat it only as a hypothesis or suggestion.",
-            "",
-            "# User Goal",
-            state.user_goal,
-            "",
-            "# Acceptance Criteria",
-            *[f"- {item}" for item in state.acceptance_criteria],
-            "",
-            "# Session Budget",
-            f"- budget_tokens: {state.session_budget_tokens}",
-            f"- handoff_threshold: {state.handoff_threshold}",
-            f"- estimated_used_tokens: {state.session_used_tokens}",
-            f"- handoff_ready: {state.handoff_ready}",
-            "When handoff_ready is true, do not start new large edits. Prefer verify, summarize, or finish.",
-            "",
-            "# Plan",
-            *[f"- [{n['status']}] {n['id']}: {n['title']}" for n in state.nodes],
-            "",
-            "# Active Task Expected Artifacts",
-            *[
-                f"- {artifact}"
-                for node in state.nodes
-                if node.get("status") in {"in_progress", "pending"}
-                for artifact in self._format_artifacts(node.get("expected_artifacts", []))
-            ],
-            "",
-            *self._initializer_instruction_lines(state),
-            "",
-            "# Active Task Artifact Policy",
-            *self._artifact_policy_lines(state),
-            "",
-            "# Active Task Verification Commands",
-            *[
-                f"- {command}"
-                for node in state.nodes
-                if node.get("status") in {"in_progress", "pending"}
-                for command in self._format_artifacts(node.get("verification_commands", []))
-            ],
-            "",
-            "# Evidence Sources",
-            *[f"- {item.get('action')}: {item.get('target')}" for item in state.evidence_sources[-12:]],
-            "",
-            "# Acceptance Contracts",
-            *[
-                f"- {item.get('task_id')}: {item.get('status', 'proposed')} - {item.get('summary', '')}"
-                for item in state.acceptance_contracts[-5:]
-            ],
-            "",
-            "# Last Action",
-            str(state.last_action),
-            "",
-            "# Last Observation",
-            str(state.last_observation),
-            "",
-            "# Required Next Action",
-            self._required_next_action(state),
             "",
             "# Memory Index",
             memory_index,
@@ -517,6 +486,8 @@ class ContextBuilder:
             "initializer_error_repeat_count",
             "command",
             "output",
+            "suggested_command",
+            "repair_hint",
         ]
         compact: list[str] = []
         for key in keys:
@@ -544,6 +515,7 @@ class ContextBuilder:
             f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list.",
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
             "Each generated task should include: id, title, priority, depends_on, status, acceptance_criteria, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, and verification_commands.",
+            "Verification commands run from the repository root. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal complete task example:",
             '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_until_contract_freeze":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',

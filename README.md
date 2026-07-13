@@ -68,6 +68,16 @@ Run with:
 python -m agent.main "Inspect this repo and suggest the next implementation step" --provider openai-compatible --max-steps 3
 ```
 
+For long benchmark runs, let the harness automatically continue from handoff files:
+
+```powershell
+python -m agent.main --benchmark todo_counter --project-spec eval\benchmarks\todo_counter\project_spec.md --provider openai-compatible --max-steps 12 --auto-resume --max-sessions 5
+```
+
+When a session reaches the handoff threshold, the harness writes `handoff.md`, resets the per-session budget flags, starts a fresh trace, and resumes from `current_task.json` without requiring a manual `--resume` restart.
+
+Each run writes a diagnostic log under `state/benchmarks/<benchmark_id>/logs/`. The terminal prints the exact path before provider initialization, so startup failures are recorded too. Use `--log-file path\to\run.log` to override it.
+
 For DeepSeek or Qwen OpenAI-compatible endpoints, keep the same command and change `LONG_AGENT_BASE_URL` plus `LONG_AGENT_MODEL`.
 
 Inspection or recommendation tasks may finish with an `answer` action instead of `finish`. Coding tasks still rely on verifier-gated `finish`.

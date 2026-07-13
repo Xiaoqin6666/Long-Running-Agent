@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, Se
 from agent.verifier import Verifier
 
 
+LOGGER = logging.getLogger("long_agent")
+
+
 @dataclass
 class RunResult:
     completed: bool
@@ -30,11 +34,12 @@ class RunResult:
     trace_path: Path
     state_path: Path
     message: str
+    sessions: int = 1
 
     def to_human_summary(self) -> str:
         status = "completed" if self.completed else "stopped"
         return (
-            f"Agent {status} after {self.steps} step(s).\n"
+            f"Agent {status} after {self.steps} step(s) across {self.sessions} session(s).\n"
             f"State: {self.state_path}\n"
             f"Trace: {self.trace_path}\n"
             f"{self.message}"
@@ -52,12 +57,16 @@ class AgentLoop:
         tasks_path: Path | None = None,
         project_spec_path: Path | None = None,
         benchmark_id: str | None = None,
+        auto_resume: bool = False,
+        max_sessions: int = 1,
     ) -> None:
         self.root = root
         self.task = task
         self.max_steps = max_steps
         self.provider = provider
         self.resume = resume
+        self.auto_resume = auto_resume
+        self.max_sessions = max(1, max_sessions)
         self.project_spec_path = project_spec_path
         self.source_tasks_path = tasks_path
         self.benchmark_id = self._safe_benchmark_id(benchmark_id) if benchmark_id else None
@@ -73,13 +82,15 @@ class AgentLoop:
         self.handoff_payload_path = self.state_dir / "handoff_payload.json"
         self.initializer_candidate_path = self.state_dir / "rejected_candidates" / "generated_tasks.json"
         self.trace_path = self.trace_dir / self._trace_name()
+        expected_workspace = self._expected_initializer_workspace_root()
+        benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
         self.context_builder = ContextBuilder(root, state_dir=self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
         self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path, benchmark_id=self.benchmark_id)
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
-            "bash": BashTool(root),
+            "bash": BashTool(root, python_path=benchmark_python_path),
             "edit": EditTool(root),
             "git": GitTool(root, allow_write=self.benchmark_id is None),
             "list_files": ListFilesTool(root),
@@ -99,9 +110,68 @@ class AgentLoop:
         return cleaned
 
     def run(self) -> RunResult:
+        LOGGER.info("Preparing state directory=%s", self.state_dir)
         self._ensure_state_files()
         self._prepare_runtime_task_graph()
         state = self._load_or_create_state()
+        total_steps = 0
+        completed = False
+        message = "Reached max steps before completion."
+        sessions = 1
+
+        while sessions <= self.max_sessions:
+            LOGGER.info(
+                "Session %s/%s started task_id=%s trace=%s",
+                sessions,
+                self.max_sessions,
+                state.task_id,
+                self.trace_path,
+            )
+            session = self._run_one_session(state)
+            total_steps += session.steps
+            state = session.state
+            completed = session.completed
+            message = session.message
+            if completed:
+                break
+            if not session.handoff_ready:
+                break
+            if not self.auto_resume or sessions >= self.max_sessions:
+                break
+            sessions += 1
+            LOGGER.info("Auto-resuming from handoff into session %s/%s", sessions, self.max_sessions)
+            state = self._prepare_auto_resume_session()
+
+        if not completed:
+            self._write_handoff(state)
+
+        LOGGER.info(
+            "Loop stopped completed=%s total_steps=%s sessions=%s handoff_ready=%s message=%s",
+            completed,
+            total_steps,
+            sessions,
+            state.handoff_ready,
+            message,
+        )
+
+        return RunResult(
+            completed=completed,
+            steps=total_steps,
+            trace_path=self.trace_path,
+            state_path=self.state_path,
+            message=message,
+            sessions=sessions,
+        )
+
+    @dataclass
+    class _SessionResult:
+        completed: bool
+        handoff_ready: bool
+        steps: int
+        state: TaskState
+        message: str
+
+    def _run_one_session(self, state: TaskState) -> _SessionResult:
         steps = 0
         completed = False
         message = "Reached max steps before completion."
@@ -115,6 +185,7 @@ class AgentLoop:
                 action = self._guard_action(model_action, state)
                 observation = self._execute_action(action, state)
             except Exception as exc:
+                LOGGER.exception("Step %s model/tool protocol error", step)
                 action = {
                     "thought_summary": "Harness caught a model or tool protocol error.",
                     "action": "protocol_error",
@@ -128,6 +199,17 @@ class AgentLoop:
             self._update_state(state, action, observation)
             self._append_trace(step, action, observation, state, model_action=model_action)
             self._write_state(state)
+            LOGGER.info(
+                "Step %s action=%s target=%s ok=%s task_id=%s used_tokens=%s handoff_ready=%s observation=%s",
+                step,
+                action.get("action", "unknown"),
+                action.get("target", ""),
+                observation.ok,
+                state.task_id,
+                state.session_used_tokens,
+                state.handoff_ready,
+                self._log_text(observation.summary),
+            )
 
             if (
                 action["action"] in {"answer", "finish"}
@@ -145,16 +227,25 @@ class AgentLoop:
                 message = "Session handoff threshold reached. Handoff written."
                 break
 
-        if not completed:
-            self._write_handoff(state)
-
-        return RunResult(
+        return self._SessionResult(
             completed=completed,
+            handoff_ready=state.handoff_ready,
             steps=steps,
-            trace_path=self.trace_path,
-            state_path=self.state_path,
             message=message,
+            state=state,
         )
+
+    def _prepare_auto_resume_session(self) -> TaskState:
+        self.resume = True
+        self.trace_path = self.trace_dir / self._trace_name()
+        state = self._load_or_create_state()
+        self._write_state(state)
+        return state
+
+    @staticmethod
+    def _log_text(value: object, limit: int = 500) -> str:
+        text = " ".join(str(value).split())
+        return text if len(text) <= limit else f"{text[:limit]}..."
 
     def _load_or_create_state(self) -> TaskState:
         if self.resume and self.state_path.exists():
@@ -243,13 +334,20 @@ class AgentLoop:
             )
         if name == "required_command_repair":
             args = action.get("args", {}) if isinstance(action.get("args"), dict) else {}
+            failure_type = str(args.get("failure_type", "command_error"))
+            suggested = str(args.get("suggested_command", ""))
+            hint = str(args.get("repair_hint", ""))
             return ToolResult(
                 False,
-                "Action rejected: the acceptance command has invalid syntax. Run a corrected equivalent bash command before verification or implementation repair.",
+                "Action rejected: the acceptance command or its runtime environment is invalid. "
+                "Run a corrected equivalent bash command before verification or implementation repair.",
                 {
                     "required_action": "bash_corrected_acceptance_command",
                     "bad_command": args.get("bad_command", action.get("target", "")),
                     "failure_summary": args.get("failure_summary", ""),
+                    "failure_type": failure_type,
+                    "suggested_command": suggested,
+                    "repair_hint": hint,
                     "counts_as_progress": False,
                 },
             )
@@ -640,12 +738,20 @@ class AgentLoop:
         }
 
     def _guard_pending_repair(self, action: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
-        if self._pending_repair_is_command_syntax_error(state):
+        command_failure_type = self._pending_repair_command_failure_type(state)
+        if command_failure_type in {"command_syntax_error", "command_environment_error"}:
             if action.get("action") == "bash":
                 return action
+            problem = "invalid Python syntax" if command_failure_type == "command_syntax_error" else "an invalid module search path or working directory"
+            suggested = self._suggest_corrected_command(
+                str(state.pending_repair.get("command", "")),
+                command_failure_type,
+                state,
+            )
+            hint = self._command_repair_hint(command_failure_type, suggested)
             return {
                 "thought_summary": (
-                    "Guard override: the acceptance command itself has invalid Python syntax, "
+                    f"Guard override: the acceptance command has {problem}, "
                     "so run a corrected equivalent bash command before verification or implementation repair."
                 ),
                 "action": "required_command_repair",
@@ -653,8 +759,14 @@ class AgentLoop:
                 "args": {
                     "bad_command": state.pending_repair.get("command", ""),
                     "failure_summary": state.pending_repair.get("summary", ""),
+                    "failure_type": command_failure_type,
+                    "suggested_command": suggested,
+                    "repair_hint": hint,
                 },
-                "expected_observation": "Harness requires a corrected equivalent acceptance command.",
+                "expected_observation": (
+                    "Harness requires a corrected equivalent acceptance command. "
+                    + (f"Suggested command: {suggested}" if suggested else hint)
+                ),
                 "risk": "low",
                 "guard_override": "failed_contract_command_syntax_requires_corrected_bash",
             }
@@ -752,15 +864,104 @@ class AgentLoop:
         return isinstance(repaired_targets, list) and bool(repaired_targets)
 
     def _pending_repair_is_command_syntax_error(self, state: TaskState) -> bool:
-        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        if repair.get("command_failure_type") == "command_syntax_error":
-            return True
-        return self._command_failure_type(str(repair.get("output", ""))) == "command_syntax_error"
+        return self._pending_repair_command_failure_type(state) == "command_syntax_error"
 
-    def _command_failure_type(self, output: str) -> str | None:
+    def _pending_repair_command_failure_type(self, state: TaskState) -> str | None:
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        recorded = str(repair.get("command_failure_type", ""))
+        if recorded:
+            return recorded
+        return self._command_failure_type(
+            str(repair.get("output", "")),
+            command=str(repair.get("command", "")),
+            state=state,
+        )
+
+    def _command_failure_type(
+        self,
+        output: str,
+        command: str = "",
+        state: TaskState | None = None,
+    ) -> str | None:
         if "SyntaxError:" in output and "invalid syntax" in output:
             return "command_syntax_error"
+        if state and self._command_has_unconfigured_workspace_module(command, state):
+            return "command_environment_error"
         return None
+
+    def _command_repair_hint(self, failure_type: str, suggested_command: str) -> str:
+        if suggested_command:
+            return "Run suggested_command exactly unless you can produce a simpler equivalent command."
+        if failure_type == "command_syntax_error":
+            return (
+                "Rewrite the command as a Python-safe one-liner. Do not put compound statements "
+                "such as with/for/if/try after a semicolon in python -c; use pathlib.Path.write_text(), "
+                "explicit close(), or a small module invocation instead."
+            )
+        if failure_type == "command_environment_error":
+            return "Add sys.path/PYTHONPATH/cwd for the benchmark workspace, then rerun the equivalent command."
+        return "Run a corrected equivalent bash command."
+
+    def _suggest_corrected_command(self, command: str, failure_type: str, state: TaskState) -> str:
+        if failure_type == "command_environment_error":
+            workspace = self._workspace_root_from_artifacts(state)
+            if not workspace:
+                return ""
+            return f"python -c \"import sys; sys.path.insert(0,{workspace!r}); print('workspace import path configured')\""
+        if failure_type != "command_syntax_error":
+            return ""
+        if "tempfile.NamedTemporaryFile" not in command or "python -c" not in command:
+            return ""
+        module = self._module_invoked_by_command(command)
+        if not module:
+            return ""
+        workspace = self._workspace_root_from_command(command) or self._workspace_root_from_artifacts(state)
+        sys_path = f"sys.path.insert(0,{workspace!r}); " if workspace else ""
+        pretty = "--pretty" in command
+        args = f"[sys.executable,'-m',{module!r},str(p){",'--pretty'" if pretty else ''}]"
+        pretty_assert = "; assert '\\n  ' in r.stdout" if pretty else ""
+        return (
+            "python -c \"import sys,json,tempfile,subprocess,pathlib; "
+            f"{sys_path}"
+            "p=pathlib.Path(tempfile.gettempdir())/'long_agent_todos.txt'; "
+            "p.write_text('[ ] task1\\n[x] task2\\n', encoding='utf-8'); "
+            f"r=subprocess.run({args},capture_output=True,text=True); "
+            "p.unlink(missing_ok=True); "
+            "assert r.returncode==0, r.stderr; "
+            "assert json.loads(r.stdout)=={'total':2,'done':1,'open':1}"
+            f"{pretty_assert}; "
+            f"print({'Pretty JSON OK' if pretty else 'Basic JSON OK'!r})\""
+        )
+
+    def _module_invoked_by_command(self, command: str) -> str | None:
+        patterns = [
+            r"\[\s*sys\.executable\s*,\s*['\"]-m['\"]\s*,\s*['\"]([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)['\"]",
+            r"\bpython\s+-m\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, command)
+            if match:
+                return match.group(1)
+        return None
+
+    def _command_has_unconfigured_workspace_module(self, command: str, state: TaskState) -> bool:
+        if not command or self._workspace_root_from_command(command):
+            return False
+        workspace_root = self._workspace_root_from_artifacts(state)
+        if not workspace_root:
+            return False
+        modules: list[str] = []
+        for pattern in (
+            r"\bfrom\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s+import\b",
+            r"\bpython\s+-m\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\b",
+            r"['\"]-m['\"]\s*,\s*['\"]([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)['\"]",
+        ):
+            modules.extend(match.group(1) for match in re.finditer(pattern, command))
+        for module in dict.fromkeys(modules):
+            module_path = self.root / workspace_root / Path(*module.split("."))
+            if module_path.with_suffix(".py").exists() or (module_path / "__init__.py").exists():
+                return True
+        return False
 
     def _pending_repair_targets(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -848,7 +1049,10 @@ class AgentLoop:
         if not self._is_contract_command(command, state):
             return None
         output = str(state.last_observation.get("data", {}).get("output", ""))
-        if self._command_failure_type(output) == "command_syntax_error":
+        if self._command_failure_type(output, command=command, state=state) in {
+            "command_syntax_error",
+            "command_environment_error",
+        }:
             return None
         target = self._artifact_referenced_by_command(command, state)
         if not target:
@@ -986,6 +1190,8 @@ class AgentLoop:
             r"sys\.path\.insert\(\s*0\s*,\s*['\"]([^'\"]*workspace[^'\"]*)['\"]\s*\)",
             r"PYTHONPATH['\"]?\s*:\s*['\"]([^'\"]*workspace[^'\"]*)['\"]",
             r"PYTHONPATH=([^'\"\s]*workspace[^'\"\s]*)",
+            r"cwd\s*=\s*['\"]([^'\"]*workspace[^'\"]*)['\"]",
+            r"\bcd(?:\s+/d)?\s+['\"]?([^'\";&|]*workspace)",
         ):
             for match in re.finditer(pattern, normalized):
                 root = self._normalize_target(match.group(1))
@@ -1511,7 +1717,7 @@ class AgentLoop:
                 if node["status"] != "done":
                     node["status"] = "done"
                     node["evidence"].append(observation.summary)
-        elif name == "update_plan" and state.nodes:
+        elif name == "update_plan" and state.nodes and not self._is_initializer_task(state):
             state.nodes[0]["status"] = "done"
             state.nodes[0]["evidence"].append("initialized plan")
         elif (
@@ -1650,7 +1856,10 @@ class AgentLoop:
         name = action.get("action")
         if name == "bash":
             command = str(observation.data.get("command") or action.get("target", ""))
-            if observation.ok and self._pending_repair_is_command_syntax_error(state):
+            if observation.ok and self._pending_repair_command_failure_type(state) in {
+                "command_syntax_error",
+                "command_environment_error",
+            }:
                 state.pending_repair = {}
                 return
             if not self._is_contract_command(command, state):
@@ -1660,8 +1869,8 @@ class AgentLoop:
                 state.pending_repair = {}
                 return
             output = str(observation.data.get("output", ""))
-            failure_type = self._command_failure_type(output)
-            if failure_type == "command_syntax_error":
+            failure_type = self._command_failure_type(output, command=command, state=state)
+            if failure_type in {"command_syntax_error", "command_environment_error"}:
                 targets: list[str] = []
                 required_reads: list[str] = []
             else:
@@ -1751,8 +1960,8 @@ class AgentLoop:
                 if observation.get("ok") is True:
                     return
                 output = str(data.get("output", ""))
-                failure_type = self._command_failure_type(output)
-                if failure_type == "command_syntax_error":
+                failure_type = self._command_failure_type(output, command=command, state=state)
+                if failure_type in {"command_syntax_error", "command_environment_error"}:
                     targets = []
                     required_reads = []
                 else:
@@ -1857,6 +2066,8 @@ class AgentLoop:
             if candidate:
                 if action.get("action") in {"read", "edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
                     return None
+                if self._is_initializer_candidate_diagnostic_bash(action, candidate):
+                    return None
                 generated_target = self._normalize_target(
                     self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")
                 )
@@ -1947,6 +2158,8 @@ class AgentLoop:
             return None
         if action.get("action") in {"edit", "write"} and self._normalize_target(action.get("target", "")) == candidate:
             return None
+        if self._is_initializer_candidate_diagnostic_bash(action, candidate):
+            return None
         candidate_already_read = candidate in {
             self._normalize_target(item.get("target", ""))
             for item in state.evidence_sources
@@ -1974,6 +2187,12 @@ class AgentLoop:
             "risk": "low",
             "guard_override": "repeated_initializer_error_to_candidate_repair",
         }
+
+    def _is_initializer_candidate_diagnostic_bash(self, action: dict[str, Any], candidate: str) -> bool:
+        if action.get("action") != "bash":
+            return False
+        command = str(action.get("target", "")).replace("\\", "/")
+        return bool(candidate) and candidate in command
 
     def _initializer_verification_command(self, state: TaskState) -> str:
         commands = self._active_verification_commands(state)
@@ -2627,9 +2846,11 @@ class AgentLoop:
     def _format_pending_repair(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         targets = self._pending_repair_targets(state)
-        if not repair or not targets:
+        if not repair:
             return ["- none"]
-        return [
+        failure_type = str(repair.get("command_failure_type", ""))
+        suggested = self._suggest_corrected_command(str(repair.get("command", "")), failure_type, state)
+        lines = [
             f"- reason: {repair.get('reason', 'failed_acceptance_command')}",
             f"- command: {repair.get('command', '')}",
             f"- targets: {', '.join(targets)}",
@@ -2637,8 +2858,12 @@ class AgentLoop:
             f"- required_reads: {', '.join(str(item) for item in repair.get('required_reads', []))}",
             f"- read_targets: {', '.join(str(item) for item in repair.get('read_targets', []))}",
             f"- repaired_targets: {', '.join(str(item) for item in repair.get('repaired_targets', []))}",
+            f"- command_failure_type: {failure_type}",
             f"- summary: {repair.get('summary', '')}",
         ]
+        if suggested:
+            lines.append(f"- suggested_command: {suggested}")
+        return lines
 
     def _format_initializer_repair(self, state: TaskState) -> list[str]:
         repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
@@ -2745,7 +2970,7 @@ class AgentLoop:
 
     @staticmethod
     def _trace_name() -> str:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         return f"run_{stamp}.jsonl"
 
 

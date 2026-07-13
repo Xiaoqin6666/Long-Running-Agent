@@ -26,6 +26,8 @@ state/benchmarks/*/memory.md
 state/benchmarks/*/hard_memory.md
 state/benchmarks/*/soft_memory.md
 state/benchmarks/*/traces/*.jsonl
+state/logs/*.log
+state/benchmarks/*/logs/*.log
 state/benchmarks/*/skills/*.md
 state/benchmarks/*/rejected_candidates/
 eval/workspaces/

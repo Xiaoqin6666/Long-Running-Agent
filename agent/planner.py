@@ -310,6 +310,14 @@ def validate_generated_task_graph(
                             normalized_expected_artifacts,
                         )
                     )
+                    errors.extend(
+                        _workspace_import_path_errors(
+                            label,
+                            command_text,
+                            normalized_workspace,
+                            normalized_expected_artifacts,
+                        )
+                    )
         if standard_library_only:
             criteria_text = "\n".join(str(item) for item in task.get("acceptance_criteria", []))
             if _uses_external_python_tool(criteria_text):
@@ -474,6 +482,37 @@ def _imported_module_artifact_errors(
                 f"{label}.verification_commands imports '{module}', but expected_artifacts does not include '{module_artifact}'."
             )
     return errors
+
+
+def _workspace_import_path_errors(
+    label: str,
+    command: str,
+    workspace_root: str,
+    expected_artifacts: set[str],
+) -> list[str]:
+    project_modules = [
+        module
+        for module in _imported_project_modules(command)
+        if f"{workspace_root}/{module.replace('.', '/')}.py" in expected_artifacts
+    ]
+    if not project_modules or _command_configures_workspace_imports(command, workspace_root):
+        return []
+    return [
+        f"{label}.verification_commands invokes workspace module(s) {', '.join(project_modules)} "
+        f"without configuring '{workspace_root}' via sys.path, PYTHONPATH, or cwd; commands run from the repository root."
+    ]
+
+
+def _command_configures_workspace_imports(command: str, workspace_root: str) -> bool:
+    normalized = command.replace("\\", "/")
+    escaped = re.escape(workspace_root)
+    patterns = (
+        rf"sys\.path\.insert\([^\r\n]*{escaped}",
+        rf"PYTHONPATH[^\r\n]*{escaped}",
+        rf"cwd\s*=\s*['\"][^'\"]*{escaped}",
+        rf"\bcd(?:\s+/d)?\s+['\"]?{escaped}(?:\s|['\"]|$)",
+    )
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
 
 
 def _imported_project_modules(command: str) -> list[str]:

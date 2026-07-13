@@ -10,7 +10,7 @@ from pathlib import Path
 from agent.context import ContextBuilder
 from agent.llm import parse_action_json, validate_action
 from agent.loop import AgentLoop
-from agent.main import build_parser, infer_benchmark_id
+from agent.main import build_parser, infer_benchmark_id, resolve_log_path
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
 from agent.planner import create_initial_state, create_initializer_state, validate_generated_task_graph, validate_initializer_script
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
@@ -105,6 +105,61 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn('"priority":1', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"implementation_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"verification_commands"', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("commands run from the repository root", MAIN_AGENT_SYSTEM_PROMPT)
+
+    def test_generated_task_validator_requires_workspace_import_bootstrap(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        graph = {
+            "tasks": [
+                {
+                    "id": "T3",
+                    "title": "Implement CLI module",
+                    "priority": 1,
+                    "depends_on": [],
+                    "status": "pending",
+                    "acceptance_criteria": ["CLI runs as a module."],
+                    "expected_artifacts": [f"{workspace}/todo_counter/cli.py"],
+                    "implementation_artifacts": [f"{workspace}/todo_counter/cli.py"],
+                    "worker_test_artifacts": [],
+                    "acceptance_artifacts": [],
+                    "frozen_acceptance_artifacts": [],
+                    "verification_commands": [
+                        "python -c \"import subprocess, sys; subprocess.run([sys.executable, '-m', 'todo_counter.cli', 'todos.txt'])\""
+                    ],
+                }
+            ]
+        }
+
+        errors = validate_generated_task_graph(graph, expected_workspace_root=workspace)
+
+        self.assertIn("without configuring", " ".join(errors))
+
+    def test_generated_task_validator_accepts_workspace_subprocess_cwd(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        graph = {
+            "tasks": [
+                {
+                    "id": "T3",
+                    "title": "Implement CLI module",
+                    "priority": 1,
+                    "depends_on": [],
+                    "status": "pending",
+                    "acceptance_criteria": ["CLI runs as a module."],
+                    "expected_artifacts": [f"{workspace}/todo_counter/cli.py"],
+                    "implementation_artifacts": [f"{workspace}/todo_counter/cli.py"],
+                    "worker_test_artifacts": [],
+                    "acceptance_artifacts": [],
+                    "frozen_acceptance_artifacts": [],
+                    "verification_commands": [
+                        f"python -c \"import subprocess, sys; subprocess.run([sys.executable, '-m', 'todo_counter.cli', 'todos.txt'], cwd='{workspace}')\""
+                    ],
+                }
+            ]
+        }
+
+        errors = validate_generated_task_graph(graph, expected_workspace_root=workspace)
+
+        self.assertFalse(any("without configuring" in error for error in errors))
 
     def test_initializer_repeated_error_forces_candidate_repair_and_promotion(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -355,6 +410,31 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(args.benchmark, "todo_counter")
 
+    def test_cli_accepts_auto_resume_session_limit(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task", "--auto-resume", "--max-sessions", "3"])
+
+        self.assertTrue(args.auto_resume)
+        self.assertEqual(args.max_sessions, 3)
+
+    def test_cli_accepts_explicit_log_file(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task", "--log-file", "diagnostics/run.log"])
+
+        self.assertEqual(str(args.log_file), "diagnostics\\run.log")
+
+    def test_default_log_path_uses_benchmark_state_directory(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["Task", "--root", str(WORKSPACE_TMP), "--benchmark", "todo_counter"]
+        )
+
+        log_path = resolve_log_path(args, infer_benchmark_id(args))
+
+        self.assertEqual(log_path.parent, WORKSPACE_TMP.resolve() / "state" / "benchmarks" / "todo_counter" / "logs")
+        self.assertTrue(log_path.name.startswith("run_"))
+        self.assertEqual(log_path.suffix, ".log")
+
     def test_benchmark_id_is_inferred_from_benchmark_paths(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -390,6 +470,28 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertEqual(loop.tasks_path, root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json")
             self.assertTrue((root / "state" / "benchmarks" / "todo_counter" / "project_spec.md").exists())
             self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "runtime_tasks.json").exists())
+
+    def test_initializer_update_plan_does_not_complete_init(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="INIT", max_steps=1)
+            state = create_initializer_state(
+                "Build benchmark",
+                project_spec_artifact="state/project_spec.md",
+                generated_tasks_artifact="state/generated_tasks.json",
+                init_artifact="state/init.sh",
+            )
+
+            loop._update_state(
+                state,
+                {"action": "update_plan", "target": "current_task", "args": {}},
+                ToolResult(True, "Plan updated by harness.", {}),
+            )
+
+        self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertFalse(state.evidence_sources)
 
     def test_project_spec_uses_generated_tasks_after_initializer(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -998,6 +1100,25 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("Python", result.data["output"])
+
+    def test_bash_injects_benchmark_workspace_python_path(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            package = workspace / "sample_package"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+            result = BashTool(root, python_path=workspace).run(
+                {
+                    "action": "bash",
+                    "target": "python -c \"import sample_package; assert sample_package.VALUE == 42\"",
+                    "args": {},
+                }
+            )
+
+        self.assertTrue(result.ok, result.data.get("output"))
+        self.assertEqual(Path(result.data["python_path"]), workspace.resolve())
 
     def test_validate_action_normalizes_non_object_args(self) -> None:
         state = create_initial_state("Inspect and suggest")
@@ -2599,8 +2720,14 @@ class HarnessBehaviorTests(unittest.TestCase):
             state = create_initial_state("Implement CLI")
             state.task_id = "T3"
             bad_command = (
-                "python -c \"import tempfile; "
-                "with tempfile.NamedTemporaryFile(mode='w') as f: pass\""
+                "python -c \"import sys,json,os,tempfile,subprocess; "
+                "sys.path.insert(0,'eval/benchmarks/todo_counter/workspace'); "
+                "with tempfile.NamedTemporaryFile(mode='w',delete=False,suffix='.txt') as f: "
+                "f.write('[ ] task1\\n[x] task2\\n'); fname=f.name; "
+                "result=subprocess.run([sys.executable,'-m','todo_counter.cli',fname],capture_output=True,text=True); "
+                "os.unlink(fname); assert result.returncode==0; "
+                "data=json.loads(result.stdout); assert data=={'total':2,'done':1,'open':1}; "
+                "print('Basic JSON OK')\""
             )
             fixed_command = "python -c \"import tempfile; f=tempfile.NamedTemporaryFile(mode='w'); f.close()\""
             state.nodes = [
@@ -2623,8 +2750,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             output = (
                 "File \"<string>\", line 1\n"
-                "    import tempfile; with tempfile.NamedTemporaryFile(mode='w') as f: pass\n"
-                "                     ^^^^\n"
+                "    import sys,json,os,tempfile,subprocess; sys.path.insert(0,'eval/benchmarks/todo_counter/workspace'); with tempfile.NamedTemporaryFile(mode='w') as f: pass\n"
+                "                                                                                                         ^^^^\n"
                 "SyntaxError: invalid syntax"
             )
 
@@ -2662,13 +2789,84 @@ class HarnessBehaviorTests(unittest.TestCase):
                 ToolResult(True, "Command exited with code 0.", {"command": fixed_command, "output": ""}),
             )
 
-        self.assertEqual(state.pending_repair, {})
         self.assertEqual(blocked_verify["action"], "required_command_repair")
         self.assertEqual(blocked_verify["guard_override"], "failed_contract_command_syntax_requires_corrected_bash")
+        self.assertIn("suggested_command", blocked_verify["args"])
+        self.assertIn("pathlib.Path", blocked_verify["args"]["suggested_command"])
+        self.assertNotIn("; with ", blocked_verify["args"]["suggested_command"])
         self.assertFalse(blocked_observation.ok)
         self.assertEqual(blocked_observation.data["required_action"], "bash_corrected_acceptance_command")
+        self.assertEqual(blocked_observation.data["suggested_command"], blocked_verify["args"]["suggested_command"])
         self.assertEqual(guarded["action"], "bash")
         self.assertEqual(guarded["target"], fixed_command)
+        self.assertEqual(state.pending_repair, {})
+
+    def test_workspace_module_environment_failure_does_not_force_code_repair(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_rel = "eval/benchmarks/todo_counter/workspace"
+            workspace = root / workspace_rel
+            package = workspace / "todo_counter"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "cli.py").write_text("print('ok')\n", encoding="utf-8")
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.write_text(f"Application lives under `{workspace_rel}/`.\n", encoding="utf-8")
+            loop = AgentLoop(
+                root=root,
+                task="Implement CLI",
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            command = (
+                "python -c \"import subprocess, sys; "
+                "result=subprocess.run([sys.executable, '-m', 'todo_counter.cli'], capture_output=True, text=True); "
+                "assert result.returncode == 0\""
+            )
+            state = create_initial_state("Implement CLI")
+            state.task_id = "T3"
+            state.nodes = [
+                {
+                    "id": "T3",
+                    "title": "CLI",
+                    "status": "in_progress",
+                    "expected_artifacts": [f"{workspace_rel}/todo_counter/cli.py"],
+                    "implementation_artifacts": [f"{workspace_rel}/todo_counter/cli.py"],
+                    "verification_commands": [command],
+                }
+            ]
+            state.acceptance_contracts.append(
+                {"task_id": "T3", "summary": "CLI", "checks": [command], "status": "agreed"}
+            )
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": command,
+                "summary": "Command exited with code 1.",
+                "output": "Traceback: AssertionError",
+                "targets": [f"{workspace_rel}/todo_counter/cli.py"],
+                "repair_targets": [f"{workspace_rel}/todo_counter/cli.py"],
+                "required_reads": [],
+                "read_targets": [],
+                "repaired_targets": [],
+            }
+
+            guarded = loop._guard_action(
+                {
+                    "thought_summary": "Verify.",
+                    "action": "verify",
+                    "target": "default",
+                    "args": {},
+                    "expected_observation": "Verifier passes.",
+                    "risk": "low",
+                },
+                state,
+            )
+            result = loop.tools["bash"].run({"action": "bash", "target": command, "args": {}})
+
+        self.assertEqual(guarded["action"], "required_command_repair")
+        self.assertEqual(guarded["args"]["failure_type"], "command_environment_error")
+        self.assertTrue(result.ok, result.data.get("output"))
 
     def test_pending_repair_write_create_mode_becomes_overwrite(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3159,6 +3357,49 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.session_used_tokens, 0)
         self.assertFalse(state.handoff_ready)
 
+    def test_auto_resume_continues_after_handoff_until_session_limit(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            (state_dir / "traces").mkdir(parents=True)
+            (state_dir / "current_task.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "current",
+                        "user_goal": "Resume task",
+                        "acceptance_criteria": [],
+                        "nodes": [{"id": "T1", "title": "Inspect", "status": "pending", "evidence": []}],
+                        "iterations": 0,
+                        "last_action": {},
+                        "last_observation": {},
+                        "evidence_sources": [],
+                        "acceptance_contracts": [],
+                        "session_budget_tokens": 1,
+                        "handoff_threshold": 0.5,
+                        "session_used_tokens": 0,
+                        "handoff_ready": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Resume task",
+                max_steps=1,
+                resume=True,
+                auto_resume=True,
+                max_sessions=2,
+            )
+
+            result = loop.run()
+            trace_files = list((state_dir / "traces").glob("run_*.jsonl"))
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.sessions, 2)
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(len(trace_files), 2)
+        self.assertIn("Session handoff threshold reached", result.message)
+
     def test_handoff_contains_session_budget_and_resume_sections(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3187,7 +3428,51 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "long-agent.handoff-payload.v1")
         self.assertTrue(payload["session_budget"]["handoff_ready"])
 
-    def test_context_builder_uses_four_context_layers(self) -> None:
+    def test_handoff_includes_command_only_pending_repair(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement CLI", max_steps=1)
+            state = create_initial_state("Implement CLI")
+            state.task_id = "T3"
+            bad_command = (
+                "python -c \"import sys,tempfile,subprocess; sys.path.insert(0,'eval/benchmarks/todo_counter/workspace'); "
+                "with tempfile.NamedTemporaryFile(mode='w') as f: pass; "
+                "subprocess.run([sys.executable,'-m','todo_counter.cli','x'])\""
+            )
+            state.nodes = [
+                {
+                    "id": "T3",
+                    "title": "CLI",
+                    "status": "in_progress",
+                    "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                    "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/todo_counter/cli.py"],
+                    "verification_commands": [bad_command],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": bad_command,
+                "summary": "Command exited with code 1.",
+                "output": "SyntaxError: invalid syntax",
+                "targets": [],
+                "repair_targets": [],
+                "required_reads": [],
+                "read_targets": [],
+                "repaired_targets": [],
+                "command_failure_type": "command_syntax_error",
+            }
+
+            loop._write_handoff(state)
+            handoff = (root / "state" / "handoff.md").read_text(encoding="utf-8")
+
+        self.assertIn("## 10a. Pending Repair", handoff)
+        self.assertIn("- command_failure_type: command_syntax_error", handoff)
+        self.assertIn("- suggested_command:", handoff)
+        self.assertNotIn("## 10a. Pending Repair\n- none", handoff)
+
+    def test_context_builder_uses_reorganized_context_layers(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state").mkdir()
@@ -3202,13 +3487,25 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertIn("# Always-on Context", context)
+        self.assertIn("# Critical Context", context)
+        self.assertIn("# Working Context", context)
         self.assertIn("# Startup Context", context)
-        self.assertIn("# Just-in-Time Context", context)
+        self.assertIn("# Just-in-Time Discovery", context)
         self.assertIn("# Persistent Context", context)
+        self.assertIn("# Tail Guard", context)
+        self.assertIn("# Available Tools And Calling Format", context)
+        self.assertIn('"action":"<one action>"', context)
+        self.assertIn("- list_files: inspect a directory or file entry", context)
+        self.assertIn("- write: create/overwrite/append file", context)
+        self.assertIn("- verify: ask harness verifier", context)
         self.assertIn("# Hard Memory", context)
         self.assertIn("# Soft Memory", context)
         self.assertIn("Soft Memory is not evidence", context)
+        self.assertNotIn("# Always-on Context", context)
+        self.assertLess(context.index("# Critical Context"), context.index("# Working Context"))
+        self.assertLess(context.index("# Working Context"), context.index("# Startup Context"))
+        self.assertLess(context.index("# Startup Context"), context.index("# Tail Guard"))
+        self.assertLessEqual(len(context.split("# Tail Guard", 1)[1]) + len("# Tail Guard"), 500)
 
     def test_context_builder_preserves_last_action_when_reference_context_is_large(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3251,11 +3548,13 @@ class HarnessBehaviorTests(unittest.TestCase):
             context = ContextBuilder(root, max_chars=3500, state_dir=state_dir).build(state)
 
         self.assertIn("# Critical Context", context)
-        self.assertIn("## Last Action", context)
-        self.assertIn("## Last Observation", context)
+        self.assertIn("## Last Step Summary", context)
+        self.assertIn("## Repair Summary", context)
         self.assertIn("INIT write rejected", context)
         self.assertIn("Repair the saved INIT candidate", context)
-        self.assertIn("reference context omitted", context)
+        self.assertIn("# Tail Guard", context)
+        self.assertNotIn("reference context omitted", context)
+        self.assertNotIn("[context truncated by harness]", context)
 
     def test_context_builder_does_not_truncate_by_default(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3275,7 +3574,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Critical Context", context)
         self.assertIn("# Startup Context", context)
 
-    def test_context_builder_uses_env_budget_only_when_configured(self) -> None:
+    def test_context_builder_ignores_env_budget_without_truncating(self) -> None:
         previous = os.environ.get("LONG_AGENT_CONTEXT_MAX_CHARS")
         os.environ["LONG_AGENT_CONTEXT_MAX_CHARS"] = "3000"
         try:
@@ -3298,8 +3597,8 @@ class HarnessBehaviorTests(unittest.TestCase):
                 os.environ["LONG_AGENT_CONTEXT_MAX_CHARS"] = previous
 
         self.assertIn("# Critical Context", context)
-        self.assertIn("## Last Action", context)
-        self.assertIn("[context truncated by harness]", context)
+        self.assertIn("# Tail Guard", context)
+        self.assertNotIn("[context truncated by harness]", context)
 
     def test_context_builder_includes_recent_step_trace_with_guard_overrides(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

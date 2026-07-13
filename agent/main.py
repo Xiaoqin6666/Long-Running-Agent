@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import logging
+import os
 from pathlib import Path
 import re
+import sys
 
 from agent.loop import AgentLoop
 
@@ -47,6 +51,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resume from the active state directory's current_task.json if it exists.",
     )
     parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Automatically start a fresh resumed session after writing a handoff.",
+    )
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=1,
+        help="Maximum sessions to run when --auto-resume is enabled.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help="Write runtime diagnostics to this file. Defaults to the active state directory's logs folder.",
+    )
+    parser.add_argument(
         "--benchmark",
         help="Benchmark id for isolated state under state/benchmarks/<id>. Inferred from eval/benchmarks/<id>/ paths when omitted.",
     )
@@ -89,23 +109,78 @@ def sanitize_benchmark_id(raw: str) -> str:
     return cleaned
 
 
+def resolve_log_path(args: argparse.Namespace, benchmark_id: str | None) -> Path:
+    if args.log_file:
+        path = args.log_file
+        return path if path.is_absolute() else (args.root / path).resolve()
+    state_dir = args.root.resolve() / "state"
+    if benchmark_id:
+        state_dir = state_dir / "benchmarks" / benchmark_id
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return state_dir / "logs" / f"run_{stamp}.log"
+
+
+def configure_run_logger(log_path: Path) -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("long_agent")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    task = resolve_task(args)
     benchmark_id = infer_benchmark_id(args)
-    loop = AgentLoop(
-        root=args.root.resolve(),
-        task=task,
-        max_steps=args.max_steps,
-        provider=args.provider,
-        resume=args.resume,
-        tasks_path=args.tasks_json.resolve() if args.tasks_json else None,
-        project_spec_path=args.project_spec.resolve() if args.project_spec else None,
-        benchmark_id=benchmark_id,
+    log_path = resolve_log_path(args, benchmark_id)
+    logger = configure_run_logger(log_path)
+    print(f"Log: {log_path}", flush=True)
+    logger.info(
+        "Starting provider=%s benchmark=%s max_steps=%s auto_resume=%s max_sessions=%s "
+        "api_key_configured=%s base_url=%s model=%s",
+        args.provider,
+        benchmark_id or "none",
+        args.max_steps,
+        args.auto_resume,
+        args.max_sessions,
+        bool(os.environ.get("LONG_AGENT_API_KEY")),
+        os.environ.get("LONG_AGENT_BASE_URL", "https://api.openai.com/v1"),
+        os.environ.get("LONG_AGENT_MODEL", "gpt-4.1-mini"),
     )
-    result = loop.run()
-    print(result.to_human_summary())
-    return 0 if result.completed else 1
+    try:
+        task = resolve_task(args)
+        loop = AgentLoop(
+            root=args.root.resolve(),
+            task=task,
+            max_steps=args.max_steps,
+            provider=args.provider,
+            resume=args.resume,
+            tasks_path=args.tasks_json.resolve() if args.tasks_json else None,
+            project_spec_path=args.project_spec.resolve() if args.project_spec else None,
+            benchmark_id=benchmark_id,
+            auto_resume=args.auto_resume,
+            max_sessions=args.max_sessions,
+        )
+        result = loop.run()
+        summary = result.to_human_summary()
+        print(summary)
+        logger.info(
+            "Finished completed=%s steps=%s sessions=%s message=%s",
+            result.completed,
+            result.steps,
+            result.sessions,
+            result.message,
+        )
+        return 0 if result.completed else 1
+    except Exception as exc:
+        logger.exception("Run failed during startup or execution")
+        print(f"Agent failed: {exc}\nLog: {log_path}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
