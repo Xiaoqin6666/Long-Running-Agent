@@ -135,7 +135,7 @@ state/
 
 If `--benchmark` is omitted, the CLI infers it from paths under `eval/benchmarks/<benchmark_name>/...`. Passing `--benchmark` explicitly is still recommended for reproducible experiments.
 
-Task-specific expected files must be declared in the task graph with `expected_artifacts`, and task-specific test commands should be declared with `verification_commands`. The agent harness reads those fields generically; it should not hard-code file names such as `store.py`, `cli.py`, or any benchmark-specific implementation details.
+Task-specific expected files must be declared in the task graph with `expected_artifacts`, task-specific test commands with `verification_commands`, and complete coverage with `criterion_command_map`. The agent harness reads those fields generically, creates an acceptance contract at activation, freezes the semantic requirements from `acceptance_criteria`, and keeps the execution-level `verification_procedure` correctable when a command path or working directory is wrong. The harness should not hard-code file names such as `store.py`, `cli.py`, or any benchmark-specific implementation details.
 
 For coding tasks, split artifacts by ownership when tests are involved:
 
@@ -163,7 +163,7 @@ When `--project-spec` is used without `--tasks-json`, the harness starts a one-t
 
 The last path is the run-local benchmark initializer script. It is distinct from the tracked repository-root `init.sh`, which bootstraps the Long-Running Agent harness itself. Benchmark INIT must never overwrite the repository-root script. Generated application code and public tests belong under `eval/benchmarks/todo_counter/workspace/`, not under `state/`.
 
-`INIT` does not negotiate a Worker acceptance contract. The harness permits it to write only those three benchmark-local initializer artifacts and permits shell execution only for the deterministic INIT verification command. Application code, tests, skeletons, and workspace files remain forbidden until Orchestrator selects the first ordinary Worker task.
+`INIT` does not negotiate a Worker acceptance contract. The harness permits it to write only those three benchmark-local initializer artifacts. Its `verify` action executes the deterministic INIT verification command directly. Application code, tests, skeletons, and workspace files remain forbidden until Orchestrator selects the first ordinary Worker task.
 
 `answer` and `finish` cannot terminate INIT. Once all artifacts pass deterministic validation, the guard forces the INIT verification command; after that command succeeds, it forces `verify`. Only Verifier PASS marks INIT completed, and Orchestrator selects the first Worker task before any token-budget handoff is written.
 

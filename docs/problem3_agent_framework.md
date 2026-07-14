@@ -98,7 +98,7 @@ Each iteration follows a strict protocol:
 
 The model is not allowed to silently mark work as done. Completion is a harness-level transition that requires verifier evidence.
 
-The Main Agent works on one active task per loop. It should not mix unrelated tasks in a single action. For coding tasks, the first code-writing action must be preceded by an acceptance contract agreed with the verifier.
+The Main Agent works on one active task per loop. It should not mix unrelated tasks in a single action. For generated coding tasks, task activation automatically derives, validates, and freezes an acceptance contract before the first code-writing action.
 
 ## 4.1 Initializer / Planner
 
@@ -110,7 +110,7 @@ The Initializer runs once at project start and converts the project specificatio
 
 For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>`. The repository-root `project_spec.md`, `tasks.json`, and `init.sh` describe and bootstrap the Long-Running Agent harness itself; they are not overwritten by a benchmark INIT. Preplanned benchmark source tasks remain read-only and are copied to `<active_state_dir>/runtime_tasks.json`.
 
-INIT is a planning phase, not a coding Worker task, so it does not require an acceptance contract. Its write/edit capability is restricted to the materialized project specification, generated task graph, and init script. It cannot create application code, tests, skeletons, or workspace files, and its shell access is restricted to the deterministic initializer verification command. The harness validates the generated task schema, dependency graph, hidden-test isolation, and project-spec workspace boundary before scheduling the first Worker task.
+INIT is a planning phase, not a coding Worker task, so it does not require an acceptance contract. Its write/edit capability is restricted to the materialized project specification, generated task graph, and init script. It cannot create application code, tests, skeletons, or workspace files. The harness validates the generated task schema, criterion-to-command coverage, command portability, dependency graph, hidden-test isolation, and project-spec workspace boundary before scheduling the first Worker task. `verify` executes the deterministic initializer verification command directly.
 
 INIT cannot terminate through `answer` or `finish`. Its fixed transition is `artifacts_ready -> verification_command_passed -> verifier_passed -> first_worker_scheduled`. The command-pass flag is persisted in task state so resume and handoff cannot silently skip or unnecessarily repeat a successful step.
 
@@ -187,24 +187,27 @@ ready_tasks.sort(
 
 ## 4.3 Acceptance Contract
 
-Before the Main Agent writes code for a task, it must propose a contract that the verifier can check independently:
+Before the Main Agent writes code for an ad-hoc task, it must propose a contract that the verifier can check independently. Generated tasks receive an automatic task-graph contract at activation. That contract freezes the semantic requirements, while the concrete verification procedure may be corrected if a command path, working directory, or discovery mode is wrong.
 
 ```json
 {
   "task_id": "T5",
   "summary": "Enforce acceptance contracts before coding",
   "scope": ["agent/loop.py", "agent/planner.py", "tests/"],
-  "checks": [
+  "frozen_requirements": [
     "write is rejected when no contract exists",
-    "contract action records task id, scope, checks, and required evidence",
-    "unit tests pass"
+    "contract action records task id, scope, semantic requirements, and required evidence"
   ],
+  "verification_procedure": {
+    "command": "python -m unittest tests.test_agent_harness"
+  },
+  "checks": ["python -m unittest tests.test_agent_harness"],
   "required_evidence": ["test output", "trace event"],
   "forbidden_shortcuts": ["Do not accept file existence as the only verification"]
 }
 ```
 
-The verifier should reject contracts that merely verify the Main Agent's chosen implementation rather than the user-visible behavior.
+The verifier should reject contracts that weaken `frozen_requirements` or merely verify the Main Agent's chosen implementation rather than the user-visible behavior. It may accept a revised `verification_procedure` when it preserves the exact frozen requirements and maps those requirements to executable commands.
 
 ## 5. Action Schema
 
@@ -310,7 +313,8 @@ Unix-style examples from papers should be translated to local tools or portable 
 ```text
 read target="agent"
 search target="create_issue" args={"path": "agent"}
-read target="agent/loop.py" args={"start": 1, "end": 240}
+read target="agent/loop.py" args={"query": "def _execute_action"}
+read target="agent/loop.py" args={"query": "def _execute_action", "continue_from": 350, "max_lines": 120}
 ```
 
 ### 7.4 Persistent Context
@@ -541,7 +545,7 @@ The initial implementation only needs:
 
 - `list_files(path, recursive, limit)`: inspect directory structure with structured entries.
 - `search(pattern, path)`: search files with structured match objects.
-- `read(path, start, end)`: read bounded file content.
+- `read(path, query, continue_from, max_lines)`: prefer literal `query` to find and return matching code. If the returned payload has `has_more=true`, call `read` again with the returned `next_read.args` to continue. Explicit `start`/`end` ranges remain available for known line numbers.
 - `edit(path, old, new, count)`: apply a precise text replacement.
 - `bash(command, timeout)`: run bounded shell commands.
 - `git(command, timeout)`: run allowlisted Git operations. Agent-project runs may use status, diff, log, show, branch, add, and commit; benchmark runs are restricted to read-only Git operations and reject add/commit.

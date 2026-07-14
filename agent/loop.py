@@ -287,6 +287,7 @@ class AgentLoop:
                 "title": str(task.get("title", task_id)),
                 "status": str(task.get("status", "pending")),
                 "evidence": task.get("evidence", []),
+                "acceptance_criteria": task.get("acceptance_criteria", []),
                 "depends_on": task.get("depends_on", []),
                 "priority": task.get("priority", 1000),
                 "expected_artifacts": task.get("expected_artifacts", []),
@@ -297,12 +298,74 @@ class AgentLoop:
                 "hidden_acceptance": task.get("hidden_acceptance", []),
                 "test_policy": task.get("test_policy", {}),
                 "verification_commands": task.get("verification_commands", []),
+                "criterion_command_map": task.get("criterion_command_map", {}),
+                "contract_managed": True,
             }
         ]
         if str(task.get("status", "pending")) == "pending":
             updated = self.orchestrator.transition_task(task_id, "in_progress", "scheduled by orchestrator")
             if updated:
                 state.nodes[0]["status"] = "in_progress"
+        self._ensure_frozen_acceptance_contract(state, task)
+
+    def _ensure_frozen_acceptance_contract(self, state: TaskState, task: dict[str, Any]) -> None:
+        task_id = str(task.get("id", state.task_id))
+        criteria = [str(item) for item in task.get("acceptance_criteria", [])]
+        commands = [str(item) for item in task.get("verification_commands", [])]
+        raw_mapping = task.get("criterion_command_map")
+        if isinstance(raw_mapping, dict):
+            mapping = {
+                str(criterion): [str(command) for command in mapped]
+                for criterion, mapped in raw_mapping.items()
+                if isinstance(mapped, list)
+            }
+        else:
+            mapping = {}
+        if not mapping and criteria and commands:
+            # Durable pre-mapping task graphs remain resumable; newly generated graphs are validated strictly.
+            mapping = {criterion: list(commands) for criterion in criteria}
+        contract = {
+            "task_id": task_id,
+            "summary": f"Frozen task-graph acceptance contract for {task_id}: {task.get('title', task_id)}",
+            "scope": [str(item) for item in task.get("expected_artifacts", [])],
+            "frozen_requirements": criteria,
+            "verification_procedure": {"commands": commands},
+            "checks": commands,
+            "criterion_command_map": mapping,
+            "required_evidence": criteria,
+            "forbidden_shortcuts": [
+                "Do not weaken frozen requirements after task activation.",
+                "Verification procedure may be corrected only to prove the same frozen requirements.",
+                "Do not inspect or invoke hidden acceptance from public verification commands.",
+            ],
+            "source": "task_graph",
+            "frozen": True,
+            "status": "proposed",
+        }
+        existing = next(
+            (
+                item
+                for item in reversed(state.acceptance_contracts)
+                if item.get("task_id") == task_id
+                and item.get("source") == "task_graph"
+                and item.get("frozen") is True
+                and item.get("frozen_requirements", item.get("required_evidence", [])) == criteria
+            ),
+            None,
+        )
+        if existing and existing.get("status") == "agreed":
+            existing.setdefault("frozen_requirements", list(criteria))
+            existing.setdefault("verification_procedure", {"commands": list(existing.get("checks", commands))})
+            return
+        result = self.verifier.validate_contract(contract, task)
+        contract["status"] = "agreed" if result.ok else "rejected"
+        contract["validation"] = result.data.get("checks", {})
+        state.acceptance_contracts = [
+            item
+            for item in state.acceptance_contracts
+            if not (item.get("task_id") == task_id and item.get("source") == "task_graph")
+        ]
+        state.acceptance_contracts.append(contract)
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
@@ -333,7 +396,7 @@ class AgentLoop:
                     "INIT does not create an acceptance contract; write only initializer artifacts.",
                     {"initializer_restricted": True, "allowed_targets": sorted(self._initializer_allowed_targets(state))},
                 )
-            return self._validate_contract_action(action)
+            return self._validate_contract_action(action, state)
         if name == "skill":
             if self._is_initializer_task(state):
                 return ToolResult(False, "Skill promotion is disabled during INIT.", {"initializer_restricted": True})
@@ -348,6 +411,12 @@ class AgentLoop:
             initializer_check = self._validate_initializer_write_action(action, state)
             if initializer_check is not None:
                 return initializer_check
+        elif name in {"edit", "write"} and not self._active_node(state):
+            return ToolResult(
+                False,
+                "Write rejected: no active worker task is writable. Run finish to let the harness schedule a repair task, or verify if a task was just completed.",
+                {"no_active_task": True, "required_action": "finish_or_verify"},
+            )
         elif name in {"edit", "write"} and not self._has_contract_for_active_task(state):
             return ToolResult(
                 False,
@@ -367,18 +436,6 @@ class AgentLoop:
         if name == "verify":
             task_id = self._active_task_id(state)
             if self._is_initializer_task(state):
-                if not state.initializer_command_passed:
-                    result = ToolResult(
-                        False,
-                        "Initializer verification rejected: run the deterministic INIT verification command successfully first.",
-                        {
-                            "task_id": task_id,
-                            "initializer_command_passed": False,
-                            "required_command": self._initializer_verification_command(state),
-                        },
-                    )
-                    self.verifier.record_result(result)
-                    return result
                 initializer_result = self._validate_initializer_outputs()
                 if not initializer_result.ok:
                     initializer_result.data["task_id"] = task_id
@@ -399,6 +456,18 @@ class AgentLoop:
             termination = self.terminator.evaluate()
             if termination.status == "completed":
                 return ToolResult(True, "Project completed.", termination.to_dict())
+            if "hidden_acceptance_not_passing" in termination.reasons:
+                repair_task = self._ensure_final_repair_task(state, termination.to_dict())
+                if repair_task:
+                    self._apply_orchestrator_selection(state)
+                    data = termination.to_dict()
+                    data["repair_task"] = repair_task
+                    data["required_action"] = "repair_task"
+                    return ToolResult(
+                        False,
+                        f"Finish rejected: final acceptance failed; repair task {repair_task.get('id')} was scheduled.",
+                        data,
+                    )
             return ToolResult(False, f"Finish rejected: {termination.status}.", termination.to_dict())
         tool = self.tools.get(str(name))
         if not tool:
@@ -732,8 +801,11 @@ class AgentLoop:
 
     def _contract_commands(self, state: TaskState) -> list[str]:
         latest = self._active_contract(state)
-        checks = list(latest.get("checks", [])) if latest else []
-        checks.extend(self._active_task_verification_commands(state))
+        checks = self._contract_procedure_commands(latest) if latest else []
+        if not checks and latest:
+            checks = list(latest.get("checks", []))
+        if not latest or latest.get("source") != "task_graph":
+            checks.extend(self._active_task_verification_commands(state))
         commands: list[str] = []
         for check in checks:
             text = str(check).strip()
@@ -742,6 +814,36 @@ class AgentLoop:
             if command.startswith("python "):
                 commands.append(command)
         return list(dict.fromkeys(commands))
+
+    def _contract_procedure_commands(self, contract: dict[str, Any] | None) -> list[str]:
+        if not contract:
+            return []
+        procedure = contract.get("verification_procedure")
+        if not isinstance(procedure, dict):
+            return []
+        commands = procedure.get("commands")
+        if isinstance(commands, list):
+            return [str(command) for command in commands if str(command).strip()]
+        command = str(procedure.get("command", "")).strip()
+        return [command] if command else []
+
+    def _normalize_verification_procedure(self, raw: object) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            procedure: dict[str, Any] = {}
+            working_directory = str(raw.get("working_directory", "")).strip()
+            if working_directory:
+                procedure["working_directory"] = working_directory
+            commands = raw.get("commands")
+            if isinstance(commands, list):
+                procedure["commands"] = [str(command) for command in commands if str(command).strip()]
+                return procedure
+            command = str(raw.get("command", "")).strip()
+            if command:
+                procedure["command"] = command
+            return procedure
+        if isinstance(raw, list):
+            return {"commands": [str(command) for command in raw if str(command).strip()]}
+        return {}
 
     def _is_contract_command(self, command: object, state: TaskState) -> bool:
         normalized = self._normalize_command(command)
@@ -879,6 +981,77 @@ class AgentLoop:
             if str(task.get("id", "")) == active:
                 return task
         return {}
+
+    def _ensure_final_repair_task(self, state: TaskState, termination: dict[str, Any]) -> dict[str, Any] | None:
+        checks = termination.get("checks", {}) if isinstance(termination, dict) else {}
+        if not isinstance(checks, dict) or not checks.get("tasks", {}).get("ok"):
+            return None
+        hidden = checks.get("hidden_acceptance", {})
+        hints = hidden.get("repair_hints", {}) if isinstance(hidden, dict) else {}
+        artifacts = self._final_repair_artifacts(hints)
+        if not artifacts:
+            return None
+        flags = [str(item) for item in hints.get("flags", [])] if isinstance(hints, dict) else []
+        modules = [str(item) for item in hints.get("modules", [])] if isinstance(hints, dict) else []
+        criteria = [
+            "Final project acceptance failure is repaired in the inferred implementation artifact.",
+            "Public regression tests continue to pass after the repair.",
+        ]
+        if flags:
+            criteria.insert(0, f"Implementation supports final verifier option(s): {', '.join(flags[:3])}.")
+        command = self._benchmark_unittest_command()
+        if not command:
+            command = "python -m unittest discover -s tests"
+        title_suffix = f" in {modules[0]}" if modules else ""
+        return self.orchestrator.ensure_repair_task(
+            source="hidden_acceptance",
+            title=f"Repair final acceptance failure{title_suffix}",
+            acceptance_criteria=criteria,
+            expected_artifacts=artifacts,
+            verification_commands=[command],
+            evidence="Final hidden acceptance failed; harness scheduled a focused repair task.",
+            metadata={
+                "kind": "hidden_acceptance",
+                "summary": hidden.get("summary") if isinstance(hidden, dict) else "Hidden acceptance failed.",
+                "hints": hints if isinstance(hints, dict) else {},
+                "previous_task_id": state.task_id,
+            },
+        )
+
+    def _final_repair_artifacts(self, hints: object) -> list[str]:
+        artifacts: list[str] = []
+        if isinstance(hints, dict) and isinstance(hints.get("artifacts"), list):
+            artifacts.extend(str(item) for item in hints["artifacts"] if str(item).strip())
+        existing = {self._normalize_target(item) for item in self._all_task_implementation_artifacts()}
+        artifacts = [item for item in artifacts if not existing or self._normalize_target(item) in existing]
+        if artifacts:
+            return list(dict.fromkeys(artifacts))
+        return [
+            item
+            for item in self._all_task_implementation_artifacts()
+            if item.endswith(".py") and "/tests/" not in item.replace("\\", "/")
+        ]
+
+    def _all_task_implementation_artifacts(self) -> list[str]:
+        artifacts: list[str] = []
+        for task in self.orchestrator.load_tasks():
+            for item in self._format_artifacts(task.get("implementation_artifacts", [])):
+                artifacts.append(item)
+        return list(dict.fromkeys(artifacts))
+
+    def _task_graph_task_ids(self) -> set[str]:
+        return {str(task.get("id")) for task in self.orchestrator.load_tasks() if str(task.get("id", "")).strip()}
+
+    def _benchmark_unittest_command(self) -> str:
+        workspace = self._expected_initializer_workspace_root()
+        if not workspace:
+            return ""
+        tests = f"{workspace}/tests"
+        return (
+            "python -c \"import os, sys, subprocess; "
+            f"os.environ['PYTHONPATH']={workspace!r}; "
+            f"sys.exit(subprocess.call([sys.executable, '-m', 'unittest', 'discover', '-s', {tests!r}]))\""
+        )
 
     def _update_state(self, state: TaskState, action: dict[str, Any], observation: ToolResult) -> None:
         state.iterations += 1
@@ -1047,6 +1220,41 @@ class AgentLoop:
 
     def _update_pending_repair(self, state: TaskState, action: dict[str, Any], observation: ToolResult) -> None:
         name = action.get("action")
+        if name == "verify":
+            verification = observation.data.get("verification", {})
+            results = verification.get("commands", []) if isinstance(verification, dict) else []
+            failed = next(
+                (item for item in results if isinstance(item, dict) and item.get("ok") is False),
+                None,
+            )
+            if observation.ok:
+                state.pending_repair = {}
+                return
+            if not failed:
+                return
+            command = str(failed.get("command", ""))
+            output = str(failed.get("output", ""))
+            failure_type = self._command_failure_type(output, command=command, state=state)
+            if failure_type in {"command_syntax_error", "command_environment_error"}:
+                targets: list[str] = []
+                required_reads: list[str] = []
+            else:
+                targets = self._repair_targets_from_failed_output(command, output, state)
+                required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+            state.pending_repair = {
+                "reason": "failed_verification_command",
+                "command": command,
+                "summary": str(failed.get("summary", observation.summary)),
+                "output": output[:4000],
+                "targets": targets,
+                "repair_targets": self._default_repair_write_targets(targets, state),
+                "required_reads": required_reads,
+                "read_targets": self._preserve_pending_repair_reads(state, required_reads),
+                "repaired_targets": [],
+            }
+            if failure_type:
+                state.pending_repair["command_failure_type"] = failure_type
+            return
         if name == "bash":
             command = str(observation.data.get("command") or action.get("target", ""))
             if observation.ok and self._pending_repair_command_failure_type(state) in {
@@ -1602,23 +1810,113 @@ class AgentLoop:
         commands = active.get("verification_commands", [])
         return [str(command) for command in commands] if isinstance(commands, list) else []
 
-    def _validate_contract_action(self, action: dict[str, Any]) -> ToolResult:
+    def _validate_contract_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         args = action.get("args", {})
         if not isinstance(args, dict):
             return ToolResult(False, "Contract rejected: args must be an object.", {})
         task_id = str(args.get("task_id") or action.get("target") or "current")
+        if task_id == "current" and self._active_node(state):
+            task_id = self._active_task_id(state)
+        graph_task_ids = self._task_graph_task_ids()
+        if graph_task_ids and task_id not in graph_task_ids:
+            return ToolResult(
+                False,
+                "Contract rejected: task_id must refer to an active task graph node; repair tasks are created by the harness.",
+                {"task_id": task_id, "known_task_ids": sorted(graph_task_ids)},
+            )
+        managed = next(
+            (
+                item
+                for item in reversed(state.acceptance_contracts)
+                if item.get("task_id") == task_id and item.get("source") == "task_graph"
+            ),
+            None,
+        )
+        if managed:
+            frozen_requirements = [
+                str(item)
+                for item in managed.get("frozen_requirements", managed.get("required_evidence", []))
+                if str(item).strip()
+            ]
+            raw_requested_requirements = args.get(
+                "frozen_requirements", args.get("required_evidence", frozen_requirements)
+            )
+            requested_requirements = [
+                str(item)
+                for item in raw_requested_requirements
+                if str(item).strip()
+            ] if isinstance(raw_requested_requirements, list) else []
+            if requested_requirements != frozen_requirements:
+                return ToolResult(
+                    False,
+                    "Contract rejected: frozen_requirements are semantic requirements and cannot be weakened or replaced.",
+                    {
+                        "task_id": task_id,
+                        "frozen_requirements": frozen_requirements,
+                        "requested_requirements": requested_requirements,
+                    },
+                )
+            procedure = self._normalize_verification_procedure(
+                args.get("verification_procedure", args.get("checks", []))
+            )
+            procedure_commands = self._contract_procedure_commands({"verification_procedure": procedure})
+            if not procedure_commands:
+                return ToolResult(
+                    False,
+                    "Contract rejected: generated-task updates may only provide a non-empty verification_procedure.",
+                    {"task_id": task_id, "managed_contract": managed},
+                )
+            updated = dict(managed)
+            updated["summary"] = str(args.get("summary") or managed.get("summary") or "").strip()
+            updated["frozen_requirements"] = frozen_requirements
+            updated["required_evidence"] = frozen_requirements
+            updated["verification_procedure"] = procedure
+            updated["checks"] = procedure_commands
+            raw_mapping = args.get("criterion_command_map")
+            if isinstance(raw_mapping, dict):
+                updated["criterion_command_map"] = {
+                    str(criterion): [str(command) for command in commands]
+                    for criterion, commands in raw_mapping.items()
+                    if isinstance(commands, list)
+                }
+            else:
+                updated["criterion_command_map"] = {
+                    criterion: list(procedure_commands) for criterion in frozen_requirements
+                }
+            updated["status"] = "agreed"
+            updated["frozen"] = True
+            updated["source"] = "task_graph"
+            task = self._active_task_metadata(state)
+            result = self.verifier.validate_contract(updated, task if task.get("id") == task_id else None)
+            if not result.ok:
+                return result
+            state.acceptance_contracts = [
+                item
+                for item in state.acceptance_contracts
+                if not (item.get("task_id") == task_id and item.get("source") == "task_graph")
+            ]
+            state.acceptance_contracts.append(updated)
+            return ToolResult(
+                True,
+                f"Verification procedure updated for frozen requirements on {task_id}.",
+                {"contract": updated},
+            )
         summary = str(args.get("summary", "")).strip()
         checks = args.get("checks", [])
         if not summary:
             return ToolResult(False, "Contract rejected: summary is required.", {})
         if not isinstance(checks, list) or not checks:
             return ToolResult(False, "Contract rejected: checks must be a non-empty list.", {})
+        procedure = self._normalize_verification_procedure(args.get("verification_procedure", checks))
+        frozen_requirements = args.get("frozen_requirements", args.get("required_evidence", checks))
         contract = {
             "task_id": task_id,
             "summary": summary,
             "scope": args.get("scope", []),
+            "frozen_requirements": frozen_requirements,
+            "verification_procedure": procedure,
             "checks": checks,
-            "required_evidence": args.get("required_evidence", checks),
+            "required_evidence": frozen_requirements,
             "forbidden_shortcuts": args.get("forbidden_shortcuts", []),
             "status": "agreed",
         }
@@ -1886,8 +2184,14 @@ class AgentLoop:
         return f"- {node.get('id')}: [{node.get('status')}] {node.get('title')} | evidence: {evidence_text}"
 
     def _format_contract(self, contract: dict[str, Any]) -> str:
-        checks = "; ".join(str(item) for item in contract.get("checks", []))
-        return f"- {contract.get('task_id')}: {contract.get('summary')} | checks: {checks}"
+        requirements = contract.get("frozen_requirements", contract.get("required_evidence", []))
+        procedure_commands = self._contract_procedure_commands(contract) or list(contract.get("checks", []))
+        requirement_text = "; ".join(str(item) for item in requirements)
+        procedure_text = "; ".join(str(item) for item in procedure_commands)
+        return (
+            f"- {contract.get('task_id')}: {contract.get('summary')} | "
+            f"frozen_requirements: {requirement_text} | verification_procedure: {procedure_text}"
+        )
 
     def _format_pending_repair(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -1934,9 +2238,7 @@ class AgentLoop:
             missing = self._missing_initializer_artifacts()
             if missing:
                 return f"Resume INIT by writing {missing[0]}; INIT does not require an acceptance contract."
-            if not state.initializer_command_passed:
-                return "Run the deterministic INIT verification command; answer and finish are not allowed."
-            return "Submit INIT to the verifier; only Verifier PASS may schedule the first Worker task."
+            return "Submit INIT to the verifier; it executes the deterministic command and only PASS schedules the first Worker task."
         repair_targets = self._pending_repair_write_targets(state)
         if repair_targets:
             return (
@@ -1949,6 +2251,11 @@ class AgentLoop:
                 "do not repeat list_files on the missing directory."
             )
         if not self._has_contract_for_active_task(state):
+            if active.get("contract_managed"):
+                return (
+                    f"The frozen task-graph contract for {active.get('id')} is missing or rejected. "
+                    "Do not create a manual contract; repair the generated task graph from INIT and let activation freeze it."
+                )
             return f"Create an acceptance contract for {active.get('id')} before writing code."
         return f"Resume {active.get('id')} with a small evidence-backed action, then verify."
 

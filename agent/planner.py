@@ -18,6 +18,7 @@ GENERATED_TASK_REQUIRED_FIELDS = {
     "depends_on",
     "status",
     "acceptance_criteria",
+    "criterion_command_map",
     "expected_artifacts",
     "verification_commands",
 }
@@ -241,6 +242,50 @@ def validate_generated_task_graph(
         if isinstance(task.get("verification_commands"), list) and not task["verification_commands"]:
             errors.append(f"{label}.verification_commands must not be empty.")
 
+        criteria = task.get("acceptance_criteria", [])
+        criterion_command_map = task.get("criterion_command_map")
+        commands = task.get("verification_commands", [])
+        if not isinstance(criterion_command_map, dict):
+            errors.append(f"{label}.criterion_command_map must be an object.")
+        elif isinstance(criteria, list) and isinstance(commands, list):
+            criterion_texts = [str(item) for item in criteria]
+            missing_criteria = [criterion for criterion in criterion_texts if criterion not in criterion_command_map]
+            extra_criteria = [str(criterion) for criterion in criterion_command_map if str(criterion) not in criterion_texts]
+            if missing_criteria:
+                errors.append(
+                    f"{label}.criterion_command_map is missing acceptance criteria: "
+                    + ", ".join(missing_criteria)
+                    + "."
+                )
+            if extra_criteria:
+                errors.append(
+                    f"{label}.criterion_command_map contains unknown acceptance criteria: "
+                    + ", ".join(extra_criteria)
+                    + "."
+                )
+            declared_commands = {str(command) for command in commands}
+            mapped_commands: set[str] = set()
+            for criterion in criterion_texts:
+                mapped = criterion_command_map.get(criterion, [])
+                if not isinstance(mapped, list) or not mapped:
+                    errors.append(f"{label}.criterion_command_map['{criterion}'] must be a non-empty list.")
+                    continue
+                unknown_commands = [str(command) for command in mapped if str(command) not in declared_commands]
+                if unknown_commands:
+                    errors.append(
+                        f"{label}.criterion_command_map['{criterion}'] references undeclared verification commands: "
+                        + ", ".join(unknown_commands)
+                        + "."
+                    )
+                mapped_commands.update(str(command) for command in mapped)
+            unmapped_commands = [str(command) for command in commands if str(command) not in mapped_commands]
+            if unmapped_commands:
+                errors.append(
+                    f"{label}.criterion_command_map does not assign verification commands: "
+                    + ", ".join(unmapped_commands)
+                    + "."
+                )
+
         for field in GENERATED_TASK_ARTIFACT_FIELDS:
             artifacts = task.get(field, [])
             if not isinstance(artifacts, list):
@@ -295,6 +340,9 @@ def validate_generated_task_graph(
                     )
                 if _is_placeholder_verification_command(command_text):
                     errors.append(f"{label}.verification_commands contains a placeholder/no-op command: {command_text}.")
+                portability_error = verification_command_portability_error(command_text)
+                if portability_error:
+                    errors.append(f"{label}.verification_commands is not cross-platform: {portability_error}.")
                 errors.extend(_python_c_syntax_errors(label, command_text))
                 if standard_library_only and _uses_external_python_tool(command_text):
                     errors.append(
@@ -446,6 +494,28 @@ def _is_placeholder_verification_command(command: str) -> bool:
         has_followup_command = bool(re.search(r"(?:&&|\|\||;|\|)\s*\S+", normalized))
         return not has_followup_command
     return bool(re.fullmatch(r"python(?:\.exe)?\s+-c\s+[\"']assert\s+true;?[\"']", normalized))
+
+
+def verification_command_portability_error(command: str) -> str | None:
+    """Return why a public verification command is unsuitable for frozen cross-platform use."""
+    normalized = command.strip()
+    lower = normalized.lower().replace("\\", "/")
+    if not re.match(r"^(python(?:\.exe|3)?|py)\s+(?:-c|-m)\b", lower):
+        return "use a direct Python command instead of shell-specific setup or pipelines"
+    unix_markers = (
+        "/tmp/",
+        "echo -e ",
+        "mkdir -p ",
+        "printf ",
+        " grep ",
+        " rm ",
+    )
+    marker = next((item for item in unix_markers if item in f" {lower} "), None)
+    if marker:
+        return f"contains Unix-specific construct {marker.strip()!r}"
+    if "hidden_acceptance" in lower:
+        return "must not invoke hidden acceptance"
+    return None
 
 
 def _python_c_syntax_errors(label: str, command: str) -> list[str]:

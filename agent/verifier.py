@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import py_compile
 import subprocess
 import sys
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent.planner import TaskState
+from agent.planner import TaskState, verification_command_portability_error
 from agent.tools import ToolResult
 
 
@@ -23,7 +24,28 @@ class Verifier:
         checks.append(("state_dir_exists", self.state_dir.exists()))
         checks.append(("trace_dir_exists", (self.state_dir / "traces").exists()))
         checks.append(("has_plan_nodes", bool(state.nodes)))
-        checks.append(("has_evidence", self._has_success_evidence(state)))
+        active_node = self._active_node(state)
+        contract = self._active_contract(state)
+        procedures: list[dict[str, Any]] = []
+        contract_validation: dict[str, bool] | None = None
+        if state.task_id == "INIT":
+            procedures = self._procedures_from_commands(self._node_verification_commands(active_node))
+        elif active_node.get("contract_managed"):
+            contract_checks = self._contract_validation_checks(contract or {}, active_node)
+            contract_validation = dict(contract_checks)
+            contract_ok = bool(contract) and all(value for _, value in contract_checks)
+            checks.append(("contract_frozen", contract_ok))
+            if contract_ok and contract:
+                procedures = self._contract_verification_procedures(contract)
+        elif contract and contract.get("status") == "agreed":
+            procedures = self._contract_verification_procedures(contract)
+        else:
+            procedures = self._procedures_from_commands(self._node_verification_commands(active_node))
+
+        verification_ok, command_results = self._run_verification_commands(procedures)
+        if procedures or active_node.get("contract_managed") or state.task_id == "INIT":
+            checks.append(("verification_commands", verification_ok and bool(procedures)))
+        self._record_verification_evidence(state, command_results)
         compile_ok, compile_error = self._compile_agent()
         checks.append(("python_compile", compile_ok))
         tests_ok, tests_output = self._run_tests()
@@ -35,6 +57,10 @@ class Verifier:
 
         ok = all(value for _, value in checks)
         data = {"checks": dict(checks), "task_id": state.task_id}
+        if contract_validation is not None:
+            data["contract_validation"] = contract_validation
+        if procedures or active_node.get("contract_managed") or state.task_id == "INIT":
+            data["verification"] = {"commands": command_results}
         if compile_error:
             data["compile_error"] = compile_error
         if tests_output:
@@ -46,27 +72,147 @@ class Verifier:
         self._write_report(result)
         return result
 
-    def _has_success_evidence(self, state: TaskState) -> bool:
-        accepted_types = {
-            "acceptance_command_passed",
-            "initializer_command_passed",
-            "verifier_passed",
-        }
-        for evidence in state.evidence_sources:
-            if not isinstance(evidence, dict):
-                continue
-            evidence_task = str(evidence.get("task_id", ""))
-            if evidence_task and evidence_task != state.task_id:
-                continue
-            if evidence.get("ok") is True and evidence.get("evidence_type") in accepted_types:
-                return True
-        success_markers = ("acceptance command passed", "command exited with code 0", "verifier passed")
+    def _active_node(self, state: TaskState) -> dict[str, Any]:
         for node in state.nodes:
-            for evidence in node.get("evidence", []):
-                normalized = str(evidence).strip().lower()
-                if any(marker in normalized for marker in success_markers):
-                    return True
-        return False
+            if str(node.get("id", "")) == state.task_id:
+                return node
+        return state.nodes[0] if state.nodes else {}
+
+    def _active_contract(self, state: TaskState) -> dict[str, Any] | None:
+        matches = [
+            contract
+            for contract in state.acceptance_contracts
+            if isinstance(contract, dict)
+            and contract.get("task_id") in {state.task_id, "current"}
+            and contract.get("status") == "agreed"
+        ]
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def _node_verification_commands(node: dict[str, Any]) -> list[str]:
+        commands = node.get("verification_commands", [])
+        return [str(item) for item in commands] if isinstance(commands, list) else []
+
+    def _contract_verification_procedures(self, contract: dict[str, Any]) -> list[dict[str, Any]]:
+        procedure = contract.get("verification_procedure")
+        if isinstance(procedure, dict):
+            working_directory = str(procedure.get("working_directory", "")).strip()
+            commands = procedure.get("commands")
+            if isinstance(commands, list):
+                return [
+                    self._normalize_procedure({"command": str(command), "working_directory": working_directory})
+                    for command in commands
+                    if str(command).strip()
+                ]
+            command = str(procedure.get("command", "")).strip()
+            if command:
+                return [self._normalize_procedure({"command": command, "working_directory": working_directory})]
+        return self._procedures_from_commands(contract.get("checks", []))
+
+    def _procedures_from_commands(self, commands: object) -> list[dict[str, Any]]:
+        if not isinstance(commands, list):
+            return []
+        return [self._normalize_procedure({"command": str(command)}) for command in commands if str(command).strip()]
+
+    def _normalize_procedure(self, procedure: dict[str, Any]) -> dict[str, Any]:
+        normalized = {"command": str(procedure.get("command", "")).strip()}
+        working_directory = str(procedure.get("working_directory", "")).strip()
+        if working_directory:
+            normalized["working_directory"] = working_directory
+        return normalized
+
+    def _run_verification_commands(self, procedures: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
+        results: list[dict[str, Any]] = []
+        env = os.environ.copy()
+        benchmark_id = self._benchmark_id()
+        if benchmark_id:
+            workspace = (self.root / "eval" / "benchmarks" / benchmark_id / "workspace").resolve()
+            current = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join([str(workspace), current] if current else [str(workspace)])
+        for procedure in procedures:
+            command = str(procedure.get("command", "")).strip()
+            if not command:
+                continue
+            cwd = self.root
+            working_directory = str(procedure.get("working_directory", "")).strip()
+            if working_directory:
+                try:
+                    cwd = (self.root / working_directory).resolve()
+                    cwd.relative_to(self.root.resolve())
+                except (OSError, ValueError):
+                    results.append(
+                        {
+                            "command": command,
+                            "working_directory": working_directory,
+                            "ok": False,
+                            "returncode": None,
+                            "summary": "Verification working directory is outside the workspace.",
+                            "output": working_directory[-4000:],
+                        }
+                    )
+                    continue
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=180,
+                )
+                output = (completed.stdout + completed.stderr).strip()
+                results.append(
+                    {
+                        "command": command,
+                        "working_directory": working_directory or ".",
+                        "ok": completed.returncode == 0,
+                        "returncode": completed.returncode,
+                        "summary": f"Verification command exited with code {completed.returncode}.",
+                        "output": output[-4000:],
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append(
+                    {
+                        "command": command,
+                        "working_directory": working_directory or ".",
+                        "ok": False,
+                        "returncode": None,
+                        "summary": "Verification command could not be executed.",
+                        "output": str(exc)[-4000:],
+                    }
+                )
+        return bool(results) and all(item["ok"] for item in results), results
+
+    def _record_verification_evidence(self, state: TaskState, results: list[dict[str, Any]]) -> None:
+        for result in results:
+            if not result.get("ok"):
+                continue
+            record = {
+                "action": "verify",
+                "target": result["command"],
+                "summary": result["summary"],
+                "task_id": state.task_id,
+                "evidence_type": "verification_command_passed",
+                "ok": True,
+            }
+            duplicate = any(
+                isinstance(item, dict)
+                and item.get("task_id") == state.task_id
+                and item.get("evidence_type") == "verification_command_passed"
+                and item.get("target") == result["command"]
+                for item in state.evidence_sources
+            )
+            if not duplicate:
+                state.evidence_sources.append(record)
+            node = self._active_node(state)
+            evidence = node.setdefault("evidence", [])
+            marker = f"Verification command passed: {result['command']}"
+            if marker not in evidence:
+                evidence.append(marker)
 
     def _requires_hidden_acceptance(self, state: TaskState) -> bool:
         return any("hidden acceptance" in str(item).lower() for item in state.acceptance_criteria)
@@ -119,40 +265,87 @@ class Verifier:
             "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
         }
 
-    def validate_contract(self, contract: dict[str, Any]) -> ToolResult:
-        checks = []
-        # 校验1：存在非空task_id
-        checks.append(("has_task_id", bool(str(contract.get("task_id", "")).strip())))
-        # 校验2：存在非空summary
-        checks.append(("has_summary", bool(str(contract.get("summary", "")).strip())))
-        # 校验3：checks字段为非空list
-        checks.append(("has_checks", bool(contract.get("checks")) and isinstance(contract.get("checks"), list)))
-
-        # 新增工具函数：判断单条check是否是可执行校验命令
-        def is_executable_command(line: str) -> bool:
-            line = str(line).strip().lower()
-            # 匹配系统中所有合法验收执行命令前缀
-            exec_prefix = (
-                "python -c",
-                "python -m unittest",
-                "bash",
-                "./",
-                "pwsh",
-                "python3 -c"
-            )
-            return any(line.startswith(prefix) for prefix in exec_prefix)
-
-        # 校验4：至少包含一条可执行校验脚本（替换原test/smoke关键词匹配）
-        check_items = contract.get("checks", [])
-        has_exec_check = any(is_executable_command(item) for item in check_items)
-        checks.append(("behavior_level_checks", has_exec_check))
-
-        # 汇总所有校验结果
+    def validate_contract(
+        self,
+        contract: dict[str, Any],
+        task: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        checks = self._contract_validation_checks(contract, task)
         ok = all(value for _, value in checks)
         summary = "Acceptance contract agreed." if ok else "Acceptance contract rejected."
         result = ToolResult(ok, summary, {"checks": dict(checks), "contract": contract})
         self._write_report(result)
         return result
+
+    def _contract_validation_checks(
+        self,
+        contract: dict[str, Any],
+        task: dict[str, Any] | None = None,
+    ) -> list[tuple[str, bool]]:
+        checks: list[tuple[str, bool]] = []
+        procedures = self._contract_verification_procedures(contract)
+        commands = [item["command"] for item in procedures]
+        frozen_requirements = contract.get("frozen_requirements", contract.get("required_evidence", []))
+        checks.append(("has_task_id", bool(str(contract.get("task_id", "")).strip())))
+        checks.append(("has_summary", bool(str(contract.get("summary", "")).strip())))
+        checks.append(("has_frozen_requirements", isinstance(frozen_requirements, list) and bool(frozen_requirements)))
+        checks.append(("has_verification_procedure", bool(procedures)))
+        checks.append(
+            (
+                "portable_executable_checks",
+                bool(commands)
+                and all(verification_command_portability_error(str(command)) is None for command in commands),
+            )
+        )
+        checks.append(
+            (
+                "hidden_acceptance_is_private",
+                all("hidden_acceptance" not in str(command).lower() for command in commands),
+            )
+        )
+        if task is None:
+            return checks
+
+        criteria = task.get("acceptance_criteria", [])
+        mapping = contract.get("criterion_command_map")
+        expected_artifacts = task.get("expected_artifacts", [])
+        checks.append(("matches_active_task", str(contract.get("task_id")) == str(task.get("id"))))
+        checks.append(("is_frozen", contract.get("frozen") is True))
+        checks.append(
+            (
+                "requirements_match_task_graph",
+                isinstance(criteria, list)
+                and isinstance(frozen_requirements, list)
+                and [str(item) for item in frozen_requirements] == [str(item) for item in criteria],
+            )
+        )
+        checks.append(
+            (
+                "scope_matches_artifacts",
+                isinstance(contract.get("scope"), list)
+                and isinstance(expected_artifacts, list)
+                and [str(item) for item in contract.get("scope", [])]
+                == [str(item) for item in expected_artifacts],
+            )
+        )
+        mapping_ok = isinstance(mapping, dict) and isinstance(criteria, list)
+        if mapping_ok:
+            criterion_texts = [str(item) for item in criteria]
+            executable = set(commands)
+            mapping_ok = set(str(item) for item in mapping) == set(criterion_texts)
+            mapped_commands: set[str] = set()
+            for criterion in criterion_texts:
+                mapped = mapping.get(criterion, [])
+                if not isinstance(mapped, list) or not mapped:
+                    mapping_ok = False
+                    continue
+                normalized = {str(item) for item in mapped}
+                if not normalized.issubset(executable):
+                    mapping_ok = False
+                mapped_commands.update(normalized)
+            mapping_ok = mapping_ok and mapped_commands == executable
+        checks.append(("criteria_fully_mapped", mapping_ok))
+        return checks
 
     def validate_skill_promotion(self, proposal: dict[str, Any], state: TaskState) -> ToolResult:
         evidence = proposal.get("evidence", [])
@@ -162,7 +355,7 @@ class Verifier:
         checks.append(("has_skill_id", bool(str(proposal.get("skill_id", "")).strip())))
         checks.append(("has_title", bool(str(proposal.get("title", "")).strip())))
         checks.append(("has_body", bool(str(proposal.get("body", "")).strip())))
-        checks.append(("has_evidence", bool(evidence) and isinstance(evidence, list)))
+        checks.append(("has_skill_evidence", bool(evidence) and isinstance(evidence, list)))
         if evidence_type == "verified_success":
             checks.append(
                 (
@@ -209,7 +402,7 @@ class Verifier:
 
     def _run_tests(self) -> tuple[bool, str]:
         if self._benchmark_id():
-            return True, "Benchmark acceptance commands are verified from structured task evidence."
+            return True, "Host-agent unit tests are skipped for benchmark tasks; frozen requirement procedures run separately."
         tests_dir = self.root / "tests"
         if not tests_dir.exists():
             return True, "No tests directory found."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -93,12 +94,18 @@ class ProjectTerminator:
                 }
             result = run_command([sys.executable, str(script)], self.root, timeout=180)
             ok = bool(result.get("ok"))
-            return {
+            hidden_result = {
                 "ok": ok,
                 "configured": True,
                 "returncode": result.get("returncode"),
                 "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
             }
+            if not ok:
+                hidden_result["repair_hints"] = infer_benchmark_repair_hints(
+                    str(result.get("output", "")),
+                    self.benchmark_id,
+                )
+            return hidden_result
         config_path = self.root / "eval" / "hidden_acceptance.json"
         if not config_path.exists():
             return {
@@ -263,3 +270,33 @@ def run_command(command: list[str], cwd: Path, timeout: int = 120) -> dict[str, 
         "output": output[-8000:],
         "returncode": completed.returncode,
     }
+
+
+def infer_benchmark_repair_hints(output: str, benchmark_id: str | None) -> dict[str, Any]:
+    """Return non-secret repair routing hints derived from hidden verifier output."""
+    hints: dict[str, Any] = {"artifacts": [], "modules": [], "flags": []}
+    if not benchmark_id:
+        return hints
+
+    modules: list[str] = []
+    for match in re.finditer(r"\b-m\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)", output):
+        modules.append(match.group(1))
+    for match in re.finditer(r"\bfrom\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s+import\b", output):
+        modules.append(match.group(1))
+    for match in re.finditer(r"\bimport\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)", output):
+        modules.append(match.group(1))
+
+    artifacts: list[str] = []
+    for module in dict.fromkeys(modules):
+        parts = module.split(".")
+        if len(parts) == 1:
+            continue
+        artifact = f"eval/benchmarks/{benchmark_id}/workspace/" + "/".join(parts) + ".py"
+        artifacts.append(artifact)
+
+    for match in re.finditer(r"(?<!\w)--[A-Za-z][A-Za-z0-9-]*", output):
+        hints["flags"].append(match.group(0))
+    hints["flags"] = list(dict.fromkeys(hints["flags"]))[:8]
+    hints["modules"] = list(dict.fromkeys(modules))[:8]
+    hints["artifacts"] = list(dict.fromkeys(artifacts))[:8]
+    return hints

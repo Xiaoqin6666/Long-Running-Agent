@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,74 @@ class Orchestrator:
 
     def mark_verified(self, task_id: str, passed: bool, evidence: str | None = None) -> None:
         self.transition_task(task_id, "completed" if passed else "in_progress", evidence=evidence)
+
+    def ensure_repair_task(
+        self,
+        *,
+        source: str,
+        title: str,
+        acceptance_criteria: list[str],
+        expected_artifacts: list[str],
+        verification_commands: list[str],
+        evidence: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        data = self.load_task_file()
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            return None
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if task.get("repair_source") == source and normalize_status(task.get("status")) in WORKER_READY_STATUSES:
+                return task
+
+        repair_id = self.next_repair_task_id(tasks)
+        dependencies = [
+            str(task.get("id"))
+            for task in tasks
+            if isinstance(task, dict)
+            and str(task.get("id", "")).strip()
+            and normalize_status(task.get("status")) in TERMINAL_DONE_STATUSES
+            and not str(task.get("id", "")).startswith("R")
+        ]
+        commands = [str(command) for command in verification_commands if str(command).strip()]
+        criteria = [str(item) for item in acceptance_criteria if str(item).strip()]
+        mapping = {criterion: list(commands) for criterion in criteria}
+        artifacts = [str(item) for item in expected_artifacts if str(item).strip()]
+        repair_task: dict[str, Any] = {
+            "id": repair_id,
+            "title": title,
+            "priority": 0,
+            "depends_on": dependencies,
+            "status": "pending",
+            "acceptance_criteria": criteria,
+            "criterion_command_map": mapping,
+            "expected_artifacts": artifacts,
+            "implementation_artifacts": list(artifacts),
+            "worker_test_artifacts": [],
+            "acceptance_artifacts": [],
+            "frozen_acceptance_artifacts": [],
+            "test_policy": {
+                "acceptance_tests_mutable_by_worker": False,
+                "acceptance_test_repair_requires_verifier_approval": True,
+            },
+            "verification_commands": commands,
+            "repair_source": source,
+            "repair_metadata": metadata or {},
+            "evidence": [evidence] if evidence else [],
+        }
+        tasks.append(repair_task)
+        self.save_task_file(data)
+        return repair_task
+
+    def next_repair_task_id(self, tasks: list[dict[str, Any]]) -> str:
+        highest = 0
+        for task in tasks:
+            match = re.fullmatch(r"R(\d+)", str(task.get("id", "")))
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return f"R{highest + 1}"
 
     def transition_task(self, task_id: str, status: str, evidence: str | None = None) -> dict[str, Any] | None:
         status = normalize_status(status)

@@ -8,7 +8,7 @@ from pathlib import Path
 from agent.planner import TaskState
 
 
-RECENT_TOOL_OBSERVATION_LIMIT = 3
+RECENT_TOOL_OBSERVATION_LIMIT = 5
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
 RECENT_TOOL_OBSERVATIONS_MAX_CHARS = 18000
 
@@ -115,16 +115,17 @@ class ContextBuilder:
             f"Orchestrator decision: {state.orchestrator_decision}",
             f"Required next action: {self._required_next_action(state)}",
             "Runtime environment: Windows PowerShell. Prefer portable Python commands or PowerShell commands.",
-            "Tool conventions: use list_files for directories; use read for file ranges; use bash target as the command string.",
+            "Tool conventions: use list_files for directories; use search as grep before reading when you know an id, symbol, error text, or filename; then use read with args.query to fetch matching code. If read returns has_more=true, continue only when the needed content is clearly beyond the returned window; use bash target as the command string.",
             "Use action='answer' when enough evidence has been collected for an inspection, explanation, recommendation, or next-step request.",
             "For action='answer', put the final response in args.answer and cite evidence from observations.",
-            "For action='contract', args must include task_id, summary, and checks; checks must be a non-empty list with behavior-level test or smoke evidence.",
+            "Generated-task acceptance contracts freeze semantic frozen_requirements; do not weaken them. If the execution command is wrong, action='contract' may update only verification_procedure for the same frozen_requirements.",
+            "For ad-hoc tasks without a generated task graph, action='contract' args must include task_id, summary, frozen_requirements, and verification_procedure or checks.",
             "On resume, handoff.md is authoritative operational context. Read its Resume Instructions, Known Risks And Failed Attempts, and Suggested Next Action before choosing an action.",
             "If handoff.md has a Suggested Next Action and it is a low-risk write, read, bash, contract, or verify step, execute that action first. If you do not execute it, thought_summary must name the concrete blocker.",
             "Do not repeat a failed action unchanged from handoff.md, current state, or the latest observation.",
             "Do not list the same target repeatedly. After one useful listing, act on the evidence; after a missing_path listing, write the required artifact instead of listing again.",
             "If list_files reports a missing target directory for a task whose goal is to create that directory, do not repeat list_files; use write to create the first required file. Write creates parent directories.",
-            "If an agreed acceptance contract already exists for the current task, do not submit another contract unless the verifier rejected the existing one.",
+            "If an agreed acceptance contract already exists for the current task, do not submit another contract unless the verifier rejected it or the verification_procedure itself needs correction.",
             "Do not modify acceptance criteria. Use update_plan only to propose state changes.",
             "Completion requires verifier evidence; do not self-certify completion.",
             "Worker cannot mark tasks completed. Only Verifier PASS followed by Orchestrator state transition may complete a task.",
@@ -136,28 +137,29 @@ class ContextBuilder:
             )
         return "\n".join(lines)
 
-    def _startup_context(self, state: TaskState | None = None) -> str:
+    def _session_startup_context(self, state: TaskState | None = None) -> str:
         state_label = self._rel(self.state_dir)
         project_spec = self._read_optional(self.state_dir / "project_spec.md", max_chars=2500)
-        root_tasks = ""
+        root_tasks_overview = ""
         if self.state_dir == self.root / "state":
             project_spec = project_spec or self._read_optional(self.root / "project_spec.md", max_chars=2500)
-            root_tasks = self._read_optional(self.root / "tasks.json", max_chars=2500)
-        candidate = ""
+            root_tasks_overview = self._task_graph_overview(self.root / "tasks.json", state)
+        candidate_path = ""
         if state and isinstance(state.initializer_repair, dict) and state.initializer_repair.get("candidate_path"):
-            candidate = self._read_optional(self.state_dir / "rejected_candidates" / "generated_tasks.json", max_chars=5000)
+            candidate_path = self._rel(self.state_dir / "rejected_candidates" / "generated_tasks.json")
         lines = [
-            "# Startup Context",
+            "# Session Startup Context",
+            "Included only on the first model call of a Worker session.",
             f"## {state_label}/project_spec.md",
             project_spec,
-            "## repository tasks.json (non-benchmark runs only)",
-            root_tasks,
-            f"## {state_label}/generated_tasks.json",
-            self._read_optional(self.state_dir / "generated_tasks.json", max_chars=2500),
-            f"## {state_label}/rejected_candidates/generated_tasks.json (only when initializer repair is active)",
-            candidate,
-            f"## {state_label}/runtime_tasks.json",
-            self._read_optional(self.state_dir / "runtime_tasks.json", max_chars=2500),
+            "## Task Graph Overview",
+            *(["### repository tasks.json (non-benchmark runs only)", root_tasks_overview] if root_tasks_overview else []),
+            f"### {state_label}/generated_tasks.json",
+            self._task_graph_overview(self.state_dir / "generated_tasks.json", state),
+            f"### {state_label}/runtime_tasks.json",
+            self._task_graph_overview(self.state_dir / "runtime_tasks.json", state),
+            f"### {state_label}/rejected_candidates/generated_tasks.json",
+            candidate_path or "No initializer repair candidate.",
             f"## {state_label}/handoff.md focus",
             self._handoff_focus_context(),
             f"## {state_label}/verifier_report.md",
@@ -166,6 +168,36 @@ class ContextBuilder:
             self._run_git(["log", "--oneline", "-5"]),
             "## git status",
             self._run_git(["status", "--short", "--branch"]),
+        ]
+        return "\n".join(lines)
+
+    def _incremental_reference_context(self, state: TaskState) -> str:
+        state_label = self._rel(self.state_dir)
+        verifier = ""
+        if state.last_verified_at or state.last_action.get("action") == "verify":
+            verifier = self._read_optional(self.state_dir / "verifier_report.md", max_chars=1200)
+        handoff = ""
+        if state.handoff_ready or self._read_optional(self.state_dir / "handoff.md", max_chars=1):
+            handoff = self._handoff_focus_context()
+        generated_summary = self._task_graph_summary(self.state_dir / "generated_tasks.json")
+        runtime_summary = self._task_graph_summary(self.state_dir / "runtime_tasks.json")
+        git_status = self._run_git(["status", "--short", "--branch"])
+        lines = [
+            "# Incremental Reference Context",
+            "Subsequent-call reference state. Full startup files are omitted; this block carries compact task, verifier, handoff, and git signals.",
+            f"- current_task_id: {self._active_task_id(state)}",
+            f"- state_iterations: {state.iterations}",
+            f"- last_verified_at: {state.last_verified_at or 'never'}",
+            f"- handoff_ready: {state.handoff_ready}",
+            f"- orchestrator_decision: {state.orchestrator_decision}",
+            f"- generated_tasks_summary: {generated_summary}",
+            f"- runtime_tasks_summary: {runtime_summary}",
+            f"## {state_label}/handoff.md focus",
+            handoff or "No new handoff state.",
+            f"## {state_label}/verifier_report.md",
+            verifier or "No new verifier result.",
+            "## git status",
+            git_status,
         ]
         return "\n".join(lines)
 
@@ -182,9 +214,6 @@ class ContextBuilder:
             "# Acceptance Criteria",
             *[f"- {item}" for item in state.acceptance_criteria],
             "",
-            "# Plan",
-            *[f"- [{n['status']}] {n['id']}: {n['title']}" for n in state.nodes],
-            "",
             self._tool_use_reference_context(),
             "",
             *self._initializer_instruction_lines(state),
@@ -196,10 +225,7 @@ class ContextBuilder:
             *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in state.evidence_sources[-8:]],
             "",
             "# Acceptance Contracts",
-            *[
-                f"- {item.get('task_id')}: {item.get('status', 'proposed')} - {item.get('summary', '')}"
-                for item in state.acceptance_contracts[-3:]
-            ],
+            *[self._format_contract(item) for item in state.acceptance_contracts[-3:]],
             "",
             "# Active Verification Commands",
             *[
@@ -215,14 +241,16 @@ class ContextBuilder:
             "Do not preload the whole repository. Read only what is needed for the active task.",
             "Recommended discovery flow:",
             "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search relevant symbols or filenames;",
-            "3. read the smallest relevant source file ranges;",
+            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='hidden_acceptance' args={'path': '<candidate-or-dir>'};",
+            "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
             "4. read corresponding tests;",
             "5. use errors or verifier output to guide the next search.",
             "PowerShell/Python examples:",
             "- list_files target='agent'",
             "- search target='create_issue' args={'path': 'agent'}",
-            "- read target='agent/loop.py' args={'start': 1, 'end': 220}",
+            "- search target='hidden_acceptance' args={'path': 'state/benchmarks/issue_tracker/rejected_candidates/generated_tasks.json'}",
+            "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
+            "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
             "",
             "## Recent Step Trace",
             self._recent_step_trace_context(),
@@ -235,10 +263,10 @@ class ContextBuilder:
             "Return exactly one JSON object using this schema:",
             '{"thought_summary":"brief non-hidden reasoning","action":"<one action>","target":"<path|command|query|task|empty>","args":{},"expected_observation":"expected result","risk":"low|medium|high"}',
             "Callable actions:",
-            "- contract: define verifier agreement before coding; target='<task_id>'; args.task_id, args.summary, args.checks=[...].",
+            "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
-            "- read: bounded file or directory read; target='<path>'; args.start=1, args.end=200.",
-            "- search: literal text search; target='<pattern>'; args.path='.'.",
+            "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, hidden_acceptance, validation errors, functions, classes, or filenames.",
+            "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
             "- edit: exact text replacement; target='<path>'; args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false.",
             "- bash: run a needed command from repository root; target='<command>'; args.timeout=30.",
@@ -251,12 +279,131 @@ class ContextBuilder:
         ]
         return "\n".join(lines)
 
+    def _format_contract(self, contract: dict[str, object]) -> str:
+        requirements = contract.get("frozen_requirements", contract.get("required_evidence", []))
+        requirement_text = "; ".join(str(item) for item in requirements) if isinstance(requirements, list) else str(requirements)
+        procedure = contract.get("verification_procedure")
+        procedure_commands: list[str] = []
+        if isinstance(procedure, dict):
+            commands = procedure.get("commands")
+            if isinstance(commands, list):
+                procedure_commands = [str(command) for command in commands]
+            elif procedure.get("command"):
+                procedure_commands = [str(procedure.get("command"))]
+        if not procedure_commands and isinstance(contract.get("checks"), list):
+            procedure_commands = [str(command) for command in contract.get("checks", [])]
+        procedure_text = "; ".join(procedure_commands)
+        return (
+            f"- {contract.get('task_id')}: {contract.get('status', 'proposed')} - {contract.get('summary', '')} | "
+            f"frozen_requirements: {requirement_text or 'none'} | verification_procedure: {procedure_text or 'none'}"
+        )
+
     def _reference_context(self, state: TaskState) -> str:
+        reference = self._session_startup_context(state) if self._is_session_start(state) else self._incremental_reference_context(state)
         lines = [
-            self._startup_context(state),
+            reference,
             self._memory_context(),
         ]
         return "\n\n".join(section for section in lines if section.strip())
+
+    def _is_session_start(self, state: TaskState) -> bool:
+        return int(getattr(state, "session_used_tokens", 0) or 0) == 0
+
+    def _task_graph_overview(self, path: Path, state: TaskState | None = None) -> str:
+        rel_path = self._rel(path)
+        if not path.exists():
+            return f"Task graph: {rel_path}\nStatus: missing"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"Task graph: {rel_path}\nStatus: unreadable: {exc}"
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list):
+            return f"Task graph: {rel_path}\nStatus: no tasks list"
+
+        counts: dict[str, int] = {}
+        completed_ids: set[str] = set()
+        in_progress_ids: list[str] = []
+        pending_tasks: list[dict[str, object]] = []
+        explicit_blocked = 0
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            task_id = str(task.get("id", "")).strip()
+            status = str(task.get("status", "unknown")).strip() or "unknown"
+            counts[status] = counts.get(status, 0) + 1
+            if status in {"completed", "done"} and task_id:
+                completed_ids.add(task_id)
+            elif status == "in_progress" and task_id:
+                in_progress_ids.append(task_id)
+            elif status == "pending":
+                pending_tasks.append(task)
+            elif status == "blocked":
+                explicit_blocked += 1
+
+        ready_now: list[str] = []
+        ready_after_current: list[str] = []
+        blocked_pending = 0
+        in_progress_set = set(in_progress_ids)
+        for task in pending_tasks:
+            task_id = str(task.get("id", "")).strip()
+            depends_on = task.get("depends_on", [])
+            deps = [str(item).strip() for item in depends_on] if isinstance(depends_on, list) else []
+            if all(dep in completed_ids for dep in deps):
+                if task_id:
+                    ready_now.append(task_id)
+                continue
+            if all(dep in completed_ids or dep in in_progress_set for dep in deps):
+                if task_id:
+                    ready_after_current.append(task_id)
+                continue
+            blocked_pending += 1
+
+        current_task = self._active_task_id(state) if state else (in_progress_ids[0] if in_progress_ids else "none")
+        count_text = ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "empty"
+        return "\n".join(
+            [
+                f"Task graph: {rel_path}",
+                f"Total: {len(tasks)}",
+                f"Done: {len(completed_ids)}",
+                f"Current task: {current_task}",
+                f"In progress: {self._format_id_list(in_progress_ids)}",
+                f"Ready now: {self._format_id_list(ready_now)}",
+                f"Ready after current completion: {self._format_id_list(ready_after_current)}",
+                f"Blocked: {blocked_pending + explicit_blocked}",
+                f"Status counts: {count_text}",
+            ]
+        )
+
+    def _task_graph_summary(self, path: Path) -> str:
+        if not path.exists():
+            return "missing"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"unreadable: {exc}"
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list):
+            return "no tasks list"
+        counts: dict[str, int] = {}
+        current: list[str] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            status = str(task.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+            if status in {"in_progress", "pending"} and len(current) < 3:
+                current.append(str(task.get("id", "unknown")))
+        count_text = ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "empty"
+        current_text = ", ".join(current) if current else "none"
+        return f"{len(tasks)} task(s); {count_text}; next={current_text}"
+
+    def _format_id_list(self, items: list[str], limit: int = 12) -> str:
+        if not items:
+            return "none"
+        visible = items[:limit]
+        suffix = f", ... +{len(items) - limit}" if len(items) > limit else ""
+        return ", ".join(visible) + suffix
 
     def _just_in_time_context(self, state: TaskState) -> str:
         lines = [
@@ -264,14 +411,16 @@ class ContextBuilder:
             "Do not preload the whole repository. Read only what is needed for the active task.",
             "Recommended discovery flow:",
             "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search relevant symbols or filenames;",
-            "3. read the smallest relevant source file ranges;",
+            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='hidden_acceptance' args={'path': '<candidate-or-dir>'};",
+            "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
             "4. read corresponding tests;",
             "5. use errors or verifier output to guide the next search.",
             "PowerShell/Python examples:",
             "- list_files target='agent'",
             "- search target='create_issue' args={'path': 'agent'}",
-            "- read target='agent/loop.py' args={'start': 1, 'end': 220}",
+            "- search target='hidden_acceptance' args={'path': 'state/benchmarks/issue_tracker/rejected_candidates/generated_tasks.json'}",
+            "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
+            "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
             "",
             "## Evidence Sources Read So Far",
             *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in state.evidence_sources[-12:]],
@@ -368,7 +517,6 @@ class ContextBuilder:
                     f"- reason: {repair.get('reason', 'pending_repair')}",
                     f"- command: {str(repair.get('command', '')).replace(chr(10), ' ')[:1000] or 'none'}",
                     f"- summary: {str(repair.get('summary', ''))[:1000] or 'none'}",
-                    f"- failure_output: {str(repair.get('output', ''))[:2000] or 'none'}",
                     f"- diagnostic_targets: {repair.get('targets', [])}",
                     f"- repair_targets: {self._pending_repair_write_targets(state)}",
                     f"- required_reads: {repair.get('required_reads', [])}",
@@ -624,11 +772,12 @@ class ContextBuilder:
             f"- {self._rel(self.state_dir / 'project_spec.md')} must exist as the durable project specification.",
             f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list.",
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
-            "Each generated task should include: id, title, priority, depends_on, status, acceptance_criteria, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, and verification_commands.",
-            "Verification commands run from the repository root. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls.",
+            "Each generated task should include: id, title, priority, depends_on, status, acceptance_criteria, criterion_command_map, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, and verification_commands.",
+            "criterion_command_map must map every exact acceptance criterion string to one or more exact entries from verification_commands, and every verification command must be mapped.",
+            "Verification commands run from the repository root and must be direct, portable Python commands without Unix-only shell setup. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal complete task example:",
-            '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
+            '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"criterion_command_map":{"Behavior is verified.":["python -m unittest discover -s <workspace>/tests"]},"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
             "Implementation tasks must declare non-empty implementation_artifacts, and every owned implementation/test/acceptance artifact must also appear in expected_artifacts.",
             "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation). Verification commands must be substantive and must not be placeholders such as bare echo, TODO, or 'not implemented'.",
             "INIT does not require an acceptance contract.",
@@ -636,7 +785,7 @@ class ContextBuilder:
             "The repository-root init.sh belongs to the Long-Running Agent harness and must not be modified by a benchmark INIT.",
             "Any application artifact in the generated task graph must be under the workspace path required by project_spec.md.",
             "Do not use answer or finish during INIT.",
-            "After writing initializer artifacts, run the initializer verification command from the active task, then use verify. Only Verifier PASS completes INIT and allows Orchestrator to schedule the first Worker task.",
+            "After writing initializer artifacts, use verify. The verifier executes the INIT verification command itself; only Verifier PASS completes INIT and allows Orchestrator to schedule the first Worker task.",
         ]
 
     def _required_next_action(self, state: TaskState) -> str:
@@ -687,6 +836,12 @@ class ContextBuilder:
                 )
             if self._pending_repair_has_attempt(state):
                 command = str(state.pending_repair.get("command", ""))
+                if state.pending_repair.get("reason") == "failed_verification_command":
+                    return (
+                        "A repair was attempted for the failed verification procedure. "
+                        "Next action must be verify to rerun the agreed procedure. "
+                        "Do not list directories or continue editing until verification is rerun."
+                    )
                 return (
                     "A repair was attempted for the failed acceptance command. "
                     f"Next action must be bash target='{command}' to rerun the same acceptance command. "
@@ -694,6 +849,13 @@ class ContextBuilder:
                 )
             if not repair_targets:
                 command = str(state.pending_repair.get("command", ""))
+                if state.pending_repair.get("reason") == "failed_verification_command":
+                    return (
+                        "The verification procedure failed, but no mutable implementation target is available. "
+                        "Do not edit frozen acceptance artifacts or hidden acceptance. "
+                        "If the procedure path/cwd is wrong, update only verification_procedure with action='contract'; otherwise use verify only after the implementation/environment issue is addressed. "
+                        f"Failure excerpt: {excerpt}"
+                    )
                 return (
                     "The last acceptance or verification command failed, but no mutable repair target is available. "
                     "Do not attempt to edit a frozen or contract-owned test artifact. "

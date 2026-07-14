@@ -184,6 +184,36 @@ class HarnessBehaviorTests(unittest.TestCase):
         )
 
         self.assertFalse(any("placeholder/no-op" in error for error in errors))
+        self.assertTrue(any("not cross-platform" in error for error in errors))
+
+    def test_generated_task_validator_requires_complete_criterion_command_map(self) -> None:
+        first = "python -c \"assert 1 + 1 == 2\""
+        second = "python -c \"assert 'ok'.upper() == 'OK'\""
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Verify behavior",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Arithmetic works.", "Text works."],
+                        "criterion_command_map": {"Arithmetic works.": [first]},
+                        "expected_artifacts": [],
+                        "implementation_artifacts": [],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [first, second],
+                    }
+                ]
+            }
+        )
+
+        combined = " ".join(errors)
+        self.assertIn("missing acceptance criteria", combined)
+        self.assertIn("does not assign verification commands", combined)
 
     def test_generated_task_validator_requires_imported_module_artifact_path(self) -> None:
         errors = validate_generated_task_graph(
@@ -426,6 +456,11 @@ class HarnessBehaviorTests(unittest.TestCase):
                                 "priority": 1,
                                 "depends_on": [],
                                 "acceptance_criteria": ["Skeleton exists."],
+                                "criterion_command_map": {
+                                    "Skeleton exists.": [
+                                        "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/README.md').is_file()\""
+                                    ]
+                                },
                                 "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/README.md"],
                                 "implementation_artifacts": [
                                     "eval/benchmarks/todo_counter/workspace/README.md"
@@ -458,6 +493,9 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertEqual(state.task_id, "TC1")
             self.assertEqual(state.nodes[0]["id"], "TC1")
             self.assertEqual(state.nodes[0]["status"], "in_progress")
+            self.assertEqual(state.acceptance_contracts[-1]["status"], "agreed")
+            self.assertTrue(state.acceptance_contracts[-1]["frozen"])
+            self.assertEqual(state.acceptance_contracts[-1]["source"], "task_graph")
 
     def test_initializer_remains_active_until_init_script_exists(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -531,6 +569,11 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "depends_on": [],
                         "status": "pending",
                         "acceptance_criteria": ["Counter works."],
+                        "criterion_command_map": {
+                            "Counter works.": [
+                                "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+                            ]
+                        },
                         "expected_artifacts": [
                             "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
                         ],
@@ -837,6 +880,55 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("alpha.txt", result.data["content"])
 
+    def test_read_query_returns_matching_code_instead_of_file_head(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "module.py").write_text(
+                "\n".join(
+                    ["# header"] * 80
+                    + [
+                        "def target_function():",
+                        "    return 'found'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = ReadTool(root).run(
+                {"action": "read", "target": "module.py", "args": {"query": "target_function", "context": 1}}
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["match_line"], 81)
+        self.assertEqual(result.data["start"], 80)
+        self.assertIn("def target_function", result.data["content"])
+        self.assertNotIn("# header\n# header\n# header", result.data["content"])
+
+    def test_read_query_reports_next_read_when_truncated(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "module.py").write_text(
+                "\n".join(["def target_function():"] + [f"    value_{index} = {index}" for index in range(20)]),
+                encoding="utf-8",
+            )
+
+            first = ReadTool(root).run(
+                {"action": "read", "target": "module.py", "args": {"query": "target_function", "max_lines": 5}}
+            )
+            follow_up = ReadTool(root).run(
+                {"action": "read", "target": first.data["next_read"]["target"], "args": first.data["next_read"]["args"]}
+            )
+
+        self.assertTrue(first.ok)
+        self.assertTrue(first.data["has_more"])
+        self.assertIn("More lines exist after this window", first.summary)
+        self.assertIn("Continue with data.next_read.args only if", first.summary)
+        self.assertEqual(first.data["next_read"]["args"]["continue_from"], 6)
+        self.assertTrue(follow_up.ok)
+        self.assertEqual(follow_up.data["start"], 6)
+        self.assertIn("value_4", follow_up.data["content"])
+        self.assertNotIn("def target_function", follow_up.data["content"])
+
     def test_list_files_returns_structured_entries(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1096,6 +1188,121 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(len(state.acceptance_contracts), 1)
 
+    def test_managed_contract_allows_verification_procedure_update_only(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement generated task", max_steps=1)
+            criterion = "CLI counts open todos."
+            old_command = "python -m unittest tests.test_cli"
+            new_command = "python -m unittest discover -s tests"
+            state = create_initial_state("Implement generated task")
+            state.task_id = "T1"
+            state.acceptance_criteria = [criterion]
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Todo CLI",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "acceptance_criteria": [criterion],
+                    "criterion_command_map": {criterion: [old_command]},
+                    "expected_artifacts": ["workspace/todo_counter/cli.py"],
+                    "verification_commands": [old_command],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Todo CLI",
+                    "scope": ["workspace/todo_counter/cli.py"],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {"command": old_command},
+                    "checks": [old_command],
+                    "criterion_command_map": {criterion: [old_command]},
+                    "required_evidence": [criterion],
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = loop._execute_action(
+                {
+                    "action": "contract",
+                    "target": "T1",
+                    "args": {
+                        "task_id": "T1",
+                        "summary": "Frozen task-graph acceptance contract for T1: Todo CLI",
+                        "frozen_requirements": [criterion],
+                        "verification_procedure": {"command": new_command},
+                    },
+                },
+                state,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(state.acceptance_contracts[-1]["checks"], [new_command])
+        self.assertEqual(state.acceptance_contracts[-1]["frozen_requirements"], [criterion])
+        self.assertEqual(state.acceptance_contracts[-1]["criterion_command_map"], {criterion: [new_command]})
+
+    def test_managed_contract_rejects_frozen_requirement_change(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement generated task", max_steps=1)
+            criterion = "CLI counts open todos."
+            command = "python -m unittest discover -s tests"
+            state = create_initial_state("Implement generated task")
+            state.task_id = "T1"
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Todo CLI",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "acceptance_criteria": [criterion],
+                    "criterion_command_map": {criterion: [command]},
+                    "expected_artifacts": ["workspace/todo_counter/cli.py"],
+                    "verification_commands": [command],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Todo CLI",
+                    "scope": ["workspace/todo_counter/cli.py"],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {"command": command},
+                    "checks": [command],
+                    "criterion_command_map": {criterion: [command]},
+                    "required_evidence": [criterion],
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = loop._execute_action(
+                {
+                    "action": "contract",
+                    "target": "T1",
+                    "args": {
+                        "task_id": "T1",
+                        "frozen_requirements": ["CLI returns any JSON."],
+                        "verification_procedure": {"command": command},
+                    },
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("frozen_requirements", result.summary)
+
     def test_context_requires_write_after_empty_expected_code_read(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1295,6 +1502,35 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Next action must be write or edit", context)
         self.assertIn("workspace/issue_tracker/store.py", context)
 
+    def test_repair_details_omits_failure_output_body(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = create_initial_state("Implement store")
+            state.task_id = "IT2"
+            state.nodes = [
+                {
+                    "id": "IT2",
+                    "title": "Store",
+                    "status": "in_progress",
+                    "expected_artifacts": ["workspace/issue_tracker/store.py"],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -m unittest discover -s workspace/tests",
+                "summary": "Command exited with code 1.",
+                "output": "LONG_FAILURE_OUTPUT_MARKER",
+                "targets": ["workspace/issue_tracker/store.py"],
+            }
+
+            context = ContextBuilder(root).build(state)
+            repair_details = context.split("# Repair Details", 1)[1].split("# Just-in-Time Discovery", 1)[0]
+
+        self.assertNotIn("failure_output", repair_details)
+        self.assertNotIn("LONG_FAILURE_OUTPUT_MARKER", repair_details)
+        self.assertIn("- summary: Command exited with code 1.", repair_details)
+        self.assertIn("- repair_targets: ['workspace/issue_tracker/store.py']", repair_details)
+
     def test_context_handles_pending_repair_without_mutable_targets(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1439,6 +1675,131 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(data["tasks"][0]["status"], "completed")
         self.assertEqual(data["tasks"][1]["status"], "in_progress")
 
+    def test_finish_hidden_failure_schedules_repair_task(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implement CLI",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "completed",
+                                "acceptance_criteria": ["CLI works."],
+                                "criterion_command_map": {
+                                    "CLI works.": ["python -c \"assert True\""],
+                                },
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "worker_test_artifacts": [],
+                                "acceptance_artifacts": [],
+                                "frozen_acceptance_artifacts": [],
+                                "test_policy": {
+                                    "acceptance_tests_mutable_by_worker": False,
+                                    "acceptance_test_repair_requires_verifier_approval": True,
+                                },
+                                "verification_commands": ["python -c \"assert True\""],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_text(
+                "import sys\n"
+                "print('command failed: python -m issue_tracker.cli --data-file tmp.json list')\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark project",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Implement CLI", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result.ok)
+        self.assertIn("repair task R1 was scheduled", result.summary)
+        self.assertEqual(state.task_id, "R1")
+        self.assertEqual(state.nodes[0]["id"], "R1")
+        self.assertEqual(state.nodes[0]["status"], "in_progress")
+        repair = data["tasks"][-1]
+        self.assertEqual(repair["id"], "R1")
+        self.assertEqual(repair["status"], "in_progress")
+        self.assertEqual(repair["repair_source"], "hidden_acceptance")
+        self.assertEqual(
+            repair["expected_artifacts"],
+            ["eval/benchmarks/sample/workspace/issue_tracker/cli.py"],
+        )
+        self.assertIn("--data-file", " ".join(repair["acceptance_criteria"]))
+        self.assertEqual(state.acceptance_contracts[-1]["task_id"], "R1")
+        self.assertEqual(state.acceptance_contracts[-1]["status"], "agreed")
+
+    def test_generated_task_graph_rejects_unknown_contract_task_id(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T5",
+                                "title": "README",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "completed",
+                                "acceptance_criteria": ["README exists."],
+                                "expected_artifacts": ["README.md"],
+                                "verification_commands": ["python -c \"assert True\""],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(root=root, task="Benchmark project", max_steps=1, tasks_path=source_tasks)
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T5"
+            state.nodes = [{"id": "T5", "title": "README", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action(
+                {
+                    "action": "contract",
+                    "target": "T5-fix",
+                    "args": {
+                        "task_id": "T5-fix",
+                        "summary": "Ad-hoc repair",
+                        "checks": ["python -c \"assert True\""],
+                    },
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("task_id must refer to an active task graph node", result.summary)
+
     def test_verifier_rejects_weak_contract_without_behavior_check(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1461,7 +1822,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
 
         self.assertFalse(contract.ok)
-        self.assertFalse(contract.data["checks"]["behavior_level_checks"])
+        self.assertFalse(contract.data["checks"]["portable_executable_checks"])
 
     def test_skill_rejects_unverified_reflection(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1735,13 +2096,17 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertIn("# Critical Context", context)
         self.assertIn("# Working Context", context)
-        self.assertIn("# Startup Context", context)
+        self.assertIn("# Session Startup Context", context)
         self.assertIn("# Just-in-Time Discovery", context)
         self.assertIn("# Persistent Context", context)
         self.assertIn("# Tail Guard", context)
         self.assertIn("# Available Tools And Calling Format", context)
         self.assertIn('"action":"<one action>"', context)
         self.assertIn("- list_files: inspect a directory or file entry", context)
+        self.assertIn("- search: grep-style literal text search", context)
+        self.assertIn("Use this before read when locating T7, hidden_acceptance", context)
+        self.assertIn("search target='hidden_acceptance'", context)
+        self.assertIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
         self.assertIn("- write: create/overwrite/append file", context)
         self.assertIn("- verify: ask harness verifier", context)
         self.assertIn("# Hard Memory", context)
@@ -1750,9 +2115,99 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertNotIn("# Always-on Context", context)
         self.assertNotIn("## Non-Negotiable Rules", context)
         self.assertLess(context.index("# Critical Context"), context.index("# Working Context"))
-        self.assertLess(context.index("# Working Context"), context.index("# Startup Context"))
-        self.assertLess(context.index("# Startup Context"), context.index("# Tail Guard"))
+        self.assertLess(context.index("# Working Context"), context.index("# Session Startup Context"))
+        self.assertLess(context.index("# Session Startup Context"), context.index("# Tail Guard"))
         self.assertLessEqual(len(context.split("# Tail Guard", 1)[1]) + len("# Tail Guard"), 500)
+
+    def test_context_builder_uses_incremental_reference_after_session_start(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "project_spec.md").write_text(
+                "# Spec\nVERY_DETAILED_SPEC_BODY\n" + ("details\n" * 200),
+                encoding="utf-8",
+            )
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps({"tasks": [{"id": "T1", "status": "in_progress"}]}),
+                encoding="utf-8",
+            )
+            (state_dir / "runtime_tasks.json").write_text(
+                json.dumps({"tasks": [{"id": "T2", "status": "pending"}]}),
+                encoding="utf-8",
+            )
+            (state_dir / "handoff.md").write_text(
+                "# Worker Session Handoff\n\n## 15. Suggested Next Action\nRun verifier.\n",
+                encoding="utf-8",
+            )
+            (state_dir / "verifier_report.md").write_text("# Verifier\nVerifier passed.\n", encoding="utf-8")
+            state = create_initial_state("Implement a feature")
+            state.session_used_tokens = 120
+            state.last_verified_at = "2026-07-14T00:00:00+00:00"
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("# Incremental Reference Context", context)
+        self.assertNotIn("# Session Startup Context", context)
+        self.assertNotIn("VERY_DETAILED_SPEC_BODY", context)
+        self.assertIn("generated_tasks_summary: 1 task(s)", context)
+        self.assertIn("runtime_tasks_summary: 1 task(s)", context)
+        self.assertIn("Verifier passed.", context)
+        self.assertIn("Run verifier.", context)
+
+    def test_session_startup_context_summarizes_task_graph_without_full_json(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Completed marker SHOULD_NOT_APPEAR_IN_CONTEXT",
+                                "status": "completed",
+                                "depends_on": [],
+                            },
+                            {"id": "T2", "title": "Current", "status": "in_progress", "depends_on": ["T1"]},
+                            {"id": "T3", "title": "Next", "status": "pending", "depends_on": ["T2"]},
+                            {"id": "T4", "title": "Blocked", "status": "pending", "depends_on": ["T9"]},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = create_initial_state("Implement a feature")
+            state.task_id = "T2"
+            state.nodes = [{"id": "T2", "title": "Current", "status": "in_progress"}]
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("Task graph: state/generated_tasks.json", context)
+        self.assertIn("Total: 4", context)
+        self.assertIn("Done: 1", context)
+        self.assertIn("Current task: T2", context)
+        self.assertIn("In progress: T2", context)
+        self.assertIn("Ready after current completion: T3", context)
+        self.assertIn("Blocked: 1", context)
+        self.assertNotIn("SHOULD_NOT_APPEAR_IN_CONTEXT", context)
+
+    def test_working_context_omits_full_plan_list(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            state = create_initial_state("Implement a feature")
+            state.nodes = [
+                {"id": "T1", "title": "Current task", "status": "in_progress"},
+                {"id": "T2", "title": "FUTURE_PLAN_MARKER", "status": "pending"},
+            ]
+
+            context = ContextBuilder(root).build(state)
+            working = context.split("# Working Context", 1)[1].split("# Session Startup Context", 1)[0]
+
+        self.assertNotIn("# Plan", working)
+        self.assertNotIn("FUTURE_PLAN_MARKER", working)
 
     def test_working_context_includes_recent_read_content(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1837,7 +2292,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("[tool output truncated]", observation_section)
         self.assertLessEqual(len(observation_section), 8050)
 
-    def test_working_context_keeps_three_distinct_recent_tool_targets(self) -> None:
+    def test_working_context_keeps_five_distinct_recent_tool_targets(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             trace_dir = root / "state" / "traces"
@@ -1875,6 +2330,28 @@ class HarnessBehaviorTests(unittest.TestCase):
                         },
                     },
                 },
+                {
+                    "step": 4,
+                    "action": {"action": "list_files", "target": "src/pkg", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Listed package.",
+                        "data": {
+                            "entries": [
+                                {"path": "src/pkg/core.py", "type": "file"},
+                            ]
+                        },
+                    },
+                },
+                {
+                    "step": 5,
+                    "action": {"action": "read", "target": "README.md", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read README.",
+                        "data": {"start": 1, "end": 10, "content": "README_CONTENT"},
+                    },
+                },
             ]
             trace.write_text(
                 "".join(json.dumps(event) + "\n" for event in events),
@@ -1894,7 +2371,9 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertNotIn("OLD_APP_CONTENT", context)
         self.assertIn("TEST_CONTENT", context)
         self.assertIn("src/helpers.py", context)
-        self.assertEqual(context.count("## Observation "), 3)
+        self.assertIn("src/pkg/core.py", context)
+        self.assertIn("README_CONTENT", context)
+        self.assertEqual(context.count("## Observation "), 5)
 
     def test_context_builder_preserves_last_action_when_reference_context_is_large(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1962,7 +2441,7 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertNotIn("[context truncated by harness]", context)
         self.assertIn("# Critical Context", context)
-        self.assertIn("# Startup Context", context)
+        self.assertIn("# Session Startup Context", context)
 
     def test_context_builder_ignores_env_budget_without_truncating(self) -> None:
         previous = os.environ.get("LONG_AGENT_CONTEXT_MAX_CHARS")
@@ -2048,7 +2527,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Verifier passed", report)
         self.assertIn('"task_id": "current"', report)
 
-    def test_verifier_rejects_failed_or_unstructured_evidence(self) -> None:
+    def test_verifier_does_not_use_evidence_as_an_independent_gate(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state").mkdir()
@@ -2068,8 +2547,8 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             result = Verifier(root).run("default", state)
 
-        self.assertFalse(result.ok)
-        self.assertFalse(result.data["checks"]["has_evidence"])
+        self.assertTrue(result.ok)
+        self.assertNotIn("has_evidence", result.data["checks"])
 
     def test_benchmark_verifier_does_not_run_host_agent_tests(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2103,7 +2582,121 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertTrue(result.data["checks"]["unit_tests"])
-        self.assertIn("structured task evidence", result.data["test_output"])
+        self.assertIn("frozen requirement procedures run separately", result.data["test_output"])
+
+    def test_verifier_executes_frozen_commands_and_generates_evidence(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            (workspace / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            criterion = "Feature value is verified."
+            command = (
+                "python -c \"import pathlib; ns={}; "
+                "exec(pathlib.Path('eval/benchmarks/sample/workspace/feature.py').read_text(), ns); "
+                "assert ns['VALUE'] == 2\""
+            )
+            state = create_initial_state("Benchmark feature")
+            state.task_id = "T1"
+            state.acceptance_criteria = [criterion]
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Feature",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "acceptance_criteria": [criterion],
+                    "criterion_command_map": {criterion: [command]},
+                    "expected_artifacts": ["eval/benchmarks/sample/workspace/feature.py"],
+                    "verification_commands": [command],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Feature",
+                    "scope": ["eval/benchmarks/sample/workspace/feature.py"],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {"command": command},
+                    "checks": [command],
+                    "criterion_command_map": {criterion: [command]},
+                    "required_evidence": [criterion],
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["checks"]["contract_frozen"])
+        self.assertTrue(result.data["checks"]["verification_commands"])
+        self.assertEqual(result.data["verification"]["commands"][0]["returncode"], 0)
+        self.assertTrue(
+            any(item.get("evidence_type") == "verification_command_passed" for item in state.evidence_sources)
+        )
+        self.assertNotIn("has_evidence", result.data["checks"])
+
+    def test_verifier_freezes_requirements_but_uses_updated_procedure(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            (workspace / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            criterion = "Feature value is verified."
+            wrong_command = "python -m unittest tests.test_feature"
+            corrected_command = (
+                "python -c \"import pathlib; ns={}; "
+                "exec(pathlib.Path('feature.py').read_text(), ns); "
+                "assert ns['VALUE'] == 2\""
+            )
+            state = create_initial_state("Benchmark feature")
+            state.task_id = "T1"
+            state.acceptance_criteria = [criterion]
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Feature",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "acceptance_criteria": [criterion],
+                    "criterion_command_map": {criterion: [wrong_command]},
+                    "expected_artifacts": ["eval/benchmarks/sample/workspace/feature.py"],
+                    "verification_commands": [wrong_command],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Feature",
+                    "scope": ["eval/benchmarks/sample/workspace/feature.py"],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {
+                        "command": corrected_command,
+                        "working_directory": "eval/benchmarks/sample/workspace",
+                    },
+                    "checks": [corrected_command],
+                    "criterion_command_map": {criterion: [corrected_command]},
+                    "required_evidence": [criterion],
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["contract_validation"]["requirements_match_task_graph"])
+        self.assertNotIn(wrong_command, result.data["verification"]["commands"][0]["command"])
+        self.assertEqual(result.data["verification"]["commands"][0]["working_directory"], "eval/benchmarks/sample/workspace")
 
     def test_successful_contract_command_records_structured_task_evidence(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
