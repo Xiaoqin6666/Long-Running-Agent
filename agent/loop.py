@@ -308,7 +308,6 @@ class AgentLoop:
                 "worker_test_artifacts": task.get("worker_test_artifacts", []),
                 "acceptance_artifacts": task.get("acceptance_artifacts", []),
                 "frozen_acceptance_artifacts": task.get("frozen_acceptance_artifacts", []),
-                "hidden_acceptance": task.get("hidden_acceptance", []),
                 "test_policy": task.get("test_policy", {}),
                 "verification_commands": task.get("verification_commands", []),
                 "criterion_command_map": task.get("criterion_command_map", {}),
@@ -358,7 +357,6 @@ class AgentLoop:
             "forbidden_shortcuts": [
                 "Do not weaken frozen requirements after task activation.",
                 "Verification procedure may be corrected only to prove the same frozen requirements.",
-                "Do not inspect or invoke hidden acceptance from public verification commands.",
             ],
             "source": "task_graph",
             "frozen": True,
@@ -403,9 +401,6 @@ class AgentLoop:
             )
         if name == "dismiss_skill":
             return self._handle_dismiss_skill_action(action, state)
-        initializer_inspection = self._handle_initializer_private_inspection(action, state)
-        if initializer_inspection is not None:
-            return initializer_inspection
         if name == "answer":
             if self._is_initializer_task(state):
                 outputs = self._validate_initializer_outputs()
@@ -514,18 +509,6 @@ class AgentLoop:
             termination = self.terminator.evaluate()
             if termination.status == "completed":
                 return ToolResult(True, "Project completed.", termination.to_dict())
-            if "hidden_acceptance_not_passing" in termination.reasons:
-                repair_task = self._ensure_final_repair_task(state, termination.to_dict())
-                if repair_task:
-                    self._apply_orchestrator_selection(state)
-                    data = termination.to_dict()
-                    data["repair_task"] = repair_task
-                    data["required_action"] = "repair_task"
-                    return ToolResult(
-                        False,
-                        f"Finish rejected: final acceptance failed; repair task {repair_task.get('id')} was scheduled.",
-                        data,
-                    )
             return ToolResult(False, f"Finish rejected: {termination.status}.", termination.to_dict())
         tool = self.tools.get(str(name))
         if not tool:
@@ -536,48 +519,6 @@ class AgentLoop:
             if post_write_check is not None:
                 return post_write_check
         return result
-
-    def _handle_initializer_private_inspection(
-        self,
-        action: dict[str, Any],
-        state: TaskState,
-    ) -> ToolResult | None:
-        if not self._is_initializer_task(state):
-            return None
-        name = str(action.get("action", ""))
-        if name == "git":
-            return ToolResult(
-                False,
-                "INIT git inspection rejected: initialization does not require repository-history access.",
-                {"initializer_restricted": True, "private_acceptance_protected": True, "counts_as_progress": False},
-            )
-        if name not in {"search", "read", "list_files"}:
-            return None
-
-        private_fragment = "hidden_acceptance"
-        target = str(action.get("target", ""))
-        args = action.get("args", {})
-        args_text = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-        if private_fragment in f"{target}\n{args_text}".lower():
-            return ToolResult(
-                False,
-                "INIT inspection rejected: hidden_acceptance is private verifier input and cannot be searched, read, or listed.",
-                {
-                    "initializer_restricted": True,
-                    "private_acceptance_protected": True,
-                    "forbidden_target": private_fragment,
-                    "counts_as_progress": False,
-                },
-            )
-
-        tool = self.tools.get(name)
-        if name == "search" and isinstance(tool, SearchTool):
-            return tool.run(action, excluded_path_fragments=(private_fragment,))
-        if name == "read" and isinstance(tool, ReadTool):
-            return tool.run(action, excluded_path_fragments=(private_fragment,))
-        if name == "list_files" and isinstance(tool, ListFilesTool):
-            return tool.run(action, excluded_path_fragments=(private_fragment,))
-        return None
 
     def _pending_repair_command_failure_type(self, state: TaskState) -> str | None:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -1082,76 +1023,8 @@ class AgentLoop:
                 return task
         return {}
 
-    def _ensure_final_repair_task(self, state: TaskState, termination: dict[str, Any]) -> dict[str, Any] | None:
-        checks = termination.get("checks", {}) if isinstance(termination, dict) else {}
-        if not isinstance(checks, dict) or not checks.get("tasks", {}).get("ok"):
-            return None
-        hidden = checks.get("hidden_acceptance", {})
-        hints = hidden.get("repair_hints", {}) if isinstance(hidden, dict) else {}
-        artifacts = self._final_repair_artifacts(hints)
-        if not artifacts:
-            return None
-        flags = [str(item) for item in hints.get("flags", [])] if isinstance(hints, dict) else []
-        modules = [str(item) for item in hints.get("modules", [])] if isinstance(hints, dict) else []
-        criteria = [
-            "Final project acceptance failure is repaired in the inferred implementation artifact.",
-            "Public regression tests continue to pass after the repair.",
-        ]
-        if flags:
-            criteria.insert(0, f"Implementation supports final verifier option(s): {', '.join(flags[:3])}.")
-        command = self._benchmark_unittest_command()
-        if not command:
-            command = "python -m unittest discover -s tests"
-        title_suffix = f" in {modules[0]}" if modules else ""
-        return self.orchestrator.ensure_repair_task(
-            source="hidden_acceptance",
-            title=f"Repair final acceptance failure{title_suffix}",
-            acceptance_criteria=criteria,
-            expected_artifacts=artifacts,
-            verification_commands=[command],
-            evidence="Final hidden acceptance failed; harness scheduled a focused repair task.",
-            metadata={
-                "kind": "hidden_acceptance",
-                "summary": hidden.get("summary") if isinstance(hidden, dict) else "Hidden acceptance failed.",
-                "hints": hints if isinstance(hints, dict) else {},
-                "previous_task_id": state.task_id,
-            },
-        )
-
-    def _final_repair_artifacts(self, hints: object) -> list[str]:
-        artifacts: list[str] = []
-        if isinstance(hints, dict) and isinstance(hints.get("artifacts"), list):
-            artifacts.extend(str(item) for item in hints["artifacts"] if str(item).strip())
-        existing = {self._normalize_target(item) for item in self._all_task_implementation_artifacts()}
-        artifacts = [item for item in artifacts if not existing or self._normalize_target(item) in existing]
-        if artifacts:
-            return list(dict.fromkeys(artifacts))
-        return [
-            item
-            for item in self._all_task_implementation_artifacts()
-            if item.endswith(".py") and "/tests/" not in item.replace("\\", "/")
-        ]
-
-    def _all_task_implementation_artifacts(self) -> list[str]:
-        artifacts: list[str] = []
-        for task in self.orchestrator.load_tasks():
-            for item in self._format_artifacts(task.get("implementation_artifacts", [])):
-                artifacts.append(item)
-        return list(dict.fromkeys(artifacts))
-
     def _task_graph_task_ids(self) -> set[str]:
         return {str(task.get("id")) for task in self.orchestrator.load_tasks() if str(task.get("id", "")).strip()}
-
-    def _benchmark_unittest_command(self) -> str:
-        workspace = self._expected_initializer_workspace_root()
-        if not workspace:
-            return ""
-        tests = f"{workspace}/tests"
-        return (
-            "python -c \"import os, sys, subprocess; "
-            f"os.environ['PYTHONPATH']={workspace!r}; "
-            f"sys.exit(subprocess.call([sys.executable, '-m', 'unittest', 'discover', '-s', {tests!r}]))\""
-        )
 
     def _update_state(self, state: TaskState, action: dict[str, Any], observation: ToolResult) -> None:
         state.iterations += 1

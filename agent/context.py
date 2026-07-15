@@ -270,7 +270,7 @@ class ContextBuilder:
             "Callable actions:",
             "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
-            "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames. hidden_acceptance is private verifier input and must never be inspected.",
+            "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
             "- edit: exact text replacement; target='<path>'; args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false.",
@@ -904,7 +904,7 @@ class ContextBuilder:
                 if state.pending_repair.get("reason") == "failed_verification_command":
                     return (
                         "The verification procedure failed, but no mutable implementation target is available. "
-                        "Do not edit frozen acceptance artifacts or hidden acceptance. "
+                        "Do not edit frozen acceptance artifacts. "
                         "If the procedure path/cwd is wrong, update only verification_procedure with action='contract'; otherwise use verify only after the implementation/environment issue is addressed. "
                         f"Failure excerpt: {excerpt}"
                     )

@@ -11,7 +11,7 @@ class ReadTool(WorkspaceTool):
     DEFAULT_MATCH_LINES = 120
     MAX_LINES = 400
 
-    def run(self, action: dict[str, Any], *, excluded_path_fragments: tuple[str, ...] = ()):
+    def run(self, action: dict[str, Any]):
         from agent.tools import ToolResult
 
         target = str(action.get("target", ""))
@@ -23,9 +23,6 @@ class ReadTool(WorkspaceTool):
                 end = max(int(args.get("end", start + self.DEFAULT_RANGE_LINES - 1)), start)
                 entries = []
                 for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
-                    normalized = str(child.relative_to(self.root)).replace("\\", "/").lower()
-                    if any(fragment.lower() in normalized for fragment in excluded_path_fragments):
-                        continue
                     kind = "dir" if child.is_dir() else "file"
                     entries.append(f"{kind}\t{child.name}")
                 selected = entries[start - 1 : end]

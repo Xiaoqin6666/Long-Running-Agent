@@ -4,7 +4,6 @@ import json
 import os
 import py_compile
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -50,11 +49,6 @@ class Verifier:
         checks.append(("python_compile", compile_ok))
         tests_ok, tests_output = self._run_tests()
         checks.append(("unit_tests", tests_ok))
-        hidden_result: dict[str, Any] | None = None
-        if self._requires_hidden_acceptance(state):
-            hidden_result = self._run_benchmark_hidden_acceptance()
-            checks.append(("hidden_acceptance", hidden_result["ok"]))
-
         ok = all(value for _, value in checks)
         data = {"checks": dict(checks), "task_id": state.task_id}
         if contract_validation is not None:
@@ -65,8 +59,6 @@ class Verifier:
             data["compile_error"] = compile_error
         if tests_output:
             data["test_output"] = tests_output
-        if hidden_result is not None:
-            data["hidden_acceptance"] = hidden_result
         summary = "Verifier passed." if ok else "Verifier failed."
         result = ToolResult(ok, summary, data)
         self._write_report(result)
@@ -214,9 +206,6 @@ class Verifier:
             if marker not in evidence:
                 evidence.append(marker)
 
-    def _requires_hidden_acceptance(self, state: TaskState) -> bool:
-        return any("hidden acceptance" in str(item).lower() for item in state.acceptance_criteria)
-
     def _benchmark_id(self) -> str | None:
         benchmark_root = (self.root / "state" / "benchmarks").resolve()
         try:
@@ -229,41 +218,6 @@ class Verifier:
         if not benchmark_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in benchmark_id):
             return None
         return benchmark_id
-
-    def _run_benchmark_hidden_acceptance(self) -> dict[str, Any]:
-        benchmark_id = self._benchmark_id()
-        script = self.root / "eval" / "benchmarks" / str(benchmark_id) / "hidden_acceptance.py"
-        if not benchmark_id or not script.is_file():
-            return {
-                "ok": False,
-                "configured": False,
-                "returncode": None,
-                "summary": "Benchmark hidden acceptance is not configured.",
-            }
-        try:
-            completed = subprocess.run(
-                [sys.executable, str(script)],
-                cwd=self.root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
-            )
-        except Exception:
-            return {
-                "ok": False,
-                "configured": True,
-                "returncode": None,
-                "summary": "Benchmark hidden acceptance could not be executed.",
-            }
-        ok = completed.returncode == 0
-        return {
-            "ok": ok,
-            "configured": True,
-            "returncode": completed.returncode,
-            "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
-        }
 
     def validate_contract(
         self,
@@ -295,12 +249,6 @@ class Verifier:
                 "portable_executable_checks",
                 bool(commands)
                 and all(verification_command_portability_error(str(command)) is None for command in commands),
-            )
-        )
-        checks.append(
-            (
-                "hidden_acceptance_is_private",
-                all("hidden_acceptance" not in str(command).lower() for command in commands),
             )
         )
         if task is None:

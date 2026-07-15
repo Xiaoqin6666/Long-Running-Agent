@@ -1,4 +1,0 @@
-{
-  "command": ["python", "eval/hidden_acceptance.py"],
-  "timeout": 180
-}

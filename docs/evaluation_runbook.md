@@ -52,13 +52,13 @@ The handoff threshold is an artificial experiment control: `session_budget_token
 
 ## Local Checks
 
-Run the task-specific hidden acceptance:
+After the autonomous run has ended, optionally run the task-specific manual evaluator:
 
 ```powershell
-python eval\benchmarks\issue_tracker\hidden_acceptance.py
+python eval\manual_evaluators\issue_tracker\evaluate.py
 ```
 
-During autonomous benchmark execution, the harness selects this script from the active `benchmark_id`. The Worker cannot read or modify it, and verifier/trace state records only a redacted pass/fail summary rather than hidden output.
+The Harness never invokes this script during project execution. It does not gate `verify` or `finish`, and its result cannot create repair tasks. Keep its output outside Worker state and traces.
 
 Run trace metrics after each session:
 
@@ -80,7 +80,7 @@ python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl 
 - Skills: `state/benchmarks/issue_tracker/skills/`
 - Raw traces: `state/benchmarks/issue_tracker/traces/run_*.jsonl`
 - Metrics JSON: terminal output from `python eval\metrics.py ...`
-- Task-specific hidden acceptance output: terminal JSON from `python eval\benchmarks\issue_tracker\hidden_acceptance.py`
+- Optional manual evaluator output: terminal JSON from `python eval\manual_evaluators\issue_tracker\evaluate.py`
 
 Each benchmark now owns its own directory under `eval/benchmarks/<benchmark_name>/`. Keep benchmark definitions and generated application output together:
 
@@ -88,8 +88,10 @@ Each benchmark now owns its own directory under `eval/benchmarks/<benchmark_name
 eval/benchmarks/<benchmark_name>/
   project_spec.md or task.md
   tasks.json               # only for preplanned benchmarks
-  hidden_acceptance.py     # optional benchmark-local final check
   workspace/               # generated app output, ignored by Git
+
+eval/manual_evaluators/<benchmark_name>/
+  evaluate.py              # experimenter-only evaluator, run after Agent completion
 ```
 
 `eval/benchmarks/*/workspace/` and `state/benchmarks/*/traces/` are generated run artifacts and are ignored by Git. This keeps Issue Tracker and Todo Counter from seeing each other's files during list/read/search actions.

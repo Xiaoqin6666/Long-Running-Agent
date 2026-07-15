@@ -107,9 +107,4 @@ The project is complete only when all of the following are true:
 - `parse_todos` and `summarize_todos` satisfy the API behavior above.
 - The CLI produces valid JSON summaries.
 - Public tests pass with `python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests`.
-- A final hidden acceptance check passes.
 - Agent trace, state, and verifier evidence are written under `state/`.
-
-## Hidden Acceptance
-
-The evaluation includes a benchmark-local hidden acceptance script at `eval/benchmarks/todo_counter/hidden_acceptance.py`. The Worker should not inspect or modify this file. Hidden checks may test edge cases such as empty input, whitespace-only input, ignored non-todo lines, CLI JSON validity, and missing-file behavior.

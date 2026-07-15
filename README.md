@@ -44,11 +44,13 @@ Run behavior tests:
 python -m unittest discover -s tests
 ```
 
-Run hidden acceptance:
+Run the optional manual evaluator after the autonomous run has ended:
 
 ```powershell
-python eval\benchmarks\issue_tracker\hidden_acceptance.py
+python eval\manual_evaluators\issue_tracker\evaluate.py
 ```
+
+The Agent Harness never invokes this script. Its result does not gate `finish` and cannot create repair tasks.
 
 The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.
 

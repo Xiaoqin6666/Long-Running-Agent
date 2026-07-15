@@ -314,8 +314,6 @@ def validate_generated_task_graph(
                 if not path:
                     errors.append(f"{label}.{field} contains an empty artifact path.")
                     continue
-                if "hidden_acceptance" in path.lower():
-                    errors.append(f"{label}.{field} must not expose hidden acceptance artifacts: {path}.")
                 if normalized_workspace and not _is_under_path(path, normalized_workspace):
                     errors.append(
                         f"{label}.{field} artifact '{path}' must be under '{normalized_workspace}/'."
@@ -350,8 +348,6 @@ def validate_generated_task_graph(
         if isinstance(commands, list):
             for command in commands:
                 command_text = str(command).replace("\\", "/")
-                if "hidden_acceptance" in command_text.lower():
-                    errors.append(f"{label}.verification_commands must not invoke hidden acceptance tests.")
                 if normalized_workspace and "workspace" in command_text.lower() and normalized_workspace not in command_text:
                     errors.append(
                         f"{label}.verification_commands references a workspace outside '{normalized_workspace}/'."
@@ -531,8 +527,6 @@ def verification_command_portability_error(command: str) -> str | None:
     marker = next((item for item in unix_markers if item in f" {lower} "), None)
     if marker:
         return f"contains Unix-specific construct {marker.strip()!r}"
-    if "hidden_acceptance" in lower:
-        return "must not invoke hidden acceptance"
     return None
 
 

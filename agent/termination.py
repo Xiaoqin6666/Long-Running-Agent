@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,7 +50,6 @@ class ProjectTerminator:
         checks = {
             "tasks": evaluate_task_graph(tasks),
             "regression": self._run_regression(),
-            "hidden_acceptance": self._run_hidden_acceptance(),
             "git_clean": self._git_clean(),
             "budget": evaluate_budget(signals),
             "failure_limits": evaluate_failure_limits(signals),
@@ -75,56 +72,12 @@ class ProjectTerminator:
             return {
                 "ok": True,
                 "skipped": True,
-                "summary": "Host Agent regression is outside benchmark scope; task verification and benchmark hidden acceptance provide benchmark evidence.",
+                "summary": "Host Agent regression is outside benchmark scope; task verification provides benchmark evidence.",
             }
         compile_result = run_command(["python", "-m", "compileall", "agent", "eval", "tests"], self.root)
         test_result = run_command(["python", "-m", "unittest", "discover", "-s", "tests"], self.root)
         ok = compile_result["ok"] and test_result["ok"]
         return {"ok": ok, "compile": compile_result, "tests": test_result}
-
-    def _run_hidden_acceptance(self) -> dict[str, Any]:
-        if self.benchmark_id:
-            script = self.root / "eval" / "benchmarks" / self.benchmark_id / "hidden_acceptance.py"
-            if not script.is_file():
-                return {
-                    "ok": False,
-                    "configured": False,
-                    "returncode": None,
-                    "summary": "Benchmark hidden acceptance is not configured.",
-                }
-            result = run_command([sys.executable, str(script)], self.root, timeout=180)
-            ok = bool(result.get("ok"))
-            hidden_result = {
-                "ok": ok,
-                "configured": True,
-                "returncode": result.get("returncode"),
-                "summary": "Benchmark hidden acceptance passed." if ok else "Benchmark hidden acceptance failed.",
-            }
-            if not ok:
-                hidden_result["repair_hints"] = infer_benchmark_repair_hints(
-                    str(result.get("output", "")),
-                    self.benchmark_id,
-                )
-            return hidden_result
-        config_path = self.root / "eval" / "hidden_acceptance.json"
-        if not config_path.exists():
-            return {
-                "ok": False,
-                "configured": False,
-                "summary": "Hidden acceptance is not configured; project cannot claim successful completion.",
-            }
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        command = data.get("command", [])
-        if not isinstance(command, list) or not command:
-            return {"ok": False, "configured": True, "summary": "Hidden acceptance command is empty."}
-        result = run_command([str(item) for item in command], self.root, timeout=int(data.get("timeout", 120)))
-        ok = bool(result.get("ok"))
-        return {
-            "ok": ok,
-            "configured": True,
-            "returncode": result.get("returncode"),
-            "summary": "Hidden acceptance passed." if ok else "Hidden acceptance failed.",
-        }
 
     def _git_clean(self) -> dict[str, Any]:
         if self.benchmark_id:
@@ -228,7 +181,6 @@ def decide_termination(checks: dict[str, Any]) -> TerminationResult:
     success_checks = [
         checks["tasks"]["ok"],
         checks["regression"]["ok"],
-        checks["hidden_acceptance"]["ok"],
         checks["git_clean"]["ok"],
     ]
     if all(success_checks):
@@ -239,8 +191,6 @@ def decide_termination(checks: dict[str, Any]) -> TerminationResult:
         reasons.append("required_tasks_not_completed")
     if not checks["regression"]["ok"]:
         reasons.append("regression_not_passing")
-    if not checks["hidden_acceptance"]["ok"]:
-        reasons.append("hidden_acceptance_not_passing")
     if not checks["git_clean"]["ok"]:
         reasons.append("worktree_not_clean")
     return TerminationResult("continue_running", "Project is not ready to terminate.", reasons, checks)
@@ -270,33 +220,3 @@ def run_command(command: list[str], cwd: Path, timeout: int = 120) -> dict[str, 
         "output": output[-8000:],
         "returncode": completed.returncode,
     }
-
-
-def infer_benchmark_repair_hints(output: str, benchmark_id: str | None) -> dict[str, Any]:
-    """Return non-secret repair routing hints derived from hidden verifier output."""
-    hints: dict[str, Any] = {"artifacts": [], "modules": [], "flags": []}
-    if not benchmark_id:
-        return hints
-
-    modules: list[str] = []
-    for match in re.finditer(r"\b-m\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)", output):
-        modules.append(match.group(1))
-    for match in re.finditer(r"\bfrom\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s+import\b", output):
-        modules.append(match.group(1))
-    for match in re.finditer(r"\bimport\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)", output):
-        modules.append(match.group(1))
-
-    artifacts: list[str] = []
-    for module in dict.fromkeys(modules):
-        parts = module.split(".")
-        if len(parts) == 1:
-            continue
-        artifact = f"eval/benchmarks/{benchmark_id}/workspace/" + "/".join(parts) + ".py"
-        artifacts.append(artifact)
-
-    for match in re.finditer(r"(?<!\w)--[A-Za-z][A-Za-z0-9-]*", output):
-        hints["flags"].append(match.group(0))
-    hints["flags"] = list(dict.fromkeys(hints["flags"]))[:8]
-    hints["modules"] = list(dict.fromkeys(modules))[:8]
-    hints["artifacts"] = list(dict.fromkeys(artifacts))[:8]
-    return hints

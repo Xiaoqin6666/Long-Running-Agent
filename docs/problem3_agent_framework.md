@@ -453,10 +453,10 @@ Successful termination requires all of the following:
 - all required tasks are `completed` or legacy `done`;
 - no required task is still `blocked`;
 - full regression checks pass;
-- hidden acceptance checks pass;
+- configured public verification procedures pass;
 - for non-benchmark Agent-project runs, the Git worktree is clean and runnable.
 
-Benchmark runs are isolated from the host Agent repository. Their Git tool is read-only, host `git status` is not a completion criterion, and host Agent regression tests are outside benchmark scope. Benchmark completion is based on its runtime/generated task graph, structured task-verification evidence, and benchmark-local hidden acceptance. A benchmark Worker must never use `git add` or `git commit` to clean or finalize the host repository.
+Benchmark runs are isolated from the host Agent repository. Their Git tool is read-only, host `git status` is not a completion criterion, and host Agent regression tests are outside benchmark scope. Benchmark completion is based on its runtime/generated task graph and structured public task-verification evidence. A benchmark Worker must never use `git add` or `git commit` to clean or finalize the host repository.
 
 Failure termination is explicit and must not be reported as success. Examples:
 
@@ -470,7 +470,7 @@ Human intervention is allowed but must be explicit. The system should return `re
 
 The `finish` action runs this project-level termination policy. It is rejected unless the result is `completed`.
 
-For benchmark runs, hidden acceptance is selected from `eval/benchmarks/<benchmark_id>/hidden_acceptance.py` and is executed by the harness during a task whose acceptance criteria require hidden acceptance, then again by the project Terminator. Hidden stdout/stderr is never added to Worker context, trace evidence, or verifier reports; only configured status, return code, and a generic pass/fail summary are exposed. Non-benchmark framework runs continue to use `eval/hidden_acceptance.json`.
+Optional evaluator scripts live outside benchmark task directories under `eval/manual_evaluators/`. The experimenter runs them only after the autonomous project run. The Agent Harness never invokes them during Worker verification or project termination, and their results never create tasks or enter Worker context, trace evidence, or verifier reports.
 
 ## 9. Skill Mechanism
 
@@ -574,7 +574,7 @@ Tests are not a single permission class. The task graph should separate:
 - `worker_test_artifacts`: tests the Worker may create or edit before contract freeze.
 - `acceptance_artifacts`: tests or scripts used as agreed contract evidence.
 - `frozen_acceptance_artifacts`: acceptance evidence that the Worker may read but not modify.
-- `hidden_acceptance`: final evaluator checks unavailable to the Worker.
+- optional manual evaluator results, recorded by the experimenter outside the autonomous Agent run.
 
 Once a test becomes frozen acceptance evidence, failed verification should drive repairs toward implementation artifacts. Test repair is still possible, but it must be explicit: the harness or verifier records `allow_test_repair=true` or a list of allowed test paths in pending repair state, with a reason that the test baseline itself is faulty.
 

@@ -7,7 +7,8 @@ import tempfile
 from pathlib import Path
 
 
-BENCHMARK = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[3]
+BENCHMARK = ROOT / "eval" / "benchmarks" / "todo_counter"
 APP = BENCHMARK / "workspace"
 
 

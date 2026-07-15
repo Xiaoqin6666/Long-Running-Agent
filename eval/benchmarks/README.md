@@ -1,17 +1,15 @@
 # Benchmarks
 
-Each benchmark owns its input files, optional hidden acceptance script, and generated workspace.
+Each benchmark task directory owns only Agent-visible input files and its generated workspace. Optional experimenter-only evaluators live separately under `eval/manual_evaluators/` and are run manually after the autonomous project has ended.
 
 ```text
 eval/benchmarks/
   issue_tracker/
     task.md
     tasks.json
-    hidden_acceptance.py
     workspace/
   todo_counter/
     project_spec.md
-    hidden_acceptance.py
     workspace/
 ```
 
@@ -39,10 +37,10 @@ Resume if needed:
 python -m agent.main --benchmark skill_mechanism --task-file eval\benchmarks\skill_mechanism\task.md --tasks-json eval\benchmarks\skill_mechanism\tasks.json --provider openai-compatible --max-steps 16 --resume
 ```
 
-Run its final evaluator with:
+After the autonomous run, optionally run its manual evaluator with:
 
 ```powershell
-python eval\benchmarks\skill_mechanism\hidden_acceptance.py
+python eval\manual_evaluators\skill_mechanism\evaluate.py
 ```
 
 Do not use `--resume` when switching between benchmarks. Resume only within the same benchmark run.

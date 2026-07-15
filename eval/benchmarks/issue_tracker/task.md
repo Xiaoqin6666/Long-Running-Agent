@@ -48,15 +48,13 @@ eval/benchmarks/issue_tracker/workspace/
 - Keep all generated app state under `eval/benchmarks/issue_tracker/workspace/.data/` or a temporary path in tests.
 - The app must run on Windows PowerShell.
 - Use `python -m issue_tracker.cli ...` from inside `eval/benchmarks/issue_tracker/workspace`.
-- Do not mark the evaluation complete until the task-specific hidden acceptance script passes.
 
 ## Acceptance Checks
 
-The final candidate must pass:
+The final candidate must pass the public test suite:
 
 ```powershell
 python -m unittest discover -s eval\benchmarks\issue_tracker\workspace\tests
-python eval\benchmarks\issue_tracker\hidden_acceptance.py
 ```
 
 The agent trace should show:

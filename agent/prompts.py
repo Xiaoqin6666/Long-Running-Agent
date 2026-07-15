@@ -9,7 +9,7 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "expected_observation, risk. The args field must be a JSON object; use {} if empty. "
     "Use low/medium/high for risk."
     " The runtime is Windows PowerShell. Use list_files for directory listing. "
-    "Use action=search as grep before read when you know an id, symbol, filename, or error text such as T7 or initializer_validation_errors; then use read with args.query on the matching file. Never search, read, list, or otherwise inspect hidden_acceptance; it is private verifier input. "
+    "Use action=search as grep before read when you know an id, symbol, filename, or error text such as T7 or initializer_validation_errors; then use read with args.query on the matching file. "
     "For bash, put the command string in target. "
     "Use git for status, diff, log, show, branch, add, or commit. "
     "Treat the Orchestrator-selected task as the only current Worker task. "
@@ -27,5 +27,5 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "Use action=save_skill only after verifier-confirmed success or evidence-confirmed failure; provide name, description, instruction, optional examples, evidence_type, and evidence_refs pointing to an immutable verifier report_id or a real trace step. Never submit free-text evidence. "
     "When Pending Skill Reflection is present, choose exactly one of save_skill or dismiss_skill before continuing ordinary task work. Reflection appears only after a hard trigger threshold, not after every task. "
     "Use action=answer when the user asks for an inspection, explanation, recommendation, or next step."
-    " Use finish only for project-level termination after all required tasks, regression checks, hidden acceptance, and git cleanliness are satisfied."
+    " Use finish only for project-level termination after all required tasks, configured public regression checks, and git cleanliness are satisfied."
 )

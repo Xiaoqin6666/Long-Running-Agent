@@ -7,7 +7,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
-BENCHMARK = Path(__file__).resolve().parent
+BENCHMARK = ROOT / "eval" / "benchmarks" / "skill_mechanism"
 WORKSPACE = BENCHMARK / "workspace"
 STATE = ROOT / "state" / "benchmarks" / "skill_mechanism"
 

@@ -20,4 +20,4 @@ Complete the three preplanned tasks in order. This benchmark evaluates the Skill
 
 3. For task T3, load `normalize-portable-path` before writing or editing `eval/benchmarks/skill_mechanism/workspace/second_path.py`. Then implement the same public API and behavior in that file by following the loaded Skill.
 
-Do not read or modify `hidden_acceptance.py`. Do not directly write files under the benchmark state `skills/` or `skill_candidates/` directories; use `save_skill` and `load_skill`.
+Do not directly write files under the benchmark state `skills/` or `skill_candidates/` directories; use `save_skill` and `load_skill`.

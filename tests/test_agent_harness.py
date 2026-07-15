@@ -631,75 +631,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(observation.data["initializer_restricted"])
         self.assertFalse(workspace_exists)
 
-    def test_initializer_cannot_inspect_hidden_acceptance(self) -> None:
-        with WorkspaceTemporaryDirectory() as tmp:
-            root = Path(tmp)
-            benchmark_dir = root / "eval" / "benchmarks" / "todo_counter"
-            spec = benchmark_dir / "project_spec.md"
-            spec.parent.mkdir(parents=True)
-            spec.write_text("# Todo Counter\n", encoding="utf-8")
-            (benchmark_dir / "hidden_acceptance.py").write_text(
-                "PRIVATE_NEEDLE = 'verifier-only'\n",
-                encoding="utf-8",
-            )
-            (benchmark_dir / "public_notes.md").write_text(
-                "PRIVATE_NEEDLE documents the public requirement.\n",
-                encoding="utf-8",
-            )
-            loop = AgentLoop(
-                root=root,
-                task=spec.read_text(encoding="utf-8"),
-                max_steps=1,
-                project_spec_path=spec,
-                benchmark_id="todo_counter",
-            )
-            loop._ensure_state_files()
-            loop._prepare_runtime_task_graph()
-            state = loop._load_or_create_state()
-
-            explicit_search = loop._execute_action(
-                {"action": "search", "target": "hidden_acceptance", "args": {"path": "."}},
-                state,
-            )
-            direct_read = loop._execute_action(
-                {
-                    "action": "read",
-                    "target": "eval/benchmarks/todo_counter/hidden_acceptance.py",
-                    "args": {},
-                },
-                state,
-            )
-            broad_search = loop._execute_action(
-                {
-                    "action": "search",
-                    "target": "PRIVATE_NEEDLE",
-                    "args": {"path": "eval/benchmarks/todo_counter"},
-                },
-                state,
-            )
-            recursive_listing = loop._execute_action(
-                {
-                    "action": "list_files",
-                    "target": "eval/benchmarks/todo_counter",
-                    "args": {"recursive": True},
-                },
-                state,
-            )
-
-        self.assertFalse(explicit_search.ok)
-        self.assertTrue(explicit_search.data["private_acceptance_protected"])
-        self.assertFalse(direct_read.ok)
-        self.assertTrue(direct_read.data["private_acceptance_protected"])
-        self.assertTrue(broad_search.ok)
-        self.assertEqual(
-            [match["path"] for match in broad_search.data["matches"]],
-            ["eval\\benchmarks\\todo_counter\\public_notes.md"],
-        )
-        self.assertTrue(recursive_listing.ok)
-        self.assertFalse(
-            any("hidden_acceptance" in item["path"] for item in recursive_listing.data["entries"])
-        )
-
     def test_initializer_rejects_task_graph_outside_spec_workspace(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -810,7 +741,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         checks = {
             "tasks": {"ok": True, "all_remaining_blocked": False},
             "regression": {"ok": True},
-            "hidden_acceptance": {"ok": True},
             "git_clean": {"ok": True},
             "budget": {"ok": True, "exhausted": False},
             "failure_limits": {"ok": True, "exceeded": {}},
@@ -825,7 +755,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         checks = {
             "tasks": {"ok": False, "all_remaining_blocked": False},
             "regression": {"ok": True},
-            "hidden_acceptance": {"ok": True},
             "git_clean": {"ok": True},
             "budget": {"ok": False, "exhausted": True},
             "failure_limits": {"ok": True, "exceeded": {}},
@@ -841,7 +770,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         checks = {
             "tasks": {"ok": False, "all_remaining_blocked": False},
             "regression": {"ok": True},
-            "hidden_acceptance": {"ok": False},
             "git_clean": {"ok": True},
             "budget": {"ok": True, "exhausted": False},
             "failure_limits": {"ok": True, "exceeded": {}},
@@ -1756,7 +1684,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(data["tasks"][0]["status"], "completed")
         self.assertEqual(data["tasks"][1]["status"], "in_progress")
 
-    def test_finish_hidden_failure_schedules_repair_task(self) -> None:
+    def test_finish_does_not_run_manual_hidden_acceptance_or_create_repair_tasks(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             source_tasks = root / "input_tasks.json"
@@ -1797,8 +1725,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
             hidden.parent.mkdir(parents=True)
             hidden.write_text(
-                "import sys\n"
-                "print('command failed: python -m issue_tracker.cli --data-file tmp.json list')\n"
+                "import pathlib, sys\n"
+                "pathlib.Path('hidden-was-run.txt').write_text('unexpected', encoding='utf-8')\n"
                 "sys.exit(1)\n",
                 encoding="utf-8",
             )
@@ -1818,22 +1746,12 @@ class HarnessBehaviorTests(unittest.TestCase):
             result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
             data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
 
-        self.assertFalse(result.ok)
-        self.assertIn("repair task R1 was scheduled", result.summary)
-        self.assertEqual(state.task_id, "R1")
-        self.assertEqual(state.nodes[0]["id"], "R1")
-        self.assertEqual(state.nodes[0]["status"], "in_progress")
-        repair = data["tasks"][-1]
-        self.assertEqual(repair["id"], "R1")
-        self.assertEqual(repair["status"], "in_progress")
-        self.assertEqual(repair["repair_source"], "hidden_acceptance")
-        self.assertEqual(
-            repair["expected_artifacts"],
-            ["eval/benchmarks/sample/workspace/issue_tracker/cli.py"],
-        )
-        self.assertIn("--data-file", " ".join(repair["acceptance_criteria"]))
-        self.assertEqual(state.acceptance_contracts[-1]["task_id"], "R1")
-        self.assertEqual(state.acceptance_contracts[-1]["status"], "agreed")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary, "Project completed.")
+        self.assertNotIn("hidden_acceptance", result.data["checks"])
+        self.assertFalse((root / "hidden-was-run.txt").exists())
+        self.assertEqual([task["id"] for task in data["tasks"]], ["T1"])
+        self.assertEqual(state.task_id, "T1")
 
     def test_generated_task_graph_rejects_unknown_contract_task_id(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2474,7 +2392,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("- list_files: inspect a directory or file entry", context)
         self.assertIn("- search: grep-style literal text search", context)
         self.assertIn("Use this before read when locating T7, validation errors", context)
-        self.assertIn("hidden_acceptance is private verifier input", context)
         self.assertIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
         self.assertIn("- write: create/overwrite/append file", context)
         self.assertIn("- verify: ask harness verifier", context)
@@ -3098,17 +3015,22 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(evidence["ok"])
         self.assertIn("Acceptance command passed.", state.nodes[0]["evidence"])
 
-    def test_t5_verifier_runs_benchmark_hidden_acceptance_without_exposing_output(self) -> None:
+    def test_verifier_does_not_run_manual_hidden_acceptance(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             state_dir = root / "state" / "benchmarks" / "sample"
             (state_dir / "traces").mkdir(parents=True)
             hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
             hidden.parent.mkdir(parents=True)
-            hidden.write_text("print('SECRET-HIDDEN-DETAIL')\n", encoding="utf-8")
+            hidden.write_text(
+                "import pathlib, sys\n"
+                "pathlib.Path('hidden-verifier-was-run.txt').write_text('unexpected', encoding='utf-8')\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
             state = create_initial_state("Final verification")
             state.task_id = "T5"
-            state.acceptance_criteria = ["Hidden acceptance script passes"]
+            state.acceptance_criteria = ["Public verification passes"]
             state.nodes = [{"id": "T5", "title": "Final", "status": "in_progress", "evidence": []}]
             state.evidence_sources.append(
                 {
@@ -3125,73 +3047,10 @@ class HarnessBehaviorTests(unittest.TestCase):
             report = (state_dir / "verifier_report.md").read_text(encoding="utf-8")
 
         self.assertTrue(result.ok)
-        self.assertTrue(result.data["checks"]["hidden_acceptance"])
-        self.assertEqual(result.data["hidden_acceptance"]["summary"], "Benchmark hidden acceptance passed.")
-        self.assertNotIn("SECRET-HIDDEN-DETAIL", json.dumps(result.data))
-        self.assertNotIn("SECRET-HIDDEN-DETAIL", report)
-
-    def test_t5_verifier_redacts_failed_hidden_acceptance_output(self) -> None:
-        with WorkspaceTemporaryDirectory() as tmp:
-            root = Path(tmp)
-            state_dir = root / "state" / "benchmarks" / "sample"
-            (state_dir / "traces").mkdir(parents=True)
-            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
-            hidden.parent.mkdir(parents=True)
-            hidden.write_text(
-                "import sys\nprint('SECRET-FAILURE-DETAIL')\nsys.exit(1)\n",
-                encoding="utf-8",
-            )
-            state = create_initial_state("Final verification")
-            state.task_id = "T5"
-            state.acceptance_criteria = ["Hidden acceptance script passes"]
-            state.nodes = [{"id": "T5", "title": "Final", "status": "in_progress", "evidence": []}]
-            state.evidence_sources.append(
-                {
-                    "action": "bash",
-                    "target": "python -c \"assert True\"",
-                    "summary": "Command exited with code 0.",
-                    "task_id": "T5",
-                    "evidence_type": "acceptance_command_passed",
-                    "ok": True,
-                }
-            )
-
-            result = Verifier(root, state_dir=state_dir).run("default", state)
-            report = (state_dir / "verifier_report.md").read_text(encoding="utf-8")
-
-        self.assertFalse(result.ok)
-        self.assertFalse(result.data["checks"]["hidden_acceptance"])
-        self.assertEqual(result.data["hidden_acceptance"]["summary"], "Benchmark hidden acceptance failed.")
-        self.assertNotIn("SECRET-FAILURE-DETAIL", json.dumps(result.data))
-        self.assertNotIn("SECRET-FAILURE-DETAIL", report)
-
-    def test_hidden_acceptance_config_can_pass_in_temp_project(self) -> None:
-        with WorkspaceTemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "eval").mkdir()
-            (root / "eval" / "hidden_acceptance.json").write_text(
-                json.dumps({"command": ["python", "-c", "import sys; sys.exit(0)"]}),
-                encoding="utf-8",
-            )
-
-            result = ProjectTerminator(root)._run_hidden_acceptance()
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["configured"])
-
-    def test_terminator_prefers_benchmark_hidden_acceptance_and_redacts_output(self) -> None:
-        with WorkspaceTemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hidden = root / "eval" / "benchmarks" / "sample" / "hidden_acceptance.py"
-            hidden.parent.mkdir(parents=True)
-            hidden.write_text("print('SECRET-BENCHMARK-OUTPUT')\n", encoding="utf-8")
-
-            result = ProjectTerminator(root, benchmark_id="sample")._run_hidden_acceptance()
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["configured"])
-        self.assertEqual(result["summary"], "Benchmark hidden acceptance passed.")
-        self.assertNotIn("SECRET-BENCHMARK-OUTPUT", json.dumps(result))
+        self.assertNotIn("hidden_acceptance", result.data["checks"])
+        self.assertNotIn("hidden_acceptance", result.data)
+        self.assertFalse((root / "hidden-verifier-was-run.txt").exists())
+        self.assertNotIn("hidden_acceptance", report)
 
     def test_metrics_counts_answer_actions(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

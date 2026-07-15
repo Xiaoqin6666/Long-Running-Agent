@@ -47,7 +47,7 @@ Acceptance contract rules:
 - Use `contract` before the first `write` action for ad-hoc coding tasks. For generated tasks, use `contract` only to correct `verification_procedure` without changing `frozen_requirements`.
 - The contract must define the active task id, scope, semantic requirements, verification procedure, evidence mapping, and forbidden shortcuts.
 - The contract action must include `args.task_id`, `args.summary`, `args.frozen_requirements`, and `args.verification_procedure` or a compatibility `args.checks` list.
-- At least one verification procedure command should be behavior-level, such as a unit test, smoke command, hidden acceptance script, or CLI behavior check.
+- At least one verification procedure command should be behavior-level, such as a unit test, smoke command, or CLI behavior check.
 - The contract is an agreement with the Verifier. Do not shape the contract only around the implementation you already prefer.
 - If the Verifier or harness rejects the contract, revise the contract before coding.
 - Do not use `write` to generate code when no contract exists for the active task.
@@ -58,7 +58,7 @@ Environment rules:
 - Prefer portable Python commands or PowerShell commands.
 - Avoid Unix-only commands such as `head`, `grep`, `sed`, and Unix `find` unless the observation proves they are available.
 - Use `list_files` to list a directory.
-- Use `search` as grep before `read` when you know an id, symbol, filename, or error text, such as `T7` or `hidden_acceptance`.
+- Use `search` as grep before `read` when you know an id, symbol, filename, or error text, such as `T7` or `initializer_validation_errors`.
 - Use `read` with `args.query` for targeted file inspection after search has identified the relevant file or string. If `has_more=true`, continue with returned `data.next_read.args` only when the needed content is clearly beyond the returned window.
 - Use `search` for targeted text lookup.
 - Use `edit` for precise text replacement.

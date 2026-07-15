@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-APP = Path(__file__).resolve().parent / "workspace"
+APP = ROOT / "eval" / "benchmarks" / "issue_tracker" / "workspace"
 
 
 def run(command: list[str], cwd: Path | None = None) -> dict:
