@@ -1,0 +1,96 @@
+{
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Implement and verify the first portable path normalizer",
+      "priority": 1,
+      "depends_on": [],
+      "status": "pending",
+      "acceptance_criteria": [
+        "first_path.normalize_path converts mixed separators to a stable forward-slash path"
+      ],
+      "criterion_command_map": {
+        "first_path.normalize_path converts mixed separators to a stable forward-slash path": [
+          "python -c \"import importlib.util; p='eval/benchmarks/skill_mechanism/workspace/first_path.py'; s=importlib.util.spec_from_file_location('first_path',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.normalize_path(r'C:\\\\temp//logs\\\\run.txt') == 'C:/temp/logs/run.txt'; assert m.normalize_path(r'/srv//app\\\\data') == '/srv/app/data'\""
+        ]
+      },
+      "expected_artifacts": [
+        "eval/benchmarks/skill_mechanism/workspace/first_path.py"
+      ],
+      "implementation_artifacts": [
+        "eval/benchmarks/skill_mechanism/workspace/first_path.py"
+      ],
+      "worker_test_artifacts": [],
+      "acceptance_artifacts": [],
+      "frozen_acceptance_artifacts": [],
+      "test_policy": {
+        "acceptance_tests_mutable_by_worker": false,
+        "acceptance_test_repair_requires_verifier_approval": true
+      },
+      "verification_commands": [
+        "python -c \"import importlib.util; p='eval/benchmarks/skill_mechanism/workspace/first_path.py'; s=importlib.util.spec_from_file_location('first_path',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.normalize_path(r'C:\\\\temp//logs\\\\run.txt') == 'C:/temp/logs/run.txt'; assert m.normalize_path(r'/srv//app\\\\data') == '/srv/app/data'\""
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "Promote the verified path-normalization procedure to a Skill",
+      "priority": 1,
+      "depends_on": ["T1"],
+      "status": "pending",
+      "acceptance_criteria": [
+        "normalize-portable-path is promoted through save_skill using real T1 verification evidence"
+      ],
+      "criterion_command_map": {
+        "normalize-portable-path is promoted through save_skill using real T1 verification evidence": [
+          "python -c \"import json,pathlib; s=pathlib.Path('state/benchmarks/skill_mechanism'); p=s/'skills'/'normalize-portable-path.md'; assert p.is_file(); cs=sorted((s/'skill_candidates').glob('SC-*.json')); assert cs; c=json.loads(cs[-1].read_text(encoding='utf-8')); assert c['status']=='promoted'; r=c['evidence_refs'][0]; assert r['type']=='verifier_report' and r['task_id']=='T1' and r.get('report_id'); assert (s/'verifier_reports'/(r['report_id']+'.json')).is_file()\""
+        ]
+      },
+      "expected_artifacts": [
+        "state/benchmarks/skill_mechanism/skills/normalize-portable-path.md",
+        "state/benchmarks/skill_mechanism/skill_candidates"
+      ],
+      "implementation_artifacts": [],
+      "worker_test_artifacts": [],
+      "acceptance_artifacts": [],
+      "frozen_acceptance_artifacts": [],
+      "test_policy": {
+        "acceptance_tests_mutable_by_worker": false,
+        "acceptance_test_repair_requires_verifier_approval": true
+      },
+      "verification_commands": [
+        "python -c \"import json,pathlib; s=pathlib.Path('state/benchmarks/skill_mechanism'); p=s/'skills'/'normalize-portable-path.md'; assert p.is_file(); cs=sorted((s/'skill_candidates').glob('SC-*.json')); assert cs; c=json.loads(cs[-1].read_text(encoding='utf-8')); assert c['status']=='promoted'; r=c['evidence_refs'][0]; assert r['type']=='verifier_report' and r['task_id']=='T1' and r.get('report_id'); assert (s/'verifier_reports'/(r['report_id']+'.json')).is_file()\""
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Load and reuse the promoted Skill",
+      "priority": 1,
+      "depends_on": ["T2"],
+      "status": "pending",
+      "acceptance_criteria": [
+        "second_path.normalize_path implements the same behavior after normalize-portable-path is loaded"
+      ],
+      "criterion_command_map": {
+        "second_path.normalize_path implements the same behavior after normalize-portable-path is loaded": [
+          "python -c \"import importlib.util; p='eval/benchmarks/skill_mechanism/workspace/second_path.py'; s=importlib.util.spec_from_file_location('second_path',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.normalize_path(r'D:\\\\build//out\\\\file.json') == 'D:/build/out/file.json'; assert m.normalize_path(r'//api\\\\v1//items') == '/api/v1/items'\""
+        ]
+      },
+      "expected_artifacts": [
+        "eval/benchmarks/skill_mechanism/workspace/second_path.py"
+      ],
+      "implementation_artifacts": [
+        "eval/benchmarks/skill_mechanism/workspace/second_path.py"
+      ],
+      "worker_test_artifacts": [],
+      "acceptance_artifacts": [],
+      "frozen_acceptance_artifacts": [],
+      "test_policy": {
+        "acceptance_tests_mutable_by_worker": false,
+        "acceptance_test_repair_requires_verifier_approval": true
+      },
+      "verification_commands": [
+        "python -c \"import importlib.util; p='eval/benchmarks/skill_mechanism/workspace/second_path.py'; s=importlib.util.spec_from_file_location('second_path',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.normalize_path(r'D:\\\\build//out\\\\file.json') == 'D:/build/out/file.json'; assert m.normalize_path(r'//api\\\\v1//items') == '/api/v1/items'\""
+      ]
+    }
+  ]
+}

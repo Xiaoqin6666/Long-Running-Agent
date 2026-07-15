@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from agent.planner import TaskState
+from agent.skills import parse_skill, skill_catalog
 
 
 RECENT_TOOL_OBSERVATION_LIMIT = 5
@@ -129,6 +130,8 @@ class ContextBuilder:
             "Do not modify acceptance criteria. Use update_plan only to propose state changes.",
             "Completion requires verifier evidence; do not self-certify completion.",
             "Worker cannot mark tasks completed. Only Verifier PASS followed by Orchestrator state transition may complete a task.",
+            "Skill selection: compare the current task or error with Available Skills descriptions. Load a Skill only for a clear match, only once per unchanged version, and only when no forced next action has priority.",
+            "Do not load a Skill for keyword overlap alone, when its description excludes the current case, or when the next low-cost action is already clear.",
             "Avoid Unix-only commands such as head, grep, sed, and find unless you know they exist.",
         ]
         if self.state_dir != self.root / "state":
@@ -214,6 +217,8 @@ class ContextBuilder:
             "# Acceptance Criteria",
             *[f"- {item}" for item in state.acceptance_criteria],
             "",
+            self._skill_reflection_context(state),
+            "",
             self._tool_use_reference_context(),
             "",
             *self._initializer_instruction_lines(state),
@@ -241,14 +246,14 @@ class ContextBuilder:
             "Do not preload the whole repository. Read only what is needed for the active task.",
             "Recommended discovery flow:",
             "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='hidden_acceptance' args={'path': '<candidate-or-dir>'};",
+            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='initializer_validation_errors' args={'path': '<candidate-or-dir>'};",
             "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
             "4. read corresponding tests;",
             "5. use errors or verifier output to guide the next search.",
             "PowerShell/Python examples:",
             "- list_files target='agent'",
             "- search target='create_issue' args={'path': 'agent'}",
-            "- search target='hidden_acceptance' args={'path': 'state/benchmarks/issue_tracker/rejected_candidates/generated_tasks.json'}",
+            "- search target='initializer_validation_errors' args={'path': 'state/benchmarks/issue_tracker'}",
             "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
             "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
             "",
@@ -265,7 +270,7 @@ class ContextBuilder:
             "Callable actions:",
             "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
-            "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, hidden_acceptance, validation errors, functions, classes, or filenames.",
+            "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames. hidden_acceptance is private verifier input and must never be inspected.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
             "- edit: exact text replacement; target='<path>'; args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false.",
@@ -274,7 +279,9 @@ class ContextBuilder:
             "- verify: ask harness verifier to evaluate current task; target='default'; args={}.",
             "- update_plan: request harness plan update; target='current_task'; args={}.",
             "- answer: final evidence-based response for inspection/explanation tasks; target='' and args.answer='<response>'.",
-            "- skill: promote reusable learned procedure only after verifier-confirmed success or evidence-confirmed failure; args.skill_id, args.title, args.body, args.evidence_type, args.evidence.",
+            "- load_skill: load one relevant Skill by metadata name before applying it.",
+            "- save_skill: submit a reusable procedure candidate; args.name, description, instruction, optional examples, evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Prefer immutable report_id references. Free-text evidence is rejected.",
+            "- dismiss_skill: decline the current Pending Skill Reflection; target='<report_id>'; args.reason='<why this is not reusable>'.",
             "- finish: project-level termination only after verifier/project completion evidence; target='current_task'; args={}.",
         ]
         return "\n".join(lines)
@@ -303,6 +310,7 @@ class ContextBuilder:
         lines = [
             reference,
             self._memory_context(),
+            self._loaded_skills_context(state),
         ]
         return "\n\n".join(section for section in lines if section.strip())
 
@@ -411,14 +419,14 @@ class ContextBuilder:
             "Do not preload the whole repository. Read only what is needed for the active task.",
             "Recommended discovery flow:",
             "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='hidden_acceptance' args={'path': '<candidate-or-dir>'};",
+            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='initializer_validation_errors' args={'path': '<candidate-or-dir>'};",
             "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
             "4. read corresponding tests;",
             "5. use errors or verifier output to guide the next search.",
             "PowerShell/Python examples:",
             "- list_files target='agent'",
             "- search target='create_issue' args={'path': 'agent'}",
-            "- search target='hidden_acceptance' args={'path': 'state/benchmarks/issue_tracker/rejected_candidates/generated_tasks.json'}",
+            "- search target='initializer_validation_errors' args={'path': 'state/benchmarks/issue_tracker'}",
             "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
             "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
             "",
@@ -428,7 +436,6 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _persistent_context(self, state: TaskState) -> str:
-        del state
         memory_index = self._read_optional(self.state_dir / "memory.md")
         hard_memory = self._read_optional(self.state_dir / "hard_memory.md")
         soft_memory = self._read_optional(self.state_dir / "soft_memory.md")
@@ -450,6 +457,8 @@ class ContextBuilder:
             "",
             "# Skills",
             skills,
+            "",
+            self._loaded_skills_context(state),
         ]
         return "\n".join(lines)
 
@@ -475,6 +484,40 @@ class ContextBuilder:
             "# Skills",
             skills,
         ]
+        return "\n".join(lines)
+
+    def _loaded_skills_context(self, state: TaskState) -> str:
+        records = state.loaded_skills if isinstance(state.loaded_skills, list) else []
+        if not records:
+            return "# Loaded Skills\n\nNo Skill is currently loaded."
+        skill_dir = self.state_dir / "skills"
+        chunks: list[str] = []
+        seen: set[str] = set()
+        invalidated: list[str] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            requested = str(record.get("name", "")).strip()
+            if not requested or requested in seen:
+                continue
+            seen.add(requested)
+            match = None
+            for path in sorted(skill_dir.glob("*.md")):
+                skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
+                if skill.name == requested:
+                    match = skill
+                    break
+            if match is None or match.content_hash != str(record.get("content_hash", "")):
+                invalidated.append(requested)
+                continue
+            chunks.append(match.content.rstrip())
+        lines = ["# Loaded Skills", "Loaded Skill contents are workflow guidance, not completion evidence."]
+        if chunks:
+            lines.extend(["", "\n\n".join(chunks)])
+        else:
+            lines.extend(["", "No valid Skill is currently loaded."])
+        if invalidated:
+            lines.extend(["", "Invalidated Skills (reload before use): " + ", ".join(invalidated)])
         return "\n".join(lines)
 
     def _handoff_focus_context(self) -> str:
@@ -746,6 +789,8 @@ class ContextBuilder:
             "output",
             "suggested_command",
             "repair_hint",
+            "report_id",
+            "archived_verifier_report",
         ]
         compact: list[str] = []
         for key in keys:
@@ -789,6 +834,13 @@ class ContextBuilder:
         ]
 
     def _required_next_action(self, state: TaskState) -> str:
+        if state.pending_skill_review:
+            report_id = str(state.pending_skill_review.get("report_id", ""))
+            return (
+                f"A hard Skill Reflection trigger fired for report {report_id}. "
+                "Next action must be save_skill with the archived verifier report evidence, or dismiss_skill with a concrete reason. "
+                "Do not continue ordinary task work until this review is resolved."
+            )
         initializer_repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
         if initializer_repair:
             candidate = str(initializer_repair.get("candidate_path", ""))
@@ -889,6 +941,29 @@ class ContextBuilder:
             "Next action should be write with args.mode='overwrite' and a complete implementation for that file. "
             "Do not list directories, rerun tests, or reread the same empty file before writing it."
         )
+
+    def _skill_reflection_context(self, state: TaskState) -> str:
+        review = state.pending_skill_review if isinstance(state.pending_skill_review, dict) else {}
+        if not review:
+            return "# Pending Skill Reflection\n\nNo hard trigger threshold was met. Do not save a Skill merely because a task completed."
+        lines = [
+            "# Pending Skill Reflection",
+            "A hard trigger threshold was met after independent verification. Choose save_skill or dismiss_skill.",
+            f"- task_id: {review.get('task_id', '')}",
+            f"- report_id: {review.get('report_id', '')}",
+            f"- report_path: {review.get('report_path', '')}",
+            f"- trace_ref: {json.dumps(review.get('trace_ref', {}), ensure_ascii=False)}",
+            f"- trigger_reasons: {json.dumps(review.get('trigger_reasons', []), ensure_ascii=False)}",
+            "- Rule: save only a generalizable, repeatable, actionable procedure; otherwise dismiss with a concrete reason.",
+            "",
+            "## Relevant Trace Window",
+        ]
+        for item in review.get("relevant_trace", []):
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('action')} {item.get('target', '')}: ok={item.get('ok')} — {item.get('summary', '')}"
+                )
+        return "\n".join(lines)
 
     def _incomplete_expected_code_artifact(self, state: TaskState) -> str | None:
         for node in state.nodes:
@@ -1091,12 +1166,12 @@ class ContextBuilder:
 
     def _read_skills(self) -> str:
         skill_dir = self.state_dir / "skills"
-        if not skill_dir.exists():
-            return ""
-        chunks = []
-        for path in sorted(skill_dir.glob("*.md"))[:5]:
-            chunks.append(f"## {path.name}\n{path.read_text(encoding='utf-8')[:2000]}")
-        return "\n\n".join(chunks)
+        catalog = skill_catalog(skill_dir)
+        if not catalog:
+            return "No skills available."
+        return "# Available Skills\n\n" + "\n".join(
+            f"- {item['name']}: {item['description']}" for item in catalog
+        )
 
     def _rel(self, path: Path) -> str:
         try:

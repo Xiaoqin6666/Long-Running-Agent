@@ -57,6 +57,12 @@ class TaskState:
     initializer_repair: dict[str, Any] = field(default_factory=dict)
     orchestrator_decision: dict[str, Any] = field(default_factory=dict)
     pending_repair: dict[str, Any] = field(default_factory=dict)
+    loaded_skills: list[dict[str, Any]] = field(default_factory=list)
+    task_session_ids: dict[str, list[str]] = field(default_factory=dict)
+    error_patterns: dict[str, dict[str, Any]] = field(default_factory=dict)
+    task_error_fingerprints: dict[str, list[str]] = field(default_factory=dict)
+    pending_skill_review: dict[str, Any] = field(default_factory=dict)
+    skill_review_history: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
@@ -70,6 +76,12 @@ class TaskState:
         data.setdefault("initializer_repair", {})
         data.setdefault("orchestrator_decision", {})
         data.setdefault("pending_repair", {})
+        data.setdefault("loaded_skills", [])
+        data.setdefault("task_session_ids", {})
+        data.setdefault("error_patterns", {})
+        data.setdefault("task_error_fingerprints", {})
+        data.setdefault("pending_skill_review", {})
+        data.setdefault("skill_review_history", [])
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,6 +106,12 @@ class TaskState:
             "initializer_repair": self.initializer_repair,
             "orchestrator_decision": self.orchestrator_decision,
             "pending_repair": self.pending_repair,
+            "loaded_skills": self.loaded_skills,
+            "task_session_ids": self.task_session_ids,
+            "error_patterns": self.error_patterns,
+            "task_error_fingerprints": self.task_error_fingerprints,
+            "pending_skill_review": self.pending_skill_review,
+            "skill_review_history": self.skill_review_history,
         }
 
     def summary(self) -> str:

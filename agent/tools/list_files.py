@@ -6,7 +6,7 @@ from agent.tools.base import WorkspaceTool
 
 
 class ListFilesTool(WorkspaceTool):
-    def run(self, action: dict[str, Any]):
+    def run(self, action: dict[str, Any], *, excluded_path_fragments: tuple[str, ...] = ()):
         from agent.tools import ToolResult
 
         target = str(action.get("target", ".") or ".")
@@ -27,7 +27,7 @@ class ListFilesTool(WorkspaceTool):
             children = path.rglob("*") if recursive else path.iterdir()
             entries = []
             for child in sorted(children, key=lambda item: str(item.relative_to(self.root)).lower()):
-                if self._skip(child):
+                if self._skip(child, excluded_path_fragments):
                     continue
                 kind = "dir" if child.is_dir() else "file"
                 entries.append(entry_dict(str(child.relative_to(self.root)), kind))
@@ -41,9 +41,14 @@ class ListFilesTool(WorkspaceTool):
             {"target": target, "recursive": recursive, "limit": limit, "entries": entries},
         )
 
-    def _skip(self, path) -> bool:
+    def _skip(self, path, excluded_path_fragments: tuple[str, ...] = ()) -> bool:
         parts = set(path.parts)
-        return ".git" in parts or "__pycache__" in parts
+        normalized = str(path.relative_to(self.root)).replace("\\", "/").lower()
+        return (
+            ".git" in parts
+            or "__pycache__" in parts
+            or any(fragment.lower() in normalized for fragment in excluded_path_fragments)
+        )
 
 
 def entry_dict(path: str, kind: str) -> dict[str, str]:

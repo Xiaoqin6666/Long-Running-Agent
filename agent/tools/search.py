@@ -7,7 +7,7 @@ from agent.tools.base import WorkspaceTool
 
 
 class SearchTool(WorkspaceTool):
-    def run(self, action: dict[str, Any]):
+    def run(self, action: dict[str, Any], *, excluded_path_fragments: tuple[str, ...] = ()):
         from agent.tools import ToolResult
 
         pattern = str(action.get("target", ""))
@@ -23,7 +23,7 @@ class SearchTool(WorkspaceTool):
         matches = []
         files = [root] if root.is_file() else root.rglob("*")
         for path in files:
-            if not path.is_file() or self._skip(path):
+            if not path.is_file() or self._skip(path, excluded_path_fragments):
                 continue
             try:
                 for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -37,7 +37,12 @@ class SearchTool(WorkspaceTool):
                 break
         return ToolResult(True, f"Found {len(matches)} match(es).", {"matches": matches})
 
-    def _skip(self, path: Path) -> bool:
+    def _skip(self, path: Path, excluded_path_fragments: tuple[str, ...] = ()) -> bool:
         parts = set(path.parts)
-        return ".git" in parts or "__pycache__" in parts
+        normalized = str(path.relative_to(self.root)).replace("\\", "/").lower()
+        return (
+            ".git" in parts
+            or "__pycache__" in parts
+            or any(fragment.lower() in normalized for fragment in excluded_path_fragments)
+        )
 

@@ -19,12 +19,22 @@ from agent.planner import (
     validate_generated_task_graph,
     validate_initializer_script,
 )
+from agent.skills import (
+    SkillDocument,
+    normalize_examples,
+    normalize_instruction,
+    parse_skill,
+    render_skill,
+    skill_catalog,
+)
 from agent.termination import ProjectTerminator
 from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, SearchTool, ToolResult, WriteTool
 from agent.verifier import Verifier
 
 
 LOGGER = logging.getLogger("long_agent")
+SKILL_REFLECTION_SESSION_THRESHOLD = 5
+SKILL_REFLECTION_ERROR_THRESHOLD = 3
 
 
 @dataclass
@@ -175,9 +185,12 @@ class AgentLoop:
         steps = 0
         completed = False
         message = "Reached max steps before completion."
+        self._record_task_session(state)
 
         for step in range(1, self.max_steps + 1):
             steps = step
+            self._current_trace_step = step
+            self._record_task_session(state)
             context = self.context_builder.build(state)
             try:
                 action = self.decision_maker.next_action(context, state)
@@ -308,6 +321,15 @@ class AgentLoop:
                 state.nodes[0]["status"] = "in_progress"
         self._ensure_frozen_acceptance_contract(state, task)
 
+    def _record_task_session(self, state: TaskState, task_id: str | None = None) -> None:
+        task_id = task_id or self._active_task_id(state)
+        if not task_id:
+            return
+        session_id = self.trace_path.stem
+        sessions = state.task_session_ids.setdefault(task_id, [])
+        if session_id not in sessions:
+            sessions.append(session_id)
+
     def _ensure_frozen_acceptance_contract(self, state: TaskState, task: dict[str, Any]) -> None:
         task_id = str(task.get("id", state.task_id))
         criteria = [str(item) for item in task.get("acceptance_criteria", [])]
@@ -369,6 +391,21 @@ class AgentLoop:
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
+        if state.pending_skill_review and name not in {"save_skill", "skill", "dismiss_skill"}:
+            return ToolResult(
+                False,
+                "Pending Skill Reflection must be resolved with save_skill or dismiss_skill before ordinary work continues.",
+                {
+                    "required_action": "save_skill_or_dismiss_skill",
+                    "pending_skill_review": state.pending_skill_review,
+                    "counts_as_progress": False,
+                },
+            )
+        if name == "dismiss_skill":
+            return self._handle_dismiss_skill_action(action, state)
+        initializer_inspection = self._handle_initializer_private_inspection(action, state)
+        if initializer_inspection is not None:
+            return initializer_inspection
         if name == "answer":
             if self._is_initializer_task(state):
                 outputs = self._validate_initializer_outputs()
@@ -397,10 +434,12 @@ class AgentLoop:
                     {"initializer_restricted": True, "allowed_targets": sorted(self._initializer_allowed_targets(state))},
                 )
             return self._validate_contract_action(action, state)
-        if name == "skill":
+        if name == "load_skill":
+            return self._handle_load_skill_action(action, state)
+        if name in {"save_skill", "skill"}:
             if self._is_initializer_task(state):
                 return ToolResult(False, "Skill promotion is disabled during INIT.", {"initializer_restricted": True})
-            return self._handle_skill_action(action, state)
+            return self._handle_save_skill_action(action, state)
         if name in {"edit", "write"} and state.handoff_ready:
             return ToolResult(
                 False,
@@ -444,6 +483,25 @@ class AgentLoop:
             self.orchestrator.mark_awaiting_verification(task_id, "worker submitted candidate for verification")
             result = self.verifier.run(action.get("target", "default"), state)
             result.data["task_id"] = task_id
+            if result.ok:
+                archived = self._archive_verifier_success(task_id, result)
+                result.data.update(archived)
+            pending_skills = [item for item in state.loaded_skills if item.get("status") == "loaded"]
+            if pending_skills:
+                validation_status = "verified_pass" if result.ok else "verified_fail"
+                result.data["skill_validation"] = [
+                    {
+                        "name": item.get("name"),
+                        "status": validation_status,
+                        "tool_calls_since_load": max(
+                            0, state.iterations - int(item.get("loaded_iteration", state.iterations)) - 1
+                        ),
+                    }
+                    for item in pending_skills
+                ]
+                for item in pending_skills:
+                    item["status"] = validation_status
+                    item["verified_at"] = utc_now()
             self.orchestrator.mark_verified(task_id, result.ok, result.summary)
             return result
         if name == "finish":
@@ -478,6 +536,48 @@ class AgentLoop:
             if post_write_check is not None:
                 return post_write_check
         return result
+
+    def _handle_initializer_private_inspection(
+        self,
+        action: dict[str, Any],
+        state: TaskState,
+    ) -> ToolResult | None:
+        if not self._is_initializer_task(state):
+            return None
+        name = str(action.get("action", ""))
+        if name == "git":
+            return ToolResult(
+                False,
+                "INIT git inspection rejected: initialization does not require repository-history access.",
+                {"initializer_restricted": True, "private_acceptance_protected": True, "counts_as_progress": False},
+            )
+        if name not in {"search", "read", "list_files"}:
+            return None
+
+        private_fragment = "hidden_acceptance"
+        target = str(action.get("target", ""))
+        args = action.get("args", {})
+        args_text = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+        if private_fragment in f"{target}\n{args_text}".lower():
+            return ToolResult(
+                False,
+                "INIT inspection rejected: hidden_acceptance is private verifier input and cannot be searched, read, or listed.",
+                {
+                    "initializer_restricted": True,
+                    "private_acceptance_protected": True,
+                    "forbidden_target": private_fragment,
+                    "counts_as_progress": False,
+                },
+            )
+
+        tool = self.tools.get(name)
+        if name == "search" and isinstance(tool, SearchTool):
+            return tool.run(action, excluded_path_fragments=(private_fragment,))
+        if name == "read" and isinstance(tool, ReadTool):
+            return tool.run(action, excluded_path_fragments=(private_fragment,))
+        if name == "list_files" and isinstance(tool, ListFilesTool):
+            return tool.run(action, excluded_path_fragments=(private_fragment,))
+        return None
 
     def _pending_repair_command_failure_type(self, state: TaskState) -> str | None:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -1073,14 +1173,36 @@ class AgentLoop:
                 )
             ]
             state.acceptance_contracts.append(contract)
-        elif name == "skill" and observation.ok:
+        elif name in {"load_skill", "save_skill", "skill"} and observation.ok:
             state.evidence_sources.append(
                 {
-                    "action": "skill",
-                    "target": observation.data.get("path", ""),
+                    "action": name,
+                    "target": observation.data.get("name", observation.data.get("path", "")),
                     "summary": observation.summary,
                 }
             )
+            if name in {"save_skill", "skill"} and state.pending_skill_review:
+                observation.data["skill_review_decision"] = "saved"
+                state.skill_review_history.append(
+                    {
+                        **state.pending_skill_review,
+                        "decision": "saved",
+                        "skill_name": observation.data.get("name", ""),
+                        "decided_at": utc_now(),
+                    }
+                )
+                state.pending_skill_review = {}
+        elif name == "dismiss_skill" and observation.ok:
+            observation.data["skill_review_decision"] = "dismissed"
+            state.skill_review_history.append(
+                {
+                    **state.pending_skill_review,
+                    "decision": "dismissed",
+                    "reason": observation.data.get("reason", ""),
+                    "decided_at": utc_now(),
+                }
+            )
+            state.pending_skill_review = {}
         elif name == "answer" and observation.ok and not self._is_initializer_task(state):
             for node in state.nodes:
                 if node["status"] != "done":
@@ -1176,7 +1298,137 @@ class AgentLoop:
                 summary=observation.summary,
                 evidence_type="verifier_passed",
             )
+            self._maybe_create_pending_skill_review(state, active_task_id, observation)
+        self._record_failure_pattern(state, active_task_id, action, observation)
         self._update_pending_repair(state, action, observation)
+
+    def _record_failure_pattern(
+        self,
+        state: TaskState,
+        task_id: str,
+        action: dict[str, Any],
+        observation: ToolResult,
+    ) -> None:
+        if observation.ok:
+            return
+        name = str(action.get("action", ""))
+        command = ""
+        output = ""
+        if name == "bash":
+            command = str(observation.data.get("command") or action.get("target", ""))
+            output = str(observation.data.get("output", observation.summary))
+        elif name == "verify":
+            verification = observation.data.get("verification", {})
+            results = verification.get("commands", []) if isinstance(verification, dict) else []
+            failed = next((item for item in results if isinstance(item, dict) and item.get("ok") is False), None)
+            if failed:
+                command = str(failed.get("command", ""))
+                output = str(failed.get("output", failed.get("summary", observation.summary)))
+        if not output:
+            return
+        failure_type = self._command_failure_type(output, command=command, state=state) or "execution_error"
+        fingerprint = self._error_fingerprint(output, failure_type)
+        record = state.error_patterns.setdefault(
+            fingerprint,
+            {"count": 0, "failure_type": failure_type, "first_seen_at": utc_now(), "task_ids": []},
+        )
+        record["count"] = int(record.get("count", 0)) + 1
+        record["last_seen_at"] = utc_now()
+        record["last_summary"] = str(observation.summary)[:500]
+        task_ids = record.setdefault("task_ids", [])
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+        task_patterns = state.task_error_fingerprints.setdefault(task_id, [])
+        if fingerprint not in task_patterns:
+            task_patterns.append(fingerprint)
+
+    def _error_fingerprint(self, output: str, failure_type: str) -> str:
+        exception_matches = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\s*:", output)
+        if exception_matches:
+            return f"{failure_type}:{exception_matches[-1]}"
+        normalized = output.lower().replace("\\", "/")
+        normalized = re.sub(r"[a-z]:/[\w./-]+", "<path>", normalized)
+        normalized = re.sub(r"/(?:[\w.-]+/)+[\w.-]+", "<path>", normalized)
+        normalized = re.sub(r"\b\d+\b", "<n>", normalized)
+        words = re.findall(r"[a-z_]+|<path>|<n>", normalized)[:12]
+        suffix = "-".join(words) if words else "unknown"
+        return f"{failure_type}:{suffix[:160]}"
+
+    def _maybe_create_pending_skill_review(
+        self, state: TaskState, task_id: str, observation: ToolResult
+    ) -> None:
+        if state.pending_skill_review:
+            return
+        session_ids = state.task_session_ids.get(task_id, [])
+        repeated = []
+        for fingerprint in state.task_error_fingerprints.get(task_id, []):
+            pattern = state.error_patterns.get(fingerprint, {})
+            if int(pattern.get("count", 0)) >= SKILL_REFLECTION_ERROR_THRESHOLD:
+                repeated.append(
+                    {
+                        "fingerprint": fingerprint,
+                        "count": int(pattern.get("count", 0)),
+                        "failure_type": pattern.get("failure_type", ""),
+                    }
+                )
+        reasons: list[dict[str, Any]] = []
+        if len(session_ids) > SKILL_REFLECTION_SESSION_THRESHOLD:
+            reasons.append(
+                {
+                    "type": "high_cost_success",
+                    "session_count": len(session_ids),
+                    "threshold": SKILL_REFLECTION_SESSION_THRESHOLD,
+                }
+            )
+        if repeated:
+            reasons.append(
+                {
+                    "type": "repeated_error_resolved",
+                    "patterns": repeated,
+                    "threshold": SKILL_REFLECTION_ERROR_THRESHOLD,
+                }
+            )
+        if not reasons:
+            return
+        report_id = str(observation.data.get("report_id", ""))
+        report_path = str(observation.data.get("archived_verifier_report", ""))
+        state.pending_skill_review = {
+            "task_id": task_id,
+            "report_id": report_id,
+            "report_path": report_path,
+            "trace_ref": {
+                "type": "trace",
+                "path": self._rel(self.trace_path),
+                "step": int(getattr(self, "_current_trace_step", 0) or 0),
+                "task_id": task_id,
+            },
+            "trigger_reasons": reasons,
+            "relevant_trace": self._skill_review_trace_window(task_id, action_name="verify", observation=observation),
+            "created_at": utc_now(),
+        }
+
+    def _skill_review_trace_window(
+        self, task_id: str, *, action_name: str, observation: ToolResult
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for path in sorted(self.trace_dir.glob("run_*.jsonl"), key=lambda item: item.stat().st_mtime):
+            for event in self._load_trace_events(path):
+                if str(event.get("task_id", "")) != task_id:
+                    continue
+                action = event.get("action", {}) if isinstance(event.get("action"), dict) else {}
+                result = event.get("observation", {}) if isinstance(event.get("observation"), dict) else {}
+                events.append(
+                    {
+                        "action": action.get("action", ""),
+                        "target": str(action.get("target", ""))[:240],
+                        "ok": result.get("ok"),
+                        "summary": str(result.get("summary", ""))[:300],
+                    }
+                )
+        events.append(
+            {"action": action_name, "target": "default", "ok": observation.ok, "summary": observation.summary}
+        )
+        return events[-8:]
 
     def _record_success_evidence(
         self,
@@ -1925,54 +2177,296 @@ class AgentLoop:
             return result
         return ToolResult(True, f"Acceptance contract agreed for {task_id}.", {"contract": contract})
 
-    def _handle_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+    def _handle_load_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        requested = self._safe_skill_id(str(action.get("target", "")))
+        if not requested:
+            return ToolResult(False, "Skill load rejected: target name is required.", {})
+        skill_dir = self.state_dir / "skills"
+        matches: list[tuple[Path, SkillDocument]] = []
+        for path in sorted(skill_dir.glob("*.md")):
+            skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
+            if self._safe_skill_id(skill.name) == requested or path.stem == requested:
+                matches.append((path, skill))
+        if not matches:
+            return ToolResult(
+                False,
+                f"Skill not found: {requested}.",
+                {"name": requested, "available": [item["name"] for item in skill_catalog(skill_dir)]},
+            )
+        if len(matches) > 1:
+            return ToolResult(False, f"Skill load rejected: duplicate metadata name {requested}.", {})
+        path, skill = matches[0]
+        if not skill.instruction.strip():
+            return ToolResult(False, f"Skill load rejected: {requested} has no instructions.", {})
+        existing = next(
+            (
+                item
+                for item in state.loaded_skills
+                if item.get("name") == skill.name and item.get("content_hash") == skill.content_hash
+            ),
+            None,
+        )
+        if existing:
+            return ToolResult(
+                True,
+                f"Skill already loaded: {skill.name}.",
+                {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "content_hash": skill.content_hash,
+                    "path": self._rel(path),
+                    "already_loaded": True,
+                },
+            )
+        record = {
+            "name": skill.name,
+            "content_hash": skill.content_hash,
+            "status": "loaded",
+            "loaded_at": utc_now(),
+            "loaded_iteration": state.iterations,
+        }
+        state.loaded_skills = [item for item in state.loaded_skills if item.get("name") != skill.name]
+        state.loaded_skills.append(record)
+        return ToolResult(
+            True,
+            f"Skill loaded: {skill.name}.",
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "content": skill.content,
+                "content_hash": skill.content_hash,
+                "path": self._rel(path),
+            },
+        )
+
+    def _handle_dismiss_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        review = state.pending_skill_review if isinstance(state.pending_skill_review, dict) else {}
+        if not review:
+            return ToolResult(False, "No Pending Skill Reflection exists.", {})
+        args = action.get("args", {})
+        reason = str(args.get("reason", "")).strip() if isinstance(args, dict) else ""
+        if not reason:
+            return ToolResult(False, "dismiss_skill requires args.reason.", {})
+        return ToolResult(
+            True,
+            "Pending Skill Reflection dismissed.",
+            {
+                "decision": "dismissed",
+                "reason": reason,
+                "report_id": review.get("report_id"),
+                "task_id": review.get("task_id"),
+            },
+        )
+
+    def _handle_save_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         args = action.get("args", {})
         if not isinstance(args, dict):
             return ToolResult(False, "Skill rejected: args must be an object.", {})
-        skill_id = self._safe_skill_id(str(args.get("skill_id") or action.get("target") or ""))
-        title = str(args.get("title", "")).strip()
-        body = str(args.get("body", "")).strip()
+        skill_id = self._safe_skill_id(str(args.get("name") or args.get("skill_id") or action.get("target") or ""))
+        description = str(args.get("description") or args.get("title") or "").strip()
+        instruction = normalize_instruction(args.get("instruction", args.get("body", "")))
+        examples = normalize_examples(args.get("examples"))
         evidence_type = str(args.get("evidence_type", "")).strip()
-        evidence = args.get("evidence", [])
-        if not skill_id or not title or not body:
-            return ToolResult(False, "Skill rejected: skill_id, title, and body are required.", {})
+        evidence_refs = args.get("evidence_refs", [])
+        if not skill_id or not description or not instruction:
+            return ToolResult(False, "Skill rejected: name, description, and instruction are required.", {})
         if evidence_type not in {"verified_success", "evidence_confirmed_failure"}:
             return ToolResult(
                 False,
                 "Skill rejected: evidence_type must be verified_success or evidence_confirmed_failure.",
                 {},
             )
-        if not isinstance(evidence, list) or not evidence:
-            return ToolResult(False, "Skill rejected: evidence list is required.", {})
+        if not isinstance(evidence_refs, list) or not evidence_refs:
+            return ToolResult(False, "Skill rejected: evidence_refs list is required.", {})
+        candidate = self._create_skill_candidate(
+            skill_id=skill_id,
+            description=description,
+            instruction=instruction,
+            examples=examples,
+            evidence_type=evidence_type,
+            evidence_refs=evidence_refs,
+            state=state,
+        )
+        candidate_path = self.state_dir / "skill_candidates" / f"{candidate['candidate_id']}.json"
+        self._write_json_atomic(candidate_path, candidate)
+        skill_dir = self.state_dir / "skills"
+        catalog = skill_catalog(skill_dir)
+        normalized_description = " ".join(description.lower().split())
+        duplicate = next(
+            (
+                item
+                for item in catalog
+                if self._safe_skill_id(item["name"]) == skill_id
+                or " ".join(item["description"].lower().split()) == normalized_description
+            ),
+            None,
+        )
+        if duplicate:
+            self._transition_skill_candidate(
+                candidate, "rejected_duplicate", {"duplicate": duplicate}
+            )
+            self._write_json_atomic(candidate_path, candidate)
+            return ToolResult(
+                False,
+                f"Skill rejected: duplicate of existing skill {duplicate['name']}.",
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_path": self._rel(candidate_path),
+                    "candidate_status": candidate["status"],
+                    "duplicate": duplicate,
+                },
+            )
         result = self.verifier.validate_skill_promotion(
             {
-                "skill_id": skill_id,
-                "title": title,
-                "body": body,
+                "name": skill_id,
+                "description": description,
+                "instruction": instruction,
                 "evidence_type": evidence_type,
-                "evidence": evidence,
+                "evidence_refs": evidence_refs,
             },
             state,
         )
         if not result.ok:
-            return result
-        skill_path = self.state_dir / "skills" / f"{skill_id}.md"
+            status = (
+                "rejected_missing_evidence"
+                if not result.data.get("checks", {}).get("all_evidence_refs_resolved", False)
+                else "rejected_invalid"
+            )
+            self._transition_skill_candidate(candidate, status, result.data)
+            self._write_json_atomic(candidate_path, candidate)
+            data = dict(result.data)
+            data.update(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_path": self._rel(candidate_path),
+                    "candidate_status": candidate["status"],
+                }
+            )
+            return ToolResult(False, result.summary, data)
+        self._transition_skill_candidate(candidate, "evidence_validated", result.data)
+        self._transition_skill_candidate(candidate, "content_validated", result.data.get("checks", {}))
+        self._transition_skill_candidate(candidate, "approved", {"decision": "create"})
+        self._write_json_atomic(candidate_path, candidate)
+        skill_path = skill_dir / f"{skill_id}.md"
         skill_path.parent.mkdir(parents=True, exist_ok=True)
-        skill_path.write_text(
-            f"# {title}\n\n"
-            f"Evidence type: {evidence_type}\n\n"
-            "## Evidence\n\n"
-            + "\n".join(f"- {item}" for item in evidence)
-            + "\n\n## Procedure\n\n"
-            + body
-            + "\n",
-            encoding="utf-8",
+        skill = SkillDocument(skill_id, description, instruction, examples)
+        temporary_skill_path = skill_path.with_suffix(".md.tmp")
+        temporary_skill_path.write_text(render_skill(skill), encoding="utf-8")
+        parsed = parse_skill(temporary_skill_path.read_text(encoding="utf-8"), fallback_name=skill_id)
+        if parsed.name != skill_id or not parsed.description or not parsed.instruction:
+            temporary_skill_path.unlink(missing_ok=True)
+            self._transition_skill_candidate(candidate, "rejected_invalid", {"atomic_validation": False})
+            self._write_json_atomic(candidate_path, candidate)
+            return ToolResult(
+                False,
+                "Skill promotion rejected: rendered Skill failed validation.",
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_path": self._rel(candidate_path),
+                    "candidate_status": candidate["status"],
+                },
+            )
+        temporary_skill_path.replace(skill_path)
+        self._transition_skill_candidate(
+            candidate,
+            "promoted",
+            {"path": self._rel(skill_path), "content_hash": skill.content_hash},
         )
-        return ToolResult(True, f"Skill promoted: {skill_id}.", {"path": str(skill_path.relative_to(self.root))})
+        self._write_json_atomic(candidate_path, candidate)
+        return ToolResult(
+            True,
+            f"Skill saved: {skill_id}.",
+            {
+                "name": skill_id,
+                "path": self._rel(skill_path),
+                "content_hash": skill.content_hash,
+                "evidence_type": evidence_type,
+                "evidence_refs": evidence_refs,
+                "candidate_id": candidate["candidate_id"],
+                "candidate_path": self._rel(candidate_path),
+                "candidate_status": candidate["status"],
+            },
+        )
+
+    def _create_skill_candidate(
+        self,
+        *,
+        skill_id: str,
+        description: str,
+        instruction: str,
+        examples: str,
+        evidence_type: str,
+        evidence_refs: list[Any],
+        state: TaskState,
+    ) -> dict[str, Any]:
+        candidate_id = self._next_skill_candidate_id()
+        now = utc_now()
+        return {
+            "candidate_id": candidate_id,
+            "status": "proposed",
+            "proposed_skill": {
+                "name": skill_id,
+                "description": description,
+                "instruction": instruction,
+                "examples": examples,
+            },
+            "source": {"task_id": self._active_task_id(state), "evidence_type": evidence_type},
+            "evidence_refs": evidence_refs,
+            "validation": {},
+            "status_history": [{"status": "proposed", "time": now}],
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _next_skill_candidate_id(self) -> str:
+        candidate_dir = self.state_dir / "skill_candidates"
+        highest = 0
+        if candidate_dir.exists():
+            for path in candidate_dir.glob("SC-*.json"):
+                match = re.fullmatch(r"SC-(\d+)", path.stem)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+        return f"SC-{highest + 1:04d}"
+
+    def _transition_skill_candidate(
+        self, candidate: dict[str, Any], status: str, validation: dict[str, Any]
+    ) -> None:
+        candidate["status"] = status
+        candidate["updated_at"] = utc_now()
+        candidate["validation"] = validation
+        candidate.setdefault("status_history", []).append({"status": status, "time": candidate["updated_at"]})
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(path)
 
     def _safe_skill_id(self, raw: str) -> str:
         cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw.strip().lower())
         return cleaned.strip("-_")
+
+    def _archive_verifier_success(self, task_id: str, result: ToolResult) -> dict[str, Any]:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        safe_task = self._safe_skill_id(task_id) or "task"
+        report_id = f"VR-{safe_task}-{stamp}"
+        path = self.state_dir / "verifier_reports" / f"{report_id}.json"
+        payload = {
+            "report_id": report_id,
+            "task_id": task_id,
+            "ok": True,
+            "summary": result.summary,
+            "checks": result.data.get("checks", {}),
+            "verification": result.data.get("verification", {}),
+            "trace_ref": {
+                "path": self._rel(self.trace_path),
+                "step": int(getattr(self, "_current_trace_step", 0) or 0),
+                "task_id": task_id,
+            },
+            "created_at": utc_now(),
+        }
+        self._write_json_atomic(path, payload)
+        return {"report_id": report_id, "archived_verifier_report": self._rel(path)}
 
     def _has_contract_for_active_task(self, state: TaskState) -> bool:
         active = self._active_task_id(state)
@@ -2013,6 +2507,11 @@ class AgentLoop:
             "handoff_ready": state.handoff_ready,
             "orchestrator_decision": state.orchestrator_decision,
             "nodes": state.nodes,
+            "skill_catalog_size": len(skill_catalog(self.state_dir / "skills")),
+            "loaded_skill_names": [
+                str(item.get("name")) for item in state.loaded_skills if isinstance(item, dict) and item.get("name")
+            ],
+            "pending_skill_review": state.pending_skill_review,
         }
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, indent=2) + "\n")
@@ -2048,6 +2547,7 @@ class AgentLoop:
             f"- rejected_initializer_candidate: {self._rel(self.initializer_candidate_path)}",
             "- task_graph_source: the original `--tasks-json` file is benchmark input and should remain read-only",
             f"- latest_verifier_report: {self._rel(self.state_dir / 'verifier_report.md')}",
+            f"- immutable_verifier_reports: {self._rel(self.state_dir / 'verifier_reports')}/",
             f"- hard_memory: {self._rel(self.state_dir / 'hard_memory.md')}",
             f"- soft_memory: {self._rel(self.state_dir / 'soft_memory.md')}",
             f"- traces: {self._rel(self.trace_dir)}/",
@@ -2079,6 +2579,9 @@ class AgentLoop:
             "",
             "## 10b. Initializer Repair",
             *self._format_initializer_repair(state),
+            "",
+            "## 10c. Pending Skill Reflection",
+            json.dumps(state.pending_skill_review, ensure_ascii=False) if state.pending_skill_review else "none",
             "",
             "## 11. Verification Status",
             f"- last_verified_at: {state.last_verified_at}",
@@ -2138,6 +2641,10 @@ class AgentLoop:
             "evidence_sources": evidence,
             "pending_repair": state.pending_repair,
             "initializer_repair": state.initializer_repair,
+            "pending_skill_review": state.pending_skill_review,
+            "skill_review_history": state.skill_review_history[-20:],
+            "task_session_ids": state.task_session_ids,
+            "error_patterns": state.error_patterns,
             "last_action": state.last_action,
             "last_observation": state.last_observation,
             "last_verified_at": state.last_verified_at,
@@ -2263,6 +2770,8 @@ class AgentLoop:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "skills").mkdir(exist_ok=True)
+        (self.state_dir / "skill_candidates").mkdir(exist_ok=True)
+        (self.state_dir / "verifier_reports").mkdir(exist_ok=True)
         if not self.memory_path.exists():
             self.memory_path.write_text("# Memory Index\n\nSee hard_memory.md and soft_memory.md.\n", encoding="utf-8")
         hard_memory = self.state_dir / "hard_memory.md"
@@ -2273,7 +2782,14 @@ class AgentLoop:
             soft_memory.write_text("# Soft Memory\n\n## Entries\n\n", encoding="utf-8")
         if not (self.state_dir / "skills" / "coding.md").exists():
             (self.state_dir / "skills" / "coding.md").write_text(
-                "# Coding Skill\n\n- Inspect files before editing.\n- Prefer small verifiable steps.\n- Run syntax checks before finishing.\n",
+                "---\n"
+                "name: coding\n"
+                "description: Apply the standard evidence-driven workflow for coding tasks.\n"
+                "---\n\n"
+                "# Instructions\n\n"
+                "1. Inspect files before editing.\n"
+                "2. Prefer small verifiable steps.\n"
+                "3. Run syntax checks before finishing.\n",
                 encoding="utf-8",
             )
 

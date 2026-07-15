@@ -631,6 +631,75 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(observation.data["initializer_restricted"])
         self.assertFalse(workspace_exists)
 
+    def test_initializer_cannot_inspect_hidden_acceptance(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            benchmark_dir = root / "eval" / "benchmarks" / "todo_counter"
+            spec = benchmark_dir / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text("# Todo Counter\n", encoding="utf-8")
+            (benchmark_dir / "hidden_acceptance.py").write_text(
+                "PRIVATE_NEEDLE = 'verifier-only'\n",
+                encoding="utf-8",
+            )
+            (benchmark_dir / "public_notes.md").write_text(
+                "PRIVATE_NEEDLE documents the public requirement.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+
+            explicit_search = loop._execute_action(
+                {"action": "search", "target": "hidden_acceptance", "args": {"path": "."}},
+                state,
+            )
+            direct_read = loop._execute_action(
+                {
+                    "action": "read",
+                    "target": "eval/benchmarks/todo_counter/hidden_acceptance.py",
+                    "args": {},
+                },
+                state,
+            )
+            broad_search = loop._execute_action(
+                {
+                    "action": "search",
+                    "target": "PRIVATE_NEEDLE",
+                    "args": {"path": "eval/benchmarks/todo_counter"},
+                },
+                state,
+            )
+            recursive_listing = loop._execute_action(
+                {
+                    "action": "list_files",
+                    "target": "eval/benchmarks/todo_counter",
+                    "args": {"recursive": True},
+                },
+                state,
+            )
+
+        self.assertFalse(explicit_search.ok)
+        self.assertTrue(explicit_search.data["private_acceptance_protected"])
+        self.assertFalse(direct_read.ok)
+        self.assertTrue(direct_read.data["private_acceptance_protected"])
+        self.assertTrue(broad_search.ok)
+        self.assertEqual(
+            [match["path"] for match in broad_search.data["matches"]],
+            ["eval\\benchmarks\\todo_counter\\public_notes.md"],
+        )
+        self.assertTrue(recursive_listing.ok)
+        self.assertFalse(
+            any("hidden_acceptance" in item["path"] for item in recursive_listing.data["entries"])
+        )
+
     def test_initializer_rejects_task_graph_outside_spec_workspace(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1118,6 +1187,18 @@ class HarnessBehaviorTests(unittest.TestCase):
             (root / "state" / "traces").mkdir()
             loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
             state = create_initial_state("Implement a feature")
+            trace = root / "state" / "traces" / "run_test.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "step": 1,
+                        "task_id": "current",
+                        "action": {"action": "verify"},
+                        "observation": {"ok": False, "summary": "Verifier failed.", "data": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             observation = loop._execute_action(
                 {
@@ -1841,13 +1922,19 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "title": "Random thought",
                         "body": "Maybe do this next time.",
                         "evidence_type": "verified_success",
-                        "evidence": ["I think it worked"],
+                        "evidence_refs": [
+                            {"type": "trace", "path": "state/traces/missing.jsonl", "step": 1}
+                        ],
                     },
                 },
                 state,
             )
+            candidate = json.loads(
+                (root / "state" / "skill_candidates" / "SC-0001.json").read_text(encoding="utf-8")
+            )
 
         self.assertFalse(observation.ok)
+        self.assertEqual(candidate["status"], "rejected_missing_evidence")
 
     def test_skill_accepts_verifier_confirmed_success(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1856,7 +1943,18 @@ class HarnessBehaviorTests(unittest.TestCase):
             (root / "state" / "traces").mkdir()
             loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
             state = create_initial_state("Implement a feature")
-            state.last_observation = {"ok": True, "summary": "Verifier passed.", "data": {}}
+            trace = root / "state" / "traces" / "run_test.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "step": 1,
+                        "task_id": "current",
+                        "action": {"action": "verify"},
+                        "observation": {"ok": True, "summary": "Verifier passed.", "data": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             observation = loop._execute_action(
                 {
@@ -1867,16 +1965,27 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "title": "Verified debugging",
                         "body": "Run tests before claiming completion.",
                         "evidence_type": "verified_success",
-                        "evidence": ["verifier_report: Verifier passed"],
+                        "evidence_refs": [
+                            {"type": "trace", "path": "state/traces/run_test.jsonl", "step": 1}
+                        ],
                     },
                 },
                 state,
             )
             skill_path = root / "state" / "skills" / "verified-debugging.md"
             skill_exists = skill_path.exists()
+            candidate = json.loads(
+                (root / "state" / "skill_candidates" / "SC-0001.json").read_text(encoding="utf-8")
+            )
 
         self.assertTrue(observation.ok)
         self.assertTrue(skill_exists)
+        self.assertFalse((root / "state" / "skills" / "verified-debugging.md.tmp").exists())
+        self.assertEqual(candidate["status"], "promoted")
+        self.assertEqual(
+            [item["status"] for item in candidate["status_history"]],
+            ["proposed", "evidence_validated", "content_validated", "approved", "promoted"],
+        )
 
     def test_skill_accepts_evidence_confirmed_failure(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1885,6 +1994,18 @@ class HarnessBehaviorTests(unittest.TestCase):
             (root / "state" / "traces").mkdir()
             loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
             state = create_initial_state("Implement a feature")
+            trace = root / "state" / "traces" / "run_test.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "step": 2,
+                        "task_id": "current",
+                        "action": {"action": "contract"},
+                        "observation": {"ok": False, "summary": "Contract rejected.", "data": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             observation = loop._execute_action(
                 {
@@ -1895,13 +2016,261 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "title": "Avoid weak contracts",
                         "body": "Do not use file existence as the only acceptance check.",
                         "evidence_type": "evidence_confirmed_failure",
-                        "evidence": ["trace: contract rejected because behavior_level_checks failed"],
+                        "evidence_refs": [
+                            {"type": "trace", "path": "state/traces/run_test.jsonl", "step": 2}
+                        ],
                     },
                 },
                 state,
             )
 
         self.assertTrue(observation.ok)
+
+    def test_save_skill_accepts_real_verifier_report_reference(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            report = {
+                "time": "2026-07-15T00:00:00+00:00",
+                "ok": True,
+                "summary": "Verifier passed.",
+                "data": {"task_id": "current"},
+            }
+            (root / "state" / "verifier_report.md").write_text(
+                "# Latest Verifier Report\n\n```json\n" + json.dumps(report) + "\n```\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+            observation = loop._execute_action(
+                {
+                    "action": "save_skill",
+                    "target": "verify-before-finish",
+                    "args": {
+                        "name": "verify-before-finish",
+                        "description": "Require independent verification before finishing a coding task.",
+                        "instruction": "Run the mapped verification command before finish.",
+                        "evidence_type": "verified_success",
+                        "evidence_refs": [{"type": "verifier_report", "task_id": "current"}],
+                    },
+                },
+                state,
+            )
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(observation.data["candidate_status"], "promoted")
+
+    def test_skill_catalog_injects_metadata_only(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "state" / "skills"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "locate-error.md").write_text(
+                "---\nname: locate-error\n"
+                "description: Locate repeated errors in long logs.\n"
+                "---\n\n# Instructions\n\nSECRET FULL PROCEDURE\n",
+                encoding="utf-8",
+            )
+            context = ContextBuilder(root).build(create_initial_state("Debug tests"))
+
+        self.assertIn("locate-error: Locate repeated errors in long logs.", context)
+        self.assertNotIn("SECRET FULL PROCEDURE", context)
+
+    def test_skill_reflection_does_not_trigger_after_ordinary_verifier_pass(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Implement feature", max_steps=1)
+            state = create_initial_state("Implement feature")
+            state.task_session_ids["T1"] = ["run-1", "run-2"]
+            observation = ToolResult(
+                True,
+                "Verifier passed.",
+                {"report_id": "VR-T1-test", "archived_verifier_report": "state/verifier_reports/VR-T1-test.json"},
+            )
+            loop._maybe_create_pending_skill_review(state, "T1", observation)
+
+        self.assertFalse(state.pending_skill_review)
+
+    def test_skill_reflection_triggers_only_after_more_than_five_sessions(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Implement feature", max_steps=1)
+            state = create_initial_state("Implement feature")
+            observation = ToolResult(
+                True,
+                "Verifier passed.",
+                {"report_id": "VR-T1-test", "archived_verifier_report": "state/verifier_reports/VR-T1-test.json"},
+            )
+            state.task_session_ids["T1"] = [f"run-{index}" for index in range(5)]
+            loop._maybe_create_pending_skill_review(state, "T1", observation)
+            at_five = dict(state.pending_skill_review)
+            state.task_session_ids["T1"].append("run-5")
+            loop._maybe_create_pending_skill_review(state, "T1", observation)
+
+        self.assertFalse(at_five)
+        self.assertEqual(state.pending_skill_review["trigger_reasons"][0]["type"], "high_cost_success")
+        self.assertEqual(state.pending_skill_review["trigger_reasons"][0]["session_count"], 6)
+
+    def test_skill_reflection_triggers_after_three_matching_errors_are_resolved(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Implement feature", max_steps=1)
+            state = create_initial_state("Implement feature")
+            fingerprint = "execution_error:ModuleNotFoundError"
+            state.error_patterns[fingerprint] = {
+                "count": 3,
+                "failure_type": "execution_error",
+                "task_ids": ["T1"],
+            }
+            state.task_error_fingerprints["T1"] = [fingerprint]
+            observation = ToolResult(
+                True,
+                "Verifier passed.",
+                {"report_id": "VR-T1-test", "archived_verifier_report": "state/verifier_reports/VR-T1-test.json"},
+            )
+            loop._maybe_create_pending_skill_review(state, "T1", observation)
+            context = ContextBuilder(root).build(state)
+
+        reason = state.pending_skill_review["trigger_reasons"][0]
+        self.assertEqual(reason["type"], "repeated_error_resolved")
+        self.assertEqual(reason["patterns"][0]["count"], 3)
+        self.assertIn("# Pending Skill Reflection", context)
+        self.assertIn("save_skill or dismiss_skill", context)
+
+    def test_pending_skill_reflection_blocks_work_until_dismissed(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Implement feature", max_steps=1)
+            state = create_initial_state("Implement feature")
+            state.pending_skill_review = {"task_id": "T1", "report_id": "VR-T1-test"}
+            blocked = loop._execute_action({"action": "read", "target": "README.md", "args": {}}, state)
+            action = {
+                "action": "dismiss_skill",
+                "target": "VR-T1-test",
+                "args": {"reason": "The change was task-specific and not reusable."},
+            }
+            dismissed = loop._execute_action(action, state)
+            loop._update_state(state, action, dismissed)
+
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.data["required_action"], "save_skill_or_dismiss_skill")
+        self.assertTrue(dismissed.ok)
+        self.assertFalse(state.pending_skill_review)
+        self.assertEqual(state.skill_review_history[-1]["decision"], "dismissed")
+
+    def test_immutable_verifier_report_resolves_by_report_id(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Implement feature", max_steps=1)
+            loop._current_trace_step = 7
+            archived = loop._archive_verifier_success(
+                "T1", ToolResult(True, "Verifier passed.", {"checks": {"unit_tests": True}})
+            )
+            state = create_initial_state("Implement feature")
+            result = loop.verifier.validate_skill_promotion(
+                {
+                    "name": "verified-procedure",
+                    "description": "Reuse a verified procedure.",
+                    "instruction": "Execute the procedure and independently verify it.",
+                    "evidence_type": "verified_success",
+                    "evidence_refs": [
+                        {"type": "verifier_report", "report_id": archived["report_id"], "task_id": "T1"}
+                    ],
+                },
+                state,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["resolved_evidence"][0]["report_id"], archived["report_id"])
+
+    def test_load_skill_returns_full_content_and_tracks_pending_validation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            skill_dir = root / "state" / "skills"
+            skill_dir.mkdir()
+            (skill_dir / "locate-error.md").write_text(
+                "---\nname: locate-error\n"
+                "description: Locate repeated errors in long logs.\n"
+                "---\n\n# Instructions\n\nSearch the traceback.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            state = create_initial_state("Debug tests")
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "locate-error", "args": {}}, state
+            )
+            duplicate = loop._execute_action(
+                {"action": "load_skill", "target": "locate-error", "args": {}}, state
+            )
+            loaded_context = ContextBuilder(root).build(state)
+            (skill_dir / "locate-error.md").write_text(
+                "---\nname: locate-error\n"
+                "description: Locate repeated errors in long logs.\n"
+                "---\n\n# Instructions\n\nChanged procedure.\n",
+                encoding="utf-8",
+            )
+            invalidated_context = ContextBuilder(root).build(state)
+
+        self.assertTrue(observation.ok)
+        self.assertIn("Search the traceback.", observation.data["content"])
+        self.assertEqual(state.loaded_skills[0]["status"], "loaded")
+        self.assertEqual(len(observation.data["content_hash"]), 64)
+        self.assertTrue(duplicate.ok)
+        self.assertTrue(duplicate.data["already_loaded"])
+        self.assertEqual(len(state.loaded_skills), 1)
+        self.assertIn("# Loaded Skills", loaded_context)
+        self.assertIn("Search the traceback.", loaded_context)
+        self.assertNotIn("Search the traceback.", invalidated_context)
+        self.assertIn("Invalidated Skills (reload before use): locate-error", invalidated_context)
+
+    def test_save_skill_writes_yaml_structure_and_rejects_duplicate(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "traces").mkdir(parents=True)
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            state = create_initial_state("Debug tests")
+            trace = root / "state" / "traces" / "run_test.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "step": 3,
+                        "task_id": "current",
+                        "action": {"action": "verify"},
+                        "observation": {"ok": True, "summary": "Verifier passed.", "data": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            action = {
+                "action": "save_skill",
+                "target": "locate-errors",
+                "args": {
+                    "name": "locate-errors",
+                    "description": "Locate repeated errors in long logs.",
+                    "instruction": ["Run the failing command", "Inspect the final workspace frame"],
+                    "examples": [{"input": "Traceback", "result": "Relevant source frame"}],
+                    "evidence_type": "verified_success",
+                    "evidence_refs": [
+                        {"type": "trace", "path": "state/traces/run_test.jsonl", "step": 3}
+                    ],
+                },
+            }
+            first = loop._execute_action(action, state)
+            second = loop._execute_action(action, state)
+            content = (root / "state" / "skills" / "locate-errors.md").read_text(encoding="utf-8")
+
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertTrue(content.startswith('---\nname: "locate-errors"\n'))
+        self.assertIn("# Instructions", content)
+        self.assertIn("# Examples", content)
+        self.assertNotIn("run_test.jsonl", content)
 
     def test_handoff_ready_blocks_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2104,8 +2473,8 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn('"action":"<one action>"', context)
         self.assertIn("- list_files: inspect a directory or file entry", context)
         self.assertIn("- search: grep-style literal text search", context)
-        self.assertIn("Use this before read when locating T7, hidden_acceptance", context)
-        self.assertIn("search target='hidden_acceptance'", context)
+        self.assertIn("Use this before read when locating T7, validation errors", context)
+        self.assertIn("hidden_acceptance is private verifier input", context)
         self.assertIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
         self.assertIn("- write: create/overwrite/append file", context)
         self.assertIn("- verify: ask harness verifier", context)
@@ -2919,6 +3288,50 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(summary["max_session_used_tokens"], 30)
         self.assertEqual(summary["completed_tasks"], 1)
         self.assertEqual(summary["blocked_tasks"], 1)
+
+    def test_metrics_reports_skill_loading_and_validation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            trace = Path(tmp) / "run.jsonl"
+            events = [
+                {
+                    "action": {"action": "load_skill"},
+                    "observation": {"ok": True, "summary": "Skill loaded.", "data": {}},
+                    "skill_catalog_size": 3,
+                    "nodes": [],
+                },
+                {
+                    "action": {"action": "load_skill"},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Skill already loaded.",
+                        "data": {"already_loaded": True},
+                    },
+                    "skill_catalog_size": 3,
+                    "nodes": [],
+                },
+                {
+                    "action": {"action": "verify"},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Verifier passed.",
+                        "data": {
+                            "skill_validation": [
+                                {"name": "locate-error", "status": "verified_pass", "tool_calls_since_load": 2}
+                            ]
+                        },
+                    },
+                    "skill_catalog_size": 3,
+                    "nodes": [],
+                },
+            ]
+            trace.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+            summary = summarize(trace)
+
+        self.assertEqual(summary["skill_metadata_impressions"], 9)
+        self.assertEqual(summary["skill_loads"], 2)
+        self.assertEqual(summary["duplicate_skill_loads_avoided"], 1)
+        self.assertEqual(summary["skill_validation_passes"], 1)
+        self.assertEqual(summary["average_tool_calls_from_skill_load_to_validation"], 2)
 
 
 if __name__ == "__main__":

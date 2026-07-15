@@ -348,36 +348,161 @@ class Verifier:
         return checks
 
     def validate_skill_promotion(self, proposal: dict[str, Any], state: TaskState) -> ToolResult:
-        evidence = proposal.get("evidence", [])
-        evidence_text = "\n".join(str(item).lower() for item in evidence)
+        evidence_refs = proposal.get("evidence_refs", [])
         evidence_type = proposal.get("evidence_type")
         checks = []
-        checks.append(("has_skill_id", bool(str(proposal.get("skill_id", "")).strip())))
-        checks.append(("has_title", bool(str(proposal.get("title", "")).strip())))
-        checks.append(("has_body", bool(str(proposal.get("body", "")).strip())))
-        checks.append(("has_skill_evidence", bool(evidence) and isinstance(evidence, list)))
-        if evidence_type == "verified_success":
-            checks.append(
-                (
-                    "verifier_confirmed_success",
-                    state.last_observation.get("ok") is True
-                    and "verifier passed" in str(state.last_observation.get("summary", "")).lower(),
-                )
-            )
-        elif evidence_type == "evidence_confirmed_failure":
-            checks.append(
-                (
-                    "evidence_confirmed_failure",
-                    any(marker in evidence_text for marker in ["failed", "failure", "error", "rejected", "trace:"]),
-                )
-            )
-        else:
-            checks.append(("valid_evidence_type", False))
+        checks.append(("has_name", bool(str(proposal.get("name", proposal.get("skill_id", ""))).strip())))
+        checks.append(("has_description", bool(str(proposal.get("description", proposal.get("title", ""))).strip())))
+        checks.append(("has_instruction", bool(str(proposal.get("instruction", proposal.get("body", ""))).strip())))
+        checks.append(("has_evidence_refs", bool(evidence_refs) and isinstance(evidence_refs, list)))
+        evidence_checks, resolved_evidence = self._validate_skill_evidence_refs(
+            evidence_refs if isinstance(evidence_refs, list) else [], evidence_type, state
+        )
+        checks.extend(evidence_checks)
+        checks.append(("valid_evidence_type", evidence_type in {"verified_success", "evidence_confirmed_failure"}))
         ok = all(value for _, value in checks)
         summary = "Skill promotion accepted." if ok else "Skill promotion rejected."
-        result = ToolResult(ok, summary, {"checks": dict(checks), "proposal": proposal})
+        result = ToolResult(
+            ok,
+            summary,
+            {"checks": dict(checks), "proposal": proposal, "resolved_evidence": resolved_evidence},
+        )
         self._write_report(result)
         return result
+
+    def _validate_skill_evidence_refs(
+        self,
+        refs: list[Any],
+        evidence_type: object,
+        state: TaskState,
+    ) -> tuple[list[tuple[str, bool]], list[dict[str, Any]]]:
+        resolved: list[dict[str, Any]] = []
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_type = str(ref.get("type", ""))
+            evidence = None
+            if ref_type == "verifier_report":
+                evidence = self._resolve_verifier_report_ref(ref, state)
+            elif ref_type == "trace":
+                evidence = self._resolve_trace_ref(ref, state)
+            if evidence:
+                resolved.append(evidence)
+        if evidence_type == "verified_success":
+            matching = any(
+                item.get("ok") is True
+                and (item.get("type") == "verifier_report" or item.get("action") == "verify")
+                for item in resolved
+            )
+        else:
+            matching = any(item.get("ok") is False for item in resolved)
+        return [
+            ("all_evidence_refs_resolved", bool(refs) and len(resolved) == len(refs)),
+            ("evidence_matches_type", matching),
+        ], resolved
+
+    def _resolve_verifier_report_ref(self, ref: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        report_id = str(ref.get("report_id", "")).strip()
+        if report_id:
+            if not all(ch.isalnum() or ch in {"-", "_"} for ch in report_id):
+                return None
+            path = self.state_dir / "verifier_reports" / f"{report_id}.json"
+            if not path.is_file():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict) or payload.get("report_id") != report_id:
+                return None
+            actual_task = str(payload.get("task_id", ""))
+            expected_task = str(ref.get("task_id", actual_task))
+            if not actual_task or expected_task != actual_task:
+                return None
+            return {
+                "type": "verifier_report",
+                "report_id": report_id,
+                "path": str(path.relative_to(self.root)).replace("\\", "/"),
+                "task_id": actual_task,
+                "ok": payload.get("ok") is True,
+            }
+        path = self.state_dir / "verifier_report.md"
+        if not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8")
+        start = text.find("```json")
+        if start == -1:
+            return None
+        start = text.find("\n", start)
+        end = text.find("```", start + 1)
+        if start == -1 or end == -1:
+            return None
+        try:
+            payload = json.loads(text[start:end].strip())
+        except json.JSONDecodeError:
+            return None
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        actual_task = str(data.get("task_id", state.task_id)) if isinstance(data, dict) else state.task_id
+        expected_task = str(ref.get("task_id", actual_task))
+        if expected_task != actual_task:
+            return None
+        return {
+            "type": "verifier_report",
+            "path": str(path.relative_to(self.root)).replace("\\", "/"),
+            "task_id": actual_task,
+            "ok": payload.get("ok") is True,
+        }
+
+    def _resolve_trace_ref(self, ref: dict[str, Any], state: TaskState) -> dict[str, Any] | None:
+        raw_path = str(ref.get("path", "")).strip()
+        if not raw_path:
+            return None
+        path = (self.root / raw_path).resolve()
+        trace_dir = (self.state_dir / "traces").resolve()
+        if trace_dir not in path.parents or not path.is_file():
+            return None
+        step = ref.get("step", ref.get("trace_step"))
+        try:
+            expected_step = int(step)
+        except (TypeError, ValueError):
+            return None
+        for event in self._load_json_stream(path):
+            if int(event.get("step", -1)) != expected_step:
+                continue
+            event_task = str(event.get("task_id", state.task_id))
+            expected_task = str(ref.get("task_id", event_task))
+            if expected_task != event_task:
+                return None
+            observation = event.get("observation", {})
+            if not isinstance(observation, dict):
+                return None
+            return {
+                "type": "trace",
+                "path": str(path.relative_to(self.root)).replace("\\", "/"),
+                "step": expected_step,
+                "task_id": event_task,
+                "action": str(event.get("action", {}).get("action", "")) if isinstance(event.get("action"), dict) else "",
+                "ok": observation.get("ok") is True,
+            }
+        return None
+
+    def _load_json_stream(self, path: Path) -> list[dict[str, Any]]:
+        text = path.read_text(encoding="utf-8").strip()
+        events: list[dict[str, Any]] = []
+        decoder = json.JSONDecoder()
+        index = 0
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                break
+            try:
+                event, index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(event, dict):
+                events.append(event)
+        return events
 
     def record_result(self, result: ToolResult) -> None:
         self._write_report(result)
