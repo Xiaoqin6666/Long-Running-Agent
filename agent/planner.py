@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-DEFAULT_SESSION_BUDGET_TOKENS = 64000
+DEFAULT_SESSION_BUDGET_TOKENS = 100000
 DEFAULT_HANDOFF_THRESHOLD = 0.75
 
 GENERATED_TASK_REQUIRED_FIELDS = {
@@ -522,6 +522,9 @@ def verification_command_portability_error(command: str) -> str | None:
     lower = normalized.lower().replace("\\", "/")
     if not re.match(r"^(python(?:\.exe|3)?|py)\s+(?:-c|-m)\b", lower):
         return "use a direct Python command instead of shell-specific setup or pipelines"
+    nested_cwd_error = _nested_python_cwd_error(normalized)
+    if nested_cwd_error:
+        return nested_cwd_error
     unix_markers = (
         "/tmp/",
         "echo -e ",
@@ -534,6 +537,79 @@ def verification_command_portability_error(command: str) -> str | None:
     if marker:
         return f"contains Unix-specific construct {marker.strip()!r}"
     return None
+
+
+def _nested_python_cwd_error(command: str) -> str | None:
+    for code in _python_c_snippets(command):
+        chdir_paths = _literal_call_paths(code, "os", "chdir")
+        cwd_paths = _literal_keyword_paths(code, "cwd")
+        for chdir_path in chdir_paths:
+            for cwd_path in cwd_paths:
+                if _paths_conflict_after_chdir(chdir_path, cwd_path):
+                    return (
+                        "mixes os.chdir() with a relative subprocess cwd for the same workspace; "
+                        "use verification_procedure.working_directory or one cwd mechanism"
+                    )
+    return None
+
+
+def _literal_call_paths(code: str, module: str, function: str) -> list[str]:
+    paths: list[str] = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return paths
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == function
+            and isinstance(func.value, ast.Name)
+            and func.value.id == module
+        ):
+            continue
+        if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            paths.append(node.args[0].value)
+    return paths
+
+
+def _literal_keyword_paths(code: str, keyword_name: str) -> list[str]:
+    paths: list[str] = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return paths
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != keyword_name:
+                continue
+            value = keyword.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                paths.append(value.value)
+    return paths
+
+
+def _paths_conflict_after_chdir(chdir_path: str, cwd_path: str) -> bool:
+    chdir_normalized = _relative_path_for_cwd_check(chdir_path)
+    cwd_normalized = _relative_path_for_cwd_check(cwd_path)
+    if not chdir_normalized or not cwd_normalized:
+        return False
+    if chdir_normalized == cwd_normalized:
+        return True
+    return cwd_normalized.startswith(f"{chdir_normalized}/")
+
+
+def _relative_path_for_cwd_check(path: str) -> str:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("/"):
+        return ""
+    return normalized
 
 
 def _python_c_syntax_errors(label: str, command: str) -> list[str]:

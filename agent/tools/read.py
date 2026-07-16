@@ -6,7 +6,7 @@ from agent.tools.base import WorkspaceTool
 
 
 class ReadTool(WorkspaceTool):
-    DEFAULT_RANGE_LINES = 200
+    DEFAULT_RANGE_LINES = 50
     DEFAULT_MATCH_CONTEXT = 20
     DEFAULT_MATCH_LINES = 120
     MAX_LINES = 400

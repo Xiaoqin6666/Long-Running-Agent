@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import call, patch
+from uuid import uuid4
 
 from agent.chat import ChatConfig, ChatMessage, InteractiveCLI, launch_chat_window
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from agent.main import build_parser, resolve_optional_task
 from agent.planner import TaskState, create_initial_state
+from agent.skills import parse_skill
 from agent.tools import ToolResult
 
 
@@ -21,6 +24,10 @@ class ChatCLITests(unittest.TestCase):
     def test_parser_accepts_inline_chat(self) -> None:
         args = build_parser().parse_args(["--chat", "--chat-inline"])
         self.assertTrue(args.chat_inline)
+
+    def test_chat_project_spec_is_not_initial_message(self) -> None:
+        args = build_parser().parse_args(["--chat", "--project-spec", "eval/benchmarks/budget_management/task.md"])
+        self.assertIsNone(resolve_optional_task(args))
 
     def test_explicit_ask_and_do_commands_select_mode(self) -> None:
         outputs: list[str] = []
@@ -51,6 +58,46 @@ class ChatCLITests(unittest.TestCase):
         )
         self.assertEqual(cli.run(), 0)
         self.assertIn("Choose an explicit mode: /ask <question> or /do <task>.", outputs)
+
+    def test_skill_command_collects_guided_fields(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["debug-failures", "Diagnose repeat failures", "Inspect the first traceback", "Use on failing tests"])
+        root = Path.cwd() / ".tmp_tests" / f"chat-skill-{uuid4().hex}"
+        root.mkdir(parents=True)
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        try:
+            with patch.object(cli, "_run_turn") as run_turn:
+                cli._handle_command("/skill")
+            run_turn.assert_not_called()
+            skill_path = root / "state" / "skills" / "debug-failures.md"
+            skill = parse_skill(skill_path.read_text(encoding="utf-8"))
+            self.assertEqual(skill.name, "debug-failures")
+            self.assertEqual(skill.description, "Diagnose repeat failures")
+            self.assertEqual(skill.instruction, "Inspect the first traceback")
+            self.assertEqual(skill.examples, "Use on failing tests")
+            self.assertTrue(any("Skill saved:" in output for output in outputs))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_skill_command_requires_fields_and_can_cancel(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["", "/cancel"])
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        with patch.object(cli, "_run_turn") as run_turn:
+            cli._handle_command("/skill")
+        run_turn.assert_not_called()
+        self.assertIn("Name is required.", outputs)
+        self.assertIn("Skill setup cancelled.", outputs)
 
     def test_context_keeps_active_task_and_conversation_separate(self) -> None:
         state = create_initial_state("Fix it and run the focused test")
@@ -149,6 +196,7 @@ class ChatCLITests(unittest.TestCase):
             state,
         )
         self.assertTrue(observation.ok)
+
 
     @patch("agent.chat.os.name", "nt")
     @patch("agent.chat.subprocess.Popen")

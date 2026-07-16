@@ -1,8 +1,8 @@
 # Long-Running Agent
 
-This repository is for a training-free long-running coding agent system.这个存储库用于一个不需要训练的长时间运行的编码代理系统。
+This repository is for a training-free long-running coding agent system.
 
-The current design focuses on a minimal but research-friendly agent harness:目前的设计重点是一个最小但研究友好的代理线束：
+The current design focuses on a minimal but research-friendly agent harness.
 
 - explicit task state management;
 - bounded context construction and handoff;
@@ -26,7 +26,7 @@ See [docs/evaluation_runbook.md](docs/evaluation_runbook.md) for the long-runnin
 
 The tracked repository-root `init.sh` bootstraps the Long-Running Agent harness. An autonomous benchmark INIT generates a separate run-local script at `state/benchmarks/<benchmark_id>/init.sh`; generated application code and public tests belong under `eval/benchmarks/<benchmark_id>/workspace/`.
 
-Run the deterministic offline loop:运行确定性脱机循环：
+Run the deterministic offline loop:
 
 ```powershell
 python -m agent.main "Smoke test the minimal long-running agent" --max-steps 5
@@ -46,15 +46,15 @@ You can also provide the first message directly:
 python -m agent.main "Inspect the current failure" --chat --provider openai-compatible
 ```
 
-Use `/ask <question>` for read-only questions and `/do <task>` for project work. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+Use `/ask <question>` for read-only questions, `/do <task>` for project work, and `/skill` to directly add a trusted user-authored Skill. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
 
-Summarize a trace:   总结一个踪迹：
+Summarize a trace:
 
 ```powershell
 python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl --tasks state\benchmarks\issue_tracker\runtime_tasks.json
 ```
 
-Run behavior tests:   运行行为测试：
+Run behavior tests:
 
 ```powershell
 python -m unittest discover -s tests
@@ -68,11 +68,11 @@ python eval\manual_evaluators\issue_tracker\evaluate.py
 
 The Agent Harness never invokes this script. Its result does not gate `finish` and cannot create repair tasks.
 
-The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.离线提供程序故意很简单。它在不需要API密钥的情况下执行线束循环，因此可以首先测试状态管理、工具执行、验证器门控和跟踪写入。
+The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.
 
 ## API Provider
 
-The real model provider uses an OpenAI-compatible chat completions API. Configure it with environment variables:真正的模型提供者使用与openai兼容的聊天完成API。用环境变量配置它：
+The real model provider uses an OpenAI-compatible chat completions API. Configure it with environment variables:
 
 ```powershell
 $env:LONG_AGENT_API_KEY="your_api_key"

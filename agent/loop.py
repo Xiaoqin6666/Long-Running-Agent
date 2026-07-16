@@ -507,6 +507,10 @@ class AgentLoop:
             if self._is_initializer_task(state):
                 return ToolResult(False, "Skill promotion is disabled during INIT.", {"initializer_restricted": True})
             return self._handle_save_skill_action(action, state)
+        if name == "bash":
+            repeated_bash = self._reject_repeated_failed_bash(action, state)
+            if repeated_bash is not None:
+                return repeated_bash
         if name in {"edit", "write"} and state.handoff_ready:
             return ToolResult(
                 False,
@@ -592,6 +596,35 @@ class AgentLoop:
                 return post_write_check
         return result
 
+    def _reject_repeated_failed_bash(self, action: dict[str, Any], state: TaskState) -> ToolResult | None:
+        last_action = state.last_action if isinstance(state.last_action, dict) else {}
+        last_observation = state.last_observation if isinstance(state.last_observation, dict) else {}
+        if last_action.get("action") != "bash" or last_observation.get("ok") is not False:
+            return None
+        command = self._bash_command_from_action(action)
+        last_command = self._bash_command_from_action(last_action)
+        if not command or self._normalize_command(command) != self._normalize_command(last_command):
+            return None
+        return ToolResult(
+            False,
+            (
+                "Repeated bash rejected: the same command just failed. "
+                "Use the existing failure output to repair the implementation or update the verification procedure; "
+                "do not rerun it unchanged to look for a fuller traceback."
+            ),
+            {
+                "command": command,
+                "required_action": "repair_or_update_verification",
+                "counts_as_progress": False,
+            },
+        )
+
+    def _bash_command_from_action(self, action: dict[str, Any]) -> str:
+        args = action.get("args", {})
+        if isinstance(args, dict) and args.get("command"):
+            return str(args.get("command", ""))
+        return str(action.get("target", ""))
+
     def _pending_repair_command_failure_type(self, state: TaskState) -> str | None:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         recorded = str(repair.get("command_failure_type", ""))
@@ -611,9 +644,19 @@ class AgentLoop:
     ) -> str | None:
         if "SyntaxError:" in output and "invalid syntax" in output:
             return "command_syntax_error"
+        if self._looks_like_cwd_environment_failure(output, command):
+            return "command_environment_error"
         if state and self._command_has_unconfigured_workspace_module(command, state):
             return "command_environment_error"
         return None
+
+    def _looks_like_cwd_environment_failure(self, output: str, command: str) -> bool:
+        if not command:
+            return False
+        combined = f"{output}\n{command}".replace("\\", "/")
+        if not any(marker in combined for marker in ("NotADirectoryError", "WinError 267")):
+            return False
+        return "cwd=" in combined or "os.chdir(" in combined or "subprocess.run" in combined
 
     def _suggest_corrected_command(self, command: str, failure_type: str, state: TaskState) -> str:
         if failure_type == "command_environment_error":
@@ -2243,6 +2286,7 @@ class AgentLoop:
             evidence_refs=evidence_refs,
             state=state,
         )
+
         candidate_path = self.state_dir / "skill_candidates" / f"{candidate['candidate_id']}.json"
         self._write_json_atomic(candidate_path, candidate)
         skill_dir = self.state_dir / "skills"

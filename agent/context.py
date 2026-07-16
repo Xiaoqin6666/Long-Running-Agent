@@ -24,11 +24,10 @@ class ContextBuilder:
         critical = self._critical_context(state)
         working = self._working_context(state)
         reference = self._reference_context(state)
-        tail_guard = self._tail_guard_context(state)
-        return self._pack_context(critical, working, reference, tail_guard)
+        return self._pack_context(critical, working, reference)
 
-    def _pack_context(self, critical: str, working: str, reference: str, tail_guard: str) -> str:
-        sections = [section for section in [critical, working, reference, tail_guard] if section.strip()]
+    def _pack_context(self, critical: str, working: str, reference: str) -> str:
+        sections = [section for section in [critical, working, reference] if section.strip()]
         return "\n\n".join(sections)
 
     def _critical_context(self, state: TaskState) -> str:
@@ -85,35 +84,6 @@ class ContextBuilder:
             error_text = " | ".join(str(error) for error in errors) if isinstance(errors, list) else str(errors)
             lines.append(f"- initializer_repair: candidate={candidate}; first_error={error_text[:180]}")
         return "\n".join(lines) if lines else "No pending repair."
-
-    def _tail_guard_context(self, state: TaskState) -> str:
-        observation = state.last_observation if isinstance(state.last_observation, dict) else {}
-        pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
-        lines = ["# Tail Guard", "Immediate forced action block. Follow this before earlier context."]
-        if state.interaction_mode == "question":
-            lines.extend(
-                [
-                    "- The latest interactive user message is an information request and takes priority over project execution.",
-                    "- Answer that request in this turn. Use bounded read-only inspection only when the current context is insufficient.",
-                    "- Do not continue implementation, modify contracts, run verification, or change project task status.",
-                ]
-            )
-        elif initializer:
-            candidate = str(initializer.get("candidate_path", ""))
-            lines.append(f"- Repair INIT candidate: {candidate}. Read once if needed, then edit/write it.")
-        elif pending:
-            lines.append(f"- {self._required_next_action(state)}")
-        else:
-            required = self._required_next_action(state)
-            if observation.get("ok") is False and required == "No forced next action.":
-                lines.append("- Last step failed. Do not repeat it unchanged; act on the failure summary/data.")
-            else:
-                lines.append(f"- {required}")
-        text = "\n".join(lines)
-        if len(text) <= 500:
-            return text
-        return text[:497].rstrip() + "..."
 
     def _always_on_context(self, state: TaskState) -> str:
         lines = [
@@ -625,13 +595,16 @@ class ContextBuilder:
             if not isinstance(action, dict) or not isinstance(observation, dict):
                 return
             action_name = str(action.get("action", ""))
-            target = str(action.get("target", "")).replace("\\", "/").strip().rstrip("/")
+            data = observation.get("data", {})
+            command = data.get("command", "") if isinstance(data, dict) else ""
+            target = str(command if action_name == "bash" and command else action.get("target", ""))
+            target = target.replace("\\", "/").strip().rstrip("/")
             if not target:
                 return
             if action_name in {"write", "edit"} and observation.get("ok") is True:
                 seen_targets.add(target)
                 return
-            if action_name not in {"read", "list_files", "search"} or observation.get("ok") is not True:
+            if action_name not in {"read", "list_files", "search", "bash"} or observation.get("ok") is not True:
                 return
             if target in seen_targets:
                 return
@@ -690,8 +663,16 @@ class ContextBuilder:
             payload = str(data.get("content", ""))
         elif action_name == "list_files":
             payload = json.dumps(data.get("entries", []), ensure_ascii=False, indent=2)
-        else:
+        elif action_name == "search":
             payload = json.dumps(data.get("matches", []), ensure_ascii=False, indent=2)
+        elif action_name == "bash":
+            if data.get("command"):
+                metadata.append(f"- command: {data.get('command')}")
+            if data.get("cwd"):
+                metadata.append(f"- cwd: {data.get('cwd')}")
+            payload = str(data.get("output", ""))
+        else:
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
 
         prefix = "\n".join([*metadata, "--- BEGIN TOOL OUTPUT ---", ""])
         suffix = "\n--- END TOOL OUTPUT ---"
@@ -854,7 +835,7 @@ class ContextBuilder:
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
             "Each generated task should include: id, title, priority, depends_on, status, acceptance_criteria, criterion_command_map, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, and verification_commands.",
             "criterion_command_map must map every exact acceptance criterion string to one or more exact entries from verification_commands, and every verification command must be mapped.",
-            "Verification commands run from the repository root and must be direct, portable Python commands without Unix-only shell setup. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls.",
+            "Verification commands run from the repository root and must be direct, portable Python commands without Unix-only shell setup. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls. Do not mix os.chdir('<workspace>') with subprocess cwd='<workspace>'; for contract repairs prefer verification_procedure.working_directory.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal complete task example:",
             '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"criterion_command_map":{"Behavior is verified.":["python -m unittest discover -s <workspace>/tests"]},"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
@@ -1083,15 +1064,31 @@ class ContextBuilder:
         worker_tests = self._active_task_worker_test_artifacts(state)
         acceptance = self._active_task_acceptance_artifacts(state)
         frozen = self._active_task_frozen_acceptance_artifacts(state)
+        missing_owned = self._missing_active_owned_artifacts(state)
         policy = self._active_task_test_policy(state)
         return [
             f"- implementation_artifacts: {', '.join(implementation) if implementation else 'none'}",
             f"- worker_test_artifacts: {', '.join(worker_tests) if worker_tests else 'none'}",
             f"- acceptance_artifacts: {', '.join(acceptance) if acceptance else 'none'}",
             f"- frozen_acceptance_artifacts: {', '.join(frozen) if frozen else 'none'}",
+            f"- missing_owned_artifacts: {', '.join(missing_owned) if missing_owned else 'none'}",
             f"- test_policy: {policy}",
             "- Rule: implementation artifacts are normal repair targets; worker tests remain mutable unless explicitly listed in frozen_acceptance_artifacts.",
         ]
+
+    def _missing_active_owned_artifacts(self, state: TaskState) -> list[str]:
+        owned: list[str] = []
+        for artifact in [
+            *self._active_task_implementation_artifacts(state),
+            *self._active_task_worker_test_artifacts(state),
+        ]:
+            if artifact not in owned:
+                owned.append(artifact)
+        missing: list[str] = []
+        for artifact in owned:
+            if not (self.root / artifact).exists():
+                missing.append(artifact)
+        return missing
 
     def _active_task_implementation_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "implementation_artifacts"):

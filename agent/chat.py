@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent.loop import AgentLoop, RunResult
+from agent.skills import SkillDocument, parse_skill, render_skill
 
 
 UI_WIDTH = 72
@@ -17,6 +18,7 @@ TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /ask TEXT  Ask a question without advancing project work
   /do TEXT   Give the agent a project task to execute
+  /skill     Add a user-authored Skill with a guided form
   /help      Show this help
   /status    Show the current durable agent state
   /history   Show messages from this chat session
@@ -115,6 +117,8 @@ class InteractiveCLI:
                 self.output(f"Usage: {command} <message>")
             else:
                 self._run_turn(content, interaction_mode="question" if command == "/ask" else "work")
+        elif command == "/skill":
+            self._run_skill_wizard()
         elif command == "/status":
             self._show_status()
         elif command == "/history":
@@ -131,6 +135,87 @@ class InteractiveCLI:
             self.output(f"Unknown command: {command}. Type /help for commands.")
         return False
 
+    def _run_skill_wizard(self) -> None:
+        self.output(self._paint("Skill candidate", "cyan", bold=True))
+        self.output(self._paint("Enter /cancel at any prompt to stop.", "dim"))
+        try:
+            name = self._prompt_skill_field("Name", required=True)
+            if name is None:
+                return
+            description = self._prompt_skill_field("Description", required=True)
+            if description is None:
+                return
+            instruction = self._prompt_skill_field("Instruction", required=True)
+            if instruction is None:
+                return
+            example = self._prompt_skill_field("Example (optional)", required=False)
+            if example is None:
+                return
+        except (EOFError, KeyboardInterrupt):
+            self.output("\nSkill setup cancelled.")
+            return
+
+        self._save_user_skill(name, description, instruction, example)
+
+    def _prompt_skill_field(self, label: str, required: bool) -> str | None:
+        while True:
+            value = self.input(self._paint(f"{label} > ", "cyan", bold=True)).strip()
+            if value.lower() == "/cancel":
+                self.output("Skill setup cancelled.")
+                return None
+            if value or not required:
+                return value
+            self.output(f"{label} is required.")
+
+    def _save_user_skill(self, name: str, description: str, instruction: str, example: str) -> None:
+        skill_id = safe_skill_id(name)
+        if not skill_id:
+            self.output("Skill name must contain a letter, number, underscore, or dash.")
+            return
+        skill_dir = self.state_dir / "skills"
+        skill_path = skill_dir / f"{skill_id}.md"
+        if skill_path.exists():
+            try:
+                confirmation = self.input(
+                    self._paint(f"Skill '{skill_id}' exists. Overwrite? [y/N] > ", "yellow", bold=True)
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self.output("\nSkill setup cancelled; existing Skill was not changed.")
+                return
+            if confirmation not in {"y", "yes"}:
+                self.output("Skill setup cancelled; existing Skill was not changed.")
+                return
+
+        skill = SkillDocument(skill_id, description, instruction, example)
+        rendered = render_skill(skill)
+        parsed = parse_skill(rendered, fallback_name=skill_id)
+        if parsed != skill:
+            self.output("Skill validation failed; no file was written.")
+            return
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = skill_path.with_suffix(".md.tmp")
+        try:
+            temporary_path.write_text(rendered, encoding="utf-8")
+            temporary_path.replace(skill_path)
+        except OSError as exc:
+            temporary_path.unlink(missing_ok=True)
+            self.output(f"Could not save Skill: {exc}")
+            return
+
+        record = ChatMessage(
+            "system",
+            f"User added trusted Skill '{skill_id}' at {self._relative_path(skill_path)}.",
+        )
+        self._append_history(record)
+        self.output(self._paint(f"Skill saved: {self._relative_path(skill_path)}", "green", bold=True))
+
+    def _relative_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.config.root)).replace("\\", "/")
+        except ValueError:
+            return str(path)
+
     def _show_header(self) -> None:
         benchmark = self.config.benchmark_id or "repository"
         title = "LONG-RUNNING AGENT"
@@ -142,7 +227,7 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /ask for questions, /do for work, /help for commands.", "dim"))
+        self.output(self._paint("  Use /ask for questions, /do for work, /skill to add skill.md, /help for commands.", "dim"))
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:
@@ -302,6 +387,11 @@ class InteractiveCLI:
 def compact_text(value: object, limit: int) -> str:
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def safe_skill_id(raw: str) -> str:
+    cleaned = "".join(character if character.isalnum() or character in {"-", "_"} else "-" for character in raw.strip().lower())
+    return cleaned.strip("-_")
 
 
 def launch_chat_window(argv: list[str], cwd: Path | None = None) -> bool:

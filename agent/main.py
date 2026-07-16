@@ -216,8 +216,6 @@ def main() -> int:
 
 
 def resolve_optional_task(args: argparse.Namespace) -> str | None:
-    if args.project_spec:
-        return args.project_spec.read_text(encoding="utf-8").strip()
     if args.task_file:
         return args.task_file.read_text(encoding="utf-8").strip()
     if args.task:
