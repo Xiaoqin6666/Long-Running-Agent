@@ -32,6 +32,22 @@ Run the deterministic offline loop:运行确定性脱机循环：
 python -m agent.main "Smoke test the minimal long-running agent" --max-steps 5
 ```
 
+Start an interactive terminal conversation:
+
+```powershell
+python -m agent.main --chat --provider openai-compatible --max-steps 8
+```
+
+On Windows, `--chat` opens the conversation in a dedicated terminal window. Use `--chat-inline` to keep the UI in the current terminal, which is useful for scripts and debugging.
+
+You can also provide the first message directly:
+
+```powershell
+python -m agent.main "Inspect the current failure" --chat --provider openai-compatible
+```
+
+Use `/ask <question>` for read-only questions and `/do <task>` for project work. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+
 Summarize a trace:   总结一个踪迹：
 
 ```powershell

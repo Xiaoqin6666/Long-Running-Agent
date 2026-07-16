@@ -9,6 +9,7 @@ import re
 import sys
 
 from agent.loop import AgentLoop
+from agent.chat import ChatConfig, InteractiveCLI, launch_chat_window
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,6 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Use a task graph JSON file other than ./tasks.json.",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Start an interactive terminal conversation with the agent.",
+    )
+    parser.add_argument(
+        "--chat-inline",
+        action="store_true",
+        help="Run the chat UI in the current terminal instead of opening a new window.",
+    )
+    parser.add_argument("--chat-child", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -136,6 +148,11 @@ def configure_run_logger(log_path: Path) -> logging.Logger:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.chat and not args.chat_inline and not args.chat_child:
+        if launch_chat_window(sys.argv[1:], cwd=Path.cwd()):
+            print("Long Agent chat opened in a new terminal window.")
+            return 0
+        print("Could not open a new terminal window; continuing in the current terminal.", file=sys.stderr)
     benchmark_id = infer_benchmark_id(args)
     log_path = resolve_log_path(args, benchmark_id)
     logger = configure_run_logger(log_path)
@@ -153,6 +170,21 @@ def main() -> int:
         os.environ.get("LONG_AGENT_MODEL", "gpt-4.1-mini"),
     )
     try:
+        if args.chat:
+            initial_message = resolve_optional_task(args)
+            return InteractiveCLI(
+                ChatConfig(
+                    root=args.root.resolve(),
+                    provider=args.provider,
+                    max_steps=args.max_steps,
+                    benchmark_id=benchmark_id,
+                    tasks_path=args.tasks_json.resolve() if args.tasks_json else None,
+                    project_spec_path=args.project_spec.resolve() if args.project_spec else None,
+                    auto_resume=args.auto_resume,
+                    max_sessions=args.max_sessions,
+                    initial_message=initial_message,
+                )
+            ).run()
         task = resolve_task(args)
         loop = AgentLoop(
             root=args.root.resolve(),
@@ -181,6 +213,16 @@ def main() -> int:
         logger.exception("Run failed during startup or execution")
         print(f"Agent failed: {exc}\nLog: {log_path}", file=sys.stderr)
         return 1
+
+
+def resolve_optional_task(args: argparse.Namespace) -> str | None:
+    if args.project_spec:
+        return args.project_spec.read_text(encoding="utf-8").strip()
+    if args.task_file:
+        return args.task_file.read_text(encoding="utf-8").strip()
+    if args.task:
+        return args.task.strip()
+    return None
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent.context import ContextBuilder
 from agent.llm import create_decision_maker
@@ -69,6 +69,9 @@ class AgentLoop:
         benchmark_id: str | None = None,
         auto_resume: bool = False,
         max_sessions: int = 1,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+        conversation_messages: list[dict[str, str]] | None = None,
+        interaction_mode: str = "",
     ) -> None:
         self.root = root
         self.task = task
@@ -77,6 +80,9 @@ class AgentLoop:
         self.resume = resume
         self.auto_resume = auto_resume
         self.max_sessions = max(1, max_sessions)
+        self.event_handler = event_handler
+        self.conversation_messages = self._normalize_conversation_messages(conversation_messages or [])
+        self.interaction_mode = interaction_mode if interaction_mode in {"question", "work"} else ""
         self.project_spec_path = project_spec_path
         self.source_tasks_path = tasks_path
         self.benchmark_id = self._safe_benchmark_id(benchmark_id) if benchmark_id else None
@@ -194,6 +200,14 @@ class AgentLoop:
             context = self.context_builder.build(state)
             try:
                 action = self.decision_maker.next_action(context, state)
+                self._emit_event(
+                    {
+                        "type": "tool_start",
+                        "step": step,
+                        "action": str(action.get("action", "unknown")),
+                        "target": str(action.get("target", "")),
+                    }
+                )
                 observation = self._execute_action(action, state)
             except Exception as exc:
                 LOGGER.exception("Step %s model/tool protocol error", step)
@@ -221,11 +235,22 @@ class AgentLoop:
                 state.handoff_ready,
                 self._log_text(observation.summary),
             )
+            self._emit_event(
+                {
+                    "type": "tool_result",
+                    "step": step,
+                    "session": len(state.task_session_ids.get(self._active_task_id(state), [])) or 1,
+                    "action": str(action.get("action", "unknown")),
+                    "target": str(action.get("target", "")),
+                    "ok": observation.ok,
+                    "summary": observation.summary,
+                }
+            )
 
             if (
                 action["action"] in {"answer", "finish"}
                 and observation.ok
-                and not self._is_initializer_task(state)
+                and (not self._is_initializer_task(state) or state.interaction_mode == "question")
             ):
                 completed = True
                 message = observation.data.get("answer", observation.summary)
@@ -245,6 +270,14 @@ class AgentLoop:
             message=message,
             state=state,
         )
+
+    def _emit_event(self, event: dict[str, Any]) -> None:
+        if self.event_handler is None:
+            return
+        try:
+            self.event_handler(event)
+        except Exception:
+            LOGGER.exception("Agent event handler failed")
 
     def _prepare_auto_resume_session(self) -> TaskState:
         self.resume = True
@@ -272,6 +305,10 @@ class AgentLoop:
             )
         else:
             state = create_initial_state(self.task)
+        if not self.resume and self.conversation_messages:
+            state.conversation_messages = list(self.conversation_messages)
+        if not self.resume and self.interaction_mode:
+            state.interaction_mode = self.interaction_mode
         self._dedupe_contracts(state)
         if self._is_initializer_task(state) and not state.initializer_repair:
             self._recover_initializer_repair_from_state(state)
@@ -280,6 +317,19 @@ class AgentLoop:
         if self.resume and not state.pending_repair:
             self._recover_pending_repair_from_recent_trace(state)
         return state
+
+    @staticmethod
+    def _normalize_conversation_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).strip().lower()
+            content = str(message.get("content", "")).strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            normalized.append({"role": role, "content": content})
+        return normalized
 
     def _apply_orchestrator_selection(self, state: TaskState) -> None:
         selection = self.orchestrator.choose_current_task()
@@ -389,6 +439,28 @@ class AgentLoop:
 
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
+        if state.interaction_mode == "question" and name in {
+            "bash",
+            "contract",
+            "dismiss_skill",
+            "edit",
+            "finish",
+            "git",
+            "load_skill",
+            "save_skill",
+            "skill",
+            "update_plan",
+            "verify",
+            "write",
+        }:
+            return ToolResult(
+                False,
+                (
+                    f"Interactive question cannot use project-progress action '{name}'. "
+                    "Answer the latest user question; use only bounded read-only inspection if more evidence is needed."
+                ),
+                {"interactive_question": True, "required_action": "answer_or_read_only_inspection"},
+            )
         if state.pending_skill_review and name not in {"save_skill", "skill", "dismiss_skill"}:
             return ToolResult(
                 False,
@@ -402,7 +474,7 @@ class AgentLoop:
         if name == "dismiss_skill":
             return self._handle_dismiss_skill_action(action, state)
         if name == "answer":
-            if self._is_initializer_task(state):
+            if self._is_initializer_task(state) and state.interaction_mode != "question":
                 outputs = self._validate_initializer_outputs()
                 data = dict(outputs.data)
                 data.update({"initializer_requires_verification": True, "counts_as_progress": False})
@@ -1077,10 +1149,21 @@ class AgentLoop:
             )
             state.pending_skill_review = {}
         elif name == "answer" and observation.ok and not self._is_initializer_task(state):
-            for node in state.nodes:
-                if node["status"] != "done":
-                    node["status"] = "done"
-                    node["evidence"].append(observation.summary)
+            if any(node.get("contract_managed") is True for node in state.nodes):
+                state.evidence_sources.append(
+                    {
+                        "action": "answer",
+                        "target": active_task_id,
+                        "summary": observation.summary,
+                        "task_id": active_task_id,
+                        "evidence_type": "user_response",
+                    }
+                )
+            else:
+                for node in state.nodes:
+                    if node["status"] != "done":
+                        node["status"] = "done"
+                        node["evidence"].append(observation.summary)
         elif name == "update_plan" and state.nodes and not self._is_initializer_task(state):
             state.nodes[0]["status"] = "done"
             state.nodes[0]["evidence"].append("initialized plan")

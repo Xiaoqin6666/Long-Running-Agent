@@ -63,6 +63,8 @@ class TaskState:
     task_error_fingerprints: dict[str, list[str]] = field(default_factory=dict)
     pending_skill_review: dict[str, Any] = field(default_factory=dict)
     skill_review_history: list[dict[str, Any]] = field(default_factory=list)
+    conversation_messages: list[dict[str, str]] = field(default_factory=list)
+    interaction_mode: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
@@ -82,6 +84,8 @@ class TaskState:
         data.setdefault("task_error_fingerprints", {})
         data.setdefault("pending_skill_review", {})
         data.setdefault("skill_review_history", [])
+        data.setdefault("conversation_messages", [])
+        data.setdefault("interaction_mode", "")
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +116,8 @@ class TaskState:
             "task_error_fingerprints": self.task_error_fingerprints,
             "pending_skill_review": self.pending_skill_review,
             "skill_review_history": self.skill_review_history,
+            "conversation_messages": self.conversation_messages,
+            "interaction_mode": self.interaction_mode,
         }
 
     def summary(self) -> str:

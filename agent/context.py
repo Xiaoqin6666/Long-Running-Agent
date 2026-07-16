@@ -91,7 +91,15 @@ class ContextBuilder:
         pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
         lines = ["# Tail Guard", "Immediate forced action block. Follow this before earlier context."]
-        if initializer:
+        if state.interaction_mode == "question":
+            lines.extend(
+                [
+                    "- The latest interactive user message is an information request and takes priority over project execution.",
+                    "- Answer that request in this turn. Use bounded read-only inspection only when the current context is insufficient.",
+                    "- Do not continue implementation, modify contracts, run verification, or change project task status.",
+                ]
+            )
+        elif initializer:
             candidate = str(initializer.get("candidate_path", ""))
             lines.append(f"- Repair INIT candidate: {candidate}. Read once if needed, then edit/write it.")
         elif pending:
@@ -211,8 +219,13 @@ class ContextBuilder:
             "# Working Context",
             "Use this to choose the next task-local action.",
             "",
-            "# User Goal",
+            "# Active Task",
             state.user_goal,
+            "",
+            "# User Conversation",
+            self._conversation_context(state),
+            "",
+            f"# Interaction Mode\n{state.interaction_mode or 'non-interactive'}",
             "",
             "# Acceptance Criteria",
             *[f"- {item}" for item in state.acceptance_criteria],
@@ -285,6 +298,28 @@ class ContextBuilder:
             "- finish: project-level termination only after verifier/project completion evidence; target='current_task'; args={}.",
         ]
         return "\n".join(lines)
+
+    def _conversation_context(self, state: TaskState) -> str:
+        messages = state.conversation_messages if isinstance(state.conversation_messages, list) else []
+        rendered: list[str] = []
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).strip().lower()
+            content = str(message.get("content", "")).strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            label = "User" if role == "user" else "Agent"
+            if role == "user" and not any(
+                isinstance(later, dict) and str(later.get("role", "")).strip().lower() == "user"
+                for later in messages[index + 1 :]
+            ):
+                label = "Latest User Message"
+            rendered.append(f"{label}: {content}")
+        text = "\n\n".join(rendered)
+        if len(text) > 8000:
+            text = text[-8000:]
+        return text or "No interactive user conversation is attached to this run."
 
     def _format_contract(self, contract: dict[str, object]) -> str:
         requirements = contract.get("frozen_requirements", contract.get("required_evidence", []))
