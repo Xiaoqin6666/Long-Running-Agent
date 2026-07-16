@@ -10,6 +10,7 @@ from agent.chat import ChatConfig, ChatMessage, InteractiveCLI, launch_chat_wind
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from agent.main import build_parser, resolve_optional_task
+from agent.memory import parse_memory
 from agent.planner import TaskState, create_initial_state
 from agent.skills import parse_skill
 from agent.tools import ToolResult
@@ -98,6 +99,40 @@ class ChatCLITests(unittest.TestCase):
         run_turn.assert_not_called()
         self.assertIn("Name is required.", outputs)
         self.assertIn("Skill setup cancelled.", outputs)
+
+    def test_memory_command_collects_guided_fields(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(
+            [
+                "go-react-profile",
+                "User is experienced in Go and new to React",
+                "user",
+                "User has ten years of Go backend experience and is new to React.",
+            ]
+        )
+        root = Path.cwd() / ".tmp_tests" / f"chat-memory-{uuid4().hex}"
+        root.mkdir(parents=True)
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        try:
+            with patch.object(cli, "_run_turn") as run_turn:
+                cli._handle_command("/memory")
+            run_turn.assert_not_called()
+            memory_path = root / "state" / "memories" / "go-react-profile.md"
+            memory = parse_memory(memory_path.read_text(encoding="utf-8"))
+            self.assertEqual(memory.name, "go-react-profile")
+            self.assertEqual(memory.description, "User is experienced in Go and new to React")
+            self.assertEqual(memory.type, "user")
+            self.assertIn("ten years of Go", memory.content)
+            self.assertTrue(any("Memory saved:" in output for output in outputs))
+            self.assertFalse((root / "state" / "hard_memory.md").exists())
+            self.assertFalse((root / "state" / "soft_memory.md").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_context_keeps_active_task_and_conversation_separate(self) -> None:
         state = create_initial_state("Fix it and run the focused test")

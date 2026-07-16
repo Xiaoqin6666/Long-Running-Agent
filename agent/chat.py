@@ -10,15 +10,17 @@ from pathlib import Path
 from typing import Callable
 
 from agent.loop import AgentLoop, RunResult
+from agent.memory import MemoryDocument, normalize_memory_content, render_memory, render_memory_index, safe_memory_id, validate_memory
 from agent.skills import SkillDocument, parse_skill, render_skill
 
 
 UI_WIDTH = 72
-TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
+TOOL_ACTIONS = {"bash", "debug_context", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /ask TEXT  Ask a question without advancing project work
   /do TEXT   Give the agent a project task to execute
   /skill     Add a user-authored Skill with a guided form
+  /memory    Add a typed Memory with a guided form
   /help      Show this help
   /status    Show the current durable agent state
   /history   Show messages from this chat session
@@ -119,6 +121,8 @@ class InteractiveCLI:
                 self._run_turn(content, interaction_mode="question" if command == "/ask" else "work")
         elif command == "/skill":
             self._run_skill_wizard()
+        elif command == "/memory":
+            self._run_memory_wizard()
         elif command == "/status":
             self._show_status()
         elif command == "/history":
@@ -166,6 +170,112 @@ class InteractiveCLI:
             if value or not required:
                 return value
             self.output(f"{label} is required.")
+
+    def _run_memory_wizard(self) -> None:
+        self.output(self._paint("Memory candidate", "cyan", bold=True))
+        self.output(self._paint("Allowed types: user, feedback, project, reference. Enter /cancel at any prompt to stop.", "dim"))
+        try:
+            name = self._prompt_memory_field("Name", required=True)
+            if name is None:
+                return
+            description = self._prompt_memory_field("Description", required=True)
+            if description is None:
+                return
+            memory_type = self._prompt_memory_type()
+            if memory_type is None:
+                return
+            content = self._prompt_memory_field("Content", required=True)
+            if content is None:
+                return
+            why = ""
+            how = ""
+            if memory_type == "feedback":
+                why = self._prompt_memory_field("Why", required=True) or ""
+                if not why:
+                    return
+                how = self._prompt_memory_field("How to apply", required=True) or ""
+                if not how:
+                    return
+        except (EOFError, KeyboardInterrupt):
+            self.output("\nMemory setup cancelled.")
+            return
+
+        self._save_user_memory(name, description, memory_type, content, why, how)
+
+    def _prompt_memory_field(self, label: str, required: bool) -> str | None:
+        while True:
+            value = self.input(self._paint(f"{label} > ", "cyan", bold=True)).strip()
+            if value.lower() == "/cancel":
+                self.output("Memory setup cancelled.")
+                return None
+            if value or not required:
+                return value
+            self.output(f"{label} is required.")
+
+    def _prompt_memory_type(self) -> str | None:
+        while True:
+            value = self.input(self._paint("Type > ", "cyan", bold=True)).strip().lower()
+            if value == "/cancel":
+                self.output("Memory setup cancelled.")
+                return None
+            if value in {"user", "feedback", "project", "reference"}:
+                return value
+            self.output("Type must be one of: user, feedback, project, reference.")
+
+    def _save_user_memory(
+        self,
+        name: str,
+        description: str,
+        memory_type: str,
+        content: str,
+        why: str = "",
+        how_to_apply: str = "",
+    ) -> None:
+        memory_id = safe_memory_id(name)
+        if not memory_id:
+            self.output("Memory name must contain a letter, number, underscore, or dash.")
+            return
+        memory_dir = self.state_dir / "memories"
+        memory_path = memory_dir / f"{memory_id}.md"
+        if memory_path.exists():
+            try:
+                confirmation = self.input(
+                    self._paint(f"Memory '{memory_id}' exists. Overwrite? [y/N] > ", "yellow", bold=True)
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self.output("\nMemory setup cancelled; existing Memory was not changed.")
+                return
+            if confirmation not in {"y", "yes"}:
+                self.output("Memory setup cancelled; existing Memory was not changed.")
+                return
+
+        rendered_content = normalize_memory_content(
+            {"type": memory_type, "content": content, "why": why, "how_to_apply": how_to_apply}
+        )
+        memory = MemoryDocument(memory_id, description, memory_type, rendered_content)
+        errors = validate_memory(memory)
+        if errors:
+            self.output("Memory validation failed: " + "; ".join(errors))
+            return
+
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = memory_path.with_suffix(".md.tmp")
+        try:
+            temporary_path.write_text(render_memory(memory), encoding="utf-8")
+            temporary_path.replace(memory_path)
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            (self.state_dir / "memory.md").write_text(render_memory_index(memory_dir), encoding="utf-8")
+        except OSError as exc:
+            temporary_path.unlink(missing_ok=True)
+            self.output(f"Could not save Memory: {exc}")
+            return
+
+        record = ChatMessage(
+            "system",
+            f"User added trusted Memory '{memory_id}' at {self._relative_path(memory_path)}.",
+        )
+        self._append_history(record)
+        self.output(self._paint(f"Memory saved: {self._relative_path(memory_path)}", "green", bold=True))
 
     def _save_user_skill(self, name: str, description: str, instruction: str, example: str) -> None:
         skill_id = safe_skill_id(name)
@@ -227,7 +337,7 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /ask for questions, /do for work, /skill to add skill.md, /help for commands.", "dim"))
+        self.output(self._paint("  Use /ask for questions, /do for work, /skill or /memory to add durable guidance, /help for commands.", "dim"))
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:

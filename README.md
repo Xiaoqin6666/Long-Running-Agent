@@ -46,13 +46,19 @@ You can also provide the first message directly:
 python -m agent.main "Inspect the current failure" --chat --provider openai-compatible
 ```
 
-Use `/ask <question>` for read-only questions, `/do <task>` for project work, and `/skill` to directly add a trusted user-authored Skill. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+Use `/ask <question>` for read-only questions, `/do <task>` for project work, `/skill` to directly add a trusted user-authored Skill, and `/memory` to add a typed Memory. Memory entries are Markdown files under `state/memories/` with one of four fixed types: `user`, `feedback`, `project`, or `reference`. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+
+The memory index at `state/memory.md` is always loaded with a 200-line / 25KB cap. Full memory files are loaded only after synchronous retrieval. Set `LONG_AGENT_MEMORY_MODEL` such as `deepseek-flash` to use a cheap selector model; if it is unset or fails, the harness falls back to local keyword matching.
 
 Summarize a trace:
 
 ```powershell
 python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl --tasks state\benchmarks\issue_tracker\runtime_tasks.json
 ```
+
+Inspect full model context for each action:
+
+Every agent step writes the exact system message plus user context sent to the decision model under `state\debug_contexts\<trace-name>\step_0001.md`. Trace events include a `context_ref` field pointing at that file. The model can also call `debug_context` with `target="current"` or a step number; set `args.include_content=true` to return the snapshot content in the observation data.
 
 Run behavior tests:
 
@@ -78,6 +84,7 @@ The real model provider uses an OpenAI-compatible chat completions API. Configur
 $env:LONG_AGENT_API_KEY="your_api_key"
 $env:LONG_AGENT_BASE_URL="https://api.openai.com/v1"
 $env:LONG_AGENT_MODEL="gpt-4.1-mini"
+$env:LONG_AGENT_MEMORY_MODEL="deepseek-flash"  # optional selector model
 ```
 
 Run with:

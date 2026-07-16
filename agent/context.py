@@ -5,6 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from agent.memory_retrieval import truncate_entrypoint_content
 from agent.planner import TaskState
 from agent.skills import parse_skill, skill_catalog
 
@@ -20,10 +21,10 @@ class ContextBuilder:
         del max_chars
         self.state_dir = state_dir or root / "state"
 
-    def build(self, state: TaskState) -> str:
+    def build(self, state: TaskState, relevant_memories: str = "") -> str:
         critical = self._critical_context(state)
         working = self._working_context(state)
-        reference = self._reference_context(state)
+        reference = self._reference_context(state, relevant_memories=relevant_memories)
         return self._pack_context(critical, working, reference)
 
     def _pack_context(self, critical: str, working: str, reference: str) -> str:
@@ -252,6 +253,7 @@ class ContextBuilder:
             '{"thought_summary":"brief non-hidden reasoning","action":"<one action>","target":"<path|command|query|task|empty>","args":{},"expected_observation":"expected result","risk":"low|medium|high"}',
             "Callable actions:",
             "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
+            "- debug_context: inspect the exact model context snapshot for the current or a previous step; target='current' or target='<step>'; args.include_content=true returns the content in observation data, otherwise returns file references.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
             "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
@@ -265,6 +267,7 @@ class ContextBuilder:
             "- load_skill: load one relevant Skill by metadata name before applying it.",
             "- save_skill: submit a reusable procedure candidate; args.name, description, instruction, optional examples, evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Prefer immutable report_id references. Free-text evidence is rejected.",
             "- dismiss_skill: decline the current Pending Skill Reflection; target='<report_id>'; args.reason='<why this is not reusable>'.",
+            "- save_memory: store durable cross-session memory; args.name, description, type='user|feedback|project|reference', content. Feedback must include why and how_to_apply or explicit Why/How sections. Project dates must be absolute, not relative.",
             "- finish: project-level termination only after verifier/project completion evidence; target='current_task'; args={}.",
         ]
         return "\n".join(lines)
@@ -310,11 +313,11 @@ class ContextBuilder:
             f"frozen_requirements: {requirement_text or 'none'} | verification_procedure: {procedure_text or 'none'}"
         )
 
-    def _reference_context(self, state: TaskState) -> str:
+    def _reference_context(self, state: TaskState, relevant_memories: str = "") -> str:
         reference = self._session_startup_context(state) if self._is_session_start(state) else self._incremental_reference_context(state)
         lines = [
             reference,
-            self._memory_context(),
+            self._memory_context(relevant_memories=relevant_memories),
             self._loaded_skills_context(state),
         ]
         return "\n\n".join(section for section in lines if section.strip())
@@ -441,24 +444,15 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _persistent_context(self, state: TaskState) -> str:
-        memory_index = self._read_optional(self.state_dir / "memory.md")
-        hard_memory = self._read_optional(self.state_dir / "hard_memory.md")
-        soft_memory = self._read_optional(self.state_dir / "soft_memory.md")
+        memory_index = self._read_memory_index()
         skills = self._read_skills()
         lines = [
             "# Persistent Context",
             "Persist cross-session information in files rather than relying on chat history.",
-            "Persistent files include task status, verified facts, architecture decisions, failed attempts, verifier reports, git commits, and next actions.",
-            "Hard Memory is evidence-grade. Soft Memory is not evidence; treat it only as a hypothesis or suggestion.",
+            "Typed Memory stores only user, feedback, project, and reference memories. Do not store code patterns, architecture, file structure, git history, recent diffs, debug fixes already reflected in code/commits, CLAUDE.md duplicates, or temporary conversation state.",
             "",
             "# Memory Index",
             memory_index,
-            "",
-            "# Hard Memory",
-            hard_memory,
-            "",
-            "# Soft Memory",
-            soft_memory,
             "",
             "# Skills",
             skills,
@@ -467,24 +461,18 @@ class ContextBuilder:
         ]
         return "\n".join(lines)
 
-    def _memory_context(self) -> str:
-        memory_index = self._read_optional(self.state_dir / "memory.md")
-        hard_memory = self._read_optional(self.state_dir / "hard_memory.md")
-        soft_memory = self._read_optional(self.state_dir / "soft_memory.md")
+    def _memory_context(self, relevant_memories: str = "") -> str:
+        memory_index = self._read_memory_index()
         skills = self._read_skills()
         lines = [
             "# Persistent Context",
             "Persist cross-session information in files rather than relying on chat history.",
-            "Hard Memory is evidence-grade. Soft Memory is not evidence; treat it only as a hypothesis or suggestion.",
+            "Typed Memory stores only user, feedback, project, and reference memories. Do not store code patterns, architecture, file structure, git history, recent diffs, debug fixes already reflected in code/commits, CLAUDE.md duplicates, or temporary conversation state.",
             "",
             "# Memory Index",
             memory_index,
             "",
-            "# Hard Memory",
-            hard_memory,
-            "",
-            "# Soft Memory",
-            soft_memory,
+            relevant_memories or "# Relevant Memories\n\nNo relevant memories loaded.",
             "",
             "# Skills",
             skills,
@@ -1204,6 +1192,12 @@ class ContextBuilder:
         return "# Available Skills\n\n" + "\n".join(
             f"- {item['name']}: {item['description']}" for item in catalog
         )
+
+    def _read_memory_index(self) -> str:
+        raw = self._read_optional(self.state_dir / "memory.md")
+        if not raw.strip():
+            return "No memory index available."
+        return truncate_entrypoint_content(raw).content
 
     def _rel(self, path: Path) -> str:
         try:

@@ -11,6 +11,17 @@ from typing import Any, Callable
 
 from agent.context import ContextBuilder
 from agent.llm import create_decision_maker
+from agent.memory import (
+    MemoryDocument,
+    memory_catalog,
+    normalize_memory_content,
+    parse_memory,
+    render_memory,
+    render_memory_index,
+    safe_memory_id,
+    validate_memory,
+)
+from agent.memory_retrieval import MemoryRetriever, render_relevant_memories
 from agent.orchestrator import Orchestrator
 from agent.planner import (
     TaskState,
@@ -19,6 +30,7 @@ from agent.planner import (
     validate_generated_task_graph,
     validate_initializer_script,
 )
+from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.skills import (
     SkillDocument,
     normalize_examples,
@@ -88,6 +100,7 @@ class AgentLoop:
         self.benchmark_id = self._safe_benchmark_id(benchmark_id) if benchmark_id else None
         self.state_dir = self._benchmark_state_dir(self.benchmark_id) if self.benchmark_id else root / "state"
         self.trace_dir = self.state_dir / "traces"
+        self.debug_context_dir = self.state_dir / "debug_contexts"
         self.project_spec_materialized_path = self.state_dir / "project_spec.md" if project_spec_path else None
         self.generated_tasks_path = self.state_dir / "generated_tasks.json" if project_spec_path and not tasks_path else None
         self.runtime_tasks_path = self.state_dir / "runtime_tasks.json" if tasks_path else None
@@ -101,6 +114,7 @@ class AgentLoop:
         expected_workspace = self._expected_initializer_workspace_root()
         benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
         self.context_builder = ContextBuilder(root, state_dir=self.state_dir)
+        self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
         self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path, benchmark_id=self.benchmark_id)
         self.decision_maker = create_decision_maker(provider)
@@ -114,6 +128,8 @@ class AgentLoop:
             "search": SearchTool(root),
             "write": WriteTool(root),
         }
+        self._last_memory_selection: dict[str, Any] = {}
+        self._current_context_snapshot: dict[str, Any] = {}
 
     def _benchmark_state_dir(self, benchmark_id: str) -> Path:
         return self.root / "state" / "benchmarks" / benchmark_id
@@ -197,7 +213,9 @@ class AgentLoop:
             steps = step
             self._current_trace_step = step
             self._record_task_session(state)
-            context = self.context_builder.build(state)
+            memory_context = self._relevant_memory_context(state)
+            context = self.context_builder.build(state, relevant_memories=memory_context)
+            context_snapshot = self._record_context_snapshot(step, state, context)
             try:
                 action = self.decision_maker.next_action(context, state)
                 self._emit_event(
@@ -222,7 +240,7 @@ class AgentLoop:
                 observation = ToolResult(False, f"Protocol error: {exc}", {"error_type": type(exc).__name__})
             self._record_budget_usage(state, context, action, observation)
             self._update_state(state, action, observation)
-            self._append_trace(step, action, observation, state)
+            self._append_trace(step, action, observation, state, context_snapshot)
             self._write_state(state)
             LOGGER.info(
                 "Step %s action=%s target=%s ok=%s task_id=%s used_tokens=%s handoff_ready=%s observation=%s",
@@ -437,6 +455,60 @@ class AgentLoop:
         ]
         state.acceptance_contracts.append(contract)
 
+    def _record_context_snapshot(self, step: int, state: TaskState, context: str) -> dict[str, Any]:
+        session_dir = self.debug_context_dir / self.trace_path.stem
+        session_dir.mkdir(parents=True, exist_ok=True)
+        path = session_dir / f"step_{step:04d}.md"
+        content = (
+            "# Full Model Context\n\n"
+            f"- trace: {self._rel(self.trace_path)}\n"
+            f"- step: {step}\n"
+            f"- task_id: {self._active_task_id(state)}\n"
+            f"- written_at: {utc_now()}\n\n"
+            "## System Message\n\n"
+            f"{MAIN_AGENT_SYSTEM_PROMPT}\n\n"
+            "## User Context\n\n"
+            f"{context}\n"
+        )
+        path.write_text(content, encoding="utf-8")
+        snapshot = {
+            "path": self._rel(path),
+            "trace": self._rel(self.trace_path),
+            "step": step,
+            "chars": len(content),
+            "system_chars": len(MAIN_AGENT_SYSTEM_PROMPT),
+            "user_context_chars": len(context),
+        }
+        self._current_context_snapshot = snapshot
+        return snapshot
+
+    def _handle_debug_context_action(self, action: dict[str, Any]) -> ToolResult:
+        args = action.get("args", {})
+        include_content = bool(args.get("include_content")) if isinstance(args, dict) else False
+        target = str(action.get("target", "") or "current").strip().lower()
+        snapshot = self._current_context_snapshot
+        if target and target not in {"current", "latest"}:
+            try:
+                step = int(target)
+            except ValueError:
+                return ToolResult(False, f"Debug context target must be 'current' or a step number, got: {target}", {})
+            candidate = self.debug_context_dir / self.trace_path.stem / f"step_{step:04d}.md"
+            if not candidate.exists():
+                return ToolResult(False, f"No debug context snapshot exists for step {step}.", {"step": step})
+            snapshot = {
+                "path": self._rel(candidate),
+                "trace": self._rel(self.trace_path),
+                "step": step,
+                "chars": candidate.stat().st_size,
+            }
+        if not snapshot:
+            return ToolResult(False, "No debug context snapshot has been recorded yet.", {})
+        data = dict(snapshot)
+        if include_content:
+            path = self.root / str(snapshot.get("path", ""))
+            data["content"] = path.read_text(encoding="utf-8") if path.exists() else ""
+        return ToolResult(True, f"Debug context snapshot is available at {snapshot.get('path')}.", data)
+
     def _execute_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         name = action.get("action")
         if state.interaction_mode == "question" and name in {
@@ -447,6 +519,7 @@ class AgentLoop:
             "finish",
             "git",
             "load_skill",
+            "save_memory",
             "save_skill",
             "skill",
             "update_plan",
@@ -461,7 +534,7 @@ class AgentLoop:
                 ),
                 {"interactive_question": True, "required_action": "answer_or_read_only_inspection"},
             )
-        if state.pending_skill_review and name not in {"save_skill", "skill", "dismiss_skill"}:
+        if state.pending_skill_review and name not in {"debug_context", "save_skill", "skill", "dismiss_skill"}:
             return ToolResult(
                 False,
                 "Pending Skill Reflection must be resolved with save_skill or dismiss_skill before ordinary work continues.",
@@ -471,6 +544,8 @@ class AgentLoop:
                     "counts_as_progress": False,
                 },
             )
+        if name == "debug_context":
+            return self._handle_debug_context_action(action)
         if name == "dismiss_skill":
             return self._handle_dismiss_skill_action(action, state)
         if name == "answer":
@@ -503,6 +578,10 @@ class AgentLoop:
             return self._validate_contract_action(action, state)
         if name == "load_skill":
             return self._handle_load_skill_action(action, state)
+        if name == "save_memory":
+            if self._is_initializer_task(state):
+                return ToolResult(False, "Memory saving is disabled during INIT.", {"initializer_restricted": True})
+            return self._handle_save_memory_action(action, state)
         if name in {"save_skill", "skill"}:
             if self._is_initializer_task(state):
                 return ToolResult(False, "Skill promotion is disabled during INIT.", {"initializer_restricted": True})
@@ -1149,7 +1228,9 @@ class AgentLoop:
 
         name = action.get("action")
         active_task_id = self._active_task_id(state)
-        if name == "contract" and observation.ok:
+        if name == "debug_context":
+            state.last_observation["counts_as_progress"] = False
+        elif name == "contract" and observation.ok:
             contract = dict(observation.data["contract"])
             contract.setdefault("status", "agreed")
             state.acceptance_contracts = [
@@ -1161,7 +1242,7 @@ class AgentLoop:
                 )
             ]
             state.acceptance_contracts.append(contract)
-        elif name in {"load_skill", "save_skill", "skill"} and observation.ok:
+        elif name in {"load_skill", "save_skill", "skill", "save_memory"} and observation.ok:
             state.evidence_sources.append(
                 {
                     "action": name,
@@ -2238,6 +2319,56 @@ class AgentLoop:
             },
         )
 
+    def _handle_save_memory_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        args = action.get("args", {})
+        if not isinstance(args, dict):
+            return ToolResult(False, "Memory rejected: args must be an object.", {})
+        memory_id = safe_memory_id(str(args.get("name") or args.get("memory_id") or action.get("target") or ""))
+        description = str(args.get("description") or args.get("title") or "").strip()
+        memory_type = str(args.get("type") or "").strip()
+        content = normalize_memory_content(args)
+        memory = MemoryDocument(memory_id, description, memory_type, content)
+        errors = validate_memory(memory)
+        if errors:
+            return ToolResult(False, "Memory rejected: " + "; ".join(errors) + ".", {"errors": errors})
+
+        memory_dir = self.state_dir / "memories"
+        catalog = memory_catalog(memory_dir)
+        normalized_description = " ".join(description.lower().split())
+        duplicate = next(
+            (
+                item
+                for item in catalog
+                if safe_memory_id(item["name"]) == memory_id
+                or " ".join(item["description"].lower().split()) == normalized_description
+            ),
+            None,
+        )
+        if duplicate:
+            return ToolResult(False, f"Memory rejected: duplicate of existing memory {duplicate['name']}.", {"duplicate": duplicate})
+
+        memory_path = memory_dir / f"{memory_id}.md"
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = memory_path.with_suffix(".md.tmp")
+        temporary_path.write_text(render_memory(memory), encoding="utf-8")
+        parsed = validate_memory(parse_memory(temporary_path.read_text(encoding="utf-8"), fallback_name=memory_id))
+        if parsed:
+            temporary_path.unlink(missing_ok=True)
+            return ToolResult(False, "Memory rejected: rendered Memory failed validation.", {"errors": parsed})
+        temporary_path.replace(memory_path)
+        self.memory_path.write_text(render_memory_index(memory_dir), encoding="utf-8")
+        return ToolResult(
+            True,
+            f"Memory saved: {memory_id}.",
+            {
+                "name": memory_id,
+                "description": description,
+                "type": memory_type,
+                "path": self._rel(memory_path),
+                "content_hash": memory.content_hash,
+            },
+        )
+
     def _handle_dismiss_skill_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         review = state.pending_skill_review if isinstance(state.pending_skill_review, dict) else {}
         if not review:
@@ -2489,16 +2620,58 @@ class AgentLoop:
             encoding="utf-8",
         )
 
+    def _relevant_memory_context(self, state: TaskState) -> str:
+        query = self._memory_retrieval_query(state)
+        try:
+            retrieved = self.memory_retriever.retrieve(query)
+        except Exception as exc:
+            LOGGER.warning("Memory retrieval failed: %s", exc)
+            self._last_memory_selection = {
+                "source": "error",
+                "selected": [],
+                "error_type": type(exc).__name__,
+            }
+            return render_relevant_memories([], source="error")
+        self._last_memory_selection = {
+            "source": retrieved.source,
+            "selected": retrieved.selected_filenames,
+        }
+        return render_relevant_memories(retrieved.memories, source=retrieved.source)
+
+    def _memory_retrieval_query(self, state: TaskState) -> str:
+        messages = state.conversation_messages if isinstance(state.conversation_messages, list) else []
+        latest_user = ""
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role", "")).strip().lower() == "user":
+                latest_user = str(message.get("content", "")).strip()
+                break
+        parts = [
+            f"active_task_id: {self._active_task_id(state)}",
+            f"user_goal: {state.user_goal}",
+            f"interaction_mode: {state.interaction_mode or 'non-interactive'}",
+        ]
+        if latest_user:
+            parts.append(f"latest_user_message: {latest_user}")
+        if state.last_action:
+            parts.append(f"last_action: {state.last_action.get('action')} {state.last_action.get('target', '')}")
+        if isinstance(state.last_observation, dict) and state.last_observation.get("summary"):
+            parts.append(f"last_observation: {state.last_observation.get('summary')}")
+        return "\n".join(parts)
+
     def _append_trace(
         self,
         step: int,
         action: dict[str, Any],
         observation: ToolResult,
         state: TaskState,
+        context_snapshot: dict[str, Any] | None = None,
     ) -> None:
         event = {
             "step": step,
             "time": utc_now(),
+            "context_ref": context_snapshot or {},
             "action": action,
             "observation": observation.to_dict(),
             "state_summary": state.summary(),
@@ -2508,6 +2681,8 @@ class AgentLoop:
             "orchestrator_decision": state.orchestrator_decision,
             "nodes": state.nodes,
             "skill_catalog_size": len(skill_catalog(self.state_dir / "skills")),
+            "memory_catalog_size": len(memory_catalog(self.state_dir / "memories")),
+            "memory_selection": self._last_memory_selection,
             "loaded_skill_names": [
                 str(item.get("name")) for item in state.loaded_skills if isinstance(item, dict) and item.get("name")
             ],
@@ -2548,8 +2723,8 @@ class AgentLoop:
             "- task_graph_source: the original `--tasks-json` file is benchmark input and should remain read-only",
             f"- latest_verifier_report: {self._rel(self.state_dir / 'verifier_report.md')}",
             f"- immutable_verifier_reports: {self._rel(self.state_dir / 'verifier_reports')}/",
-            f"- hard_memory: {self._rel(self.state_dir / 'hard_memory.md')}",
-            f"- soft_memory: {self._rel(self.state_dir / 'soft_memory.md')}",
+            f"- memory_index: {self._rel(self.memory_path)}",
+            f"- memories: {self._rel(self.state_dir / 'memories')}/",
             f"- traces: {self._rel(self.trace_dir)}/",
             "",
             "## 5. Orchestrator Decision",
@@ -2591,7 +2766,6 @@ class AgentLoop:
             "- Review trace for failed observations and protocol errors before resuming.",
             "- Do not repeat failed actions unchanged.",
             "- Do not start new large edits until the next worker session has rebuilt context from this handoff.",
-            "- Treat Soft Memory as hypotheses, not facts.",
             "",
             "## 13. Current State Summary",
             state.summary(),
@@ -2602,8 +2776,7 @@ class AgentLoop:
             "3. Continue the active task only after checking the acceptance contract.",
             "4. If no contract exists for a coding task, create one before writing code.",
             "5. Prefer verification or small repair actions before new feature work.",
-            "6. Promote Soft Memory to Hard Memory only after verification.",
-            f"7. Inspect `{payload['payload_path']}` only when the summary above is insufficient.",
+            f"6. Inspect `{payload['payload_path']}` only when the summary above is insufficient.",
             "",
             "## 15. Suggested Next Action",
             self._suggest_next_action(state),
@@ -2769,17 +2942,15 @@ class AgentLoop:
     def _ensure_state_files(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_context_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "skills").mkdir(exist_ok=True)
+        (self.state_dir / "memories").mkdir(exist_ok=True)
         (self.state_dir / "skill_candidates").mkdir(exist_ok=True)
         (self.state_dir / "verifier_reports").mkdir(exist_ok=True)
         if not self.memory_path.exists():
-            self.memory_path.write_text("# Memory Index\n\nSee hard_memory.md and soft_memory.md.\n", encoding="utf-8")
-        hard_memory = self.state_dir / "hard_memory.md"
-        if not hard_memory.exists():
-            hard_memory.write_text("# Hard Memory\n\n## Entries\n\n", encoding="utf-8")
-        soft_memory = self.state_dir / "soft_memory.md"
-        if not soft_memory.exists():
-            soft_memory.write_text("# Soft Memory\n\n## Entries\n\n", encoding="utf-8")
+            self.memory_path.write_text(render_memory_index(self.state_dir / "memories"), encoding="utf-8")
+        for legacy_memory in (self.state_dir / "hard_memory.md", self.state_dir / "soft_memory.md"):
+            legacy_memory.unlink(missing_ok=True)
         if not (self.state_dir / "skills" / "coding.md").exists():
             (self.state_dir / "skills" / "coding.md").write_text(
                 "---\n"

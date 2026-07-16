@@ -11,6 +11,11 @@ from agent.context import ContextBuilder
 from agent.llm import parse_action_json, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id, resolve_log_path
+from agent.memory_retrieval import (
+    MemoryRetriever,
+    scan_memory_headers,
+    truncate_entrypoint_content,
+)
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
 from agent.planner import create_initial_state, create_initializer_state, validate_generated_task_graph, validate_initializer_script
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
@@ -398,6 +403,46 @@ class HarnessBehaviorTests(unittest.TestCase):
         args = parser.parse_args(["Task", "--log-file", "diagnostics/run.log"])
 
         self.assertEqual(str(args.log_file), "diagnostics\\run.log")
+
+    def test_debug_context_action_is_validated(self) -> None:
+        state = create_initial_state("Inspect context")
+
+        action = validate_action(
+            {
+                "thought_summary": "Inspect the current model context.",
+                "action": "debug_context",
+                "target": "current",
+                "args": {"include_content": True},
+                "expected_observation": "Context snapshot is returned.",
+                "risk": "low",
+            },
+            state,
+        )
+
+        self.assertEqual(action["action"], "debug_context")
+        self.assertTrue(action["args"]["include_content"])
+
+    def test_debug_context_snapshot_is_written_and_trace_references_it(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect context", max_steps=1)
+            loop._ensure_state_files()
+            state = create_initial_state("Inspect context")
+
+            snapshot = loop._record_context_snapshot(1, state, "# User-visible context")
+            observation = loop._handle_debug_context_action(
+                {"action": "debug_context", "target": "current", "args": {"include_content": True}}
+            )
+            loop._append_trace(1, {"action": "debug_context", "target": "current", "args": {}}, observation, state, snapshot)
+
+            snapshot_path = root / snapshot["path"]
+            snapshot_content = snapshot_path.read_text(encoding="utf-8")
+            trace_events = loop._load_trace_events(loop.trace_path)
+
+        self.assertTrue(observation.ok)
+        self.assertIn("# Full Model Context", snapshot_content)
+        self.assertIn("## System Message", observation.data["content"])
+        self.assertEqual(trace_events[0]["context_ref"]["path"], snapshot["path"])
 
     def test_default_log_path_uses_benchmark_state_directory(self) -> None:
         parser = build_parser()
@@ -2399,6 +2444,173 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Examples", content)
         self.assertNotIn("run_test.jsonl", content)
 
+    def test_save_memory_writes_typed_yaml_and_updates_index(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Remember preference", max_steps=1)
+            loop._ensure_state_files()
+            state = create_initial_state("Remember preference")
+            action = {
+                "action": "save_memory",
+                "target": "real-db-integration-tests",
+                "args": {
+                    "name": "real-db-integration-tests",
+                    "description": "Integration tests must use a real database",
+                    "type": "feedback",
+                    "content": "Integration tests must use a real database, not mocks.",
+                    "why": "Mock-backed tests passed while production migrations failed.",
+                    "how_to_apply": "Connect integration tests to the real test database.",
+                },
+            }
+
+            result = loop._execute_action(action, state)
+            duplicate = loop._execute_action(action, state)
+            content = (root / "state" / "memories" / "real-db-integration-tests.md").read_text(encoding="utf-8")
+            index = (root / "state" / "memory.md").read_text(encoding="utf-8")
+            hard_memory_exists = (root / "state" / "hard_memory.md").exists()
+            soft_memory_exists = (root / "state" / "soft_memory.md").exists()
+
+        self.assertTrue(result.ok)
+        self.assertFalse(duplicate.ok)
+        self.assertTrue(content.startswith('---\nname: "real-db-integration-tests"\n'))
+        self.assertIn("type: feedback", content)
+        self.assertIn("**Why:** Mock-backed tests passed", content)
+        self.assertIn("**How to apply:** Connect integration tests", content)
+        self.assertIn("[feedback] real-db-integration-tests", index)
+        self.assertFalse(hard_memory_exists)
+        self.assertFalse(soft_memory_exists)
+
+    def test_save_memory_rejects_invalid_type_feedback_without_why_and_project_relative_dates(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Remember constraints", max_steps=1)
+            loop._ensure_state_files()
+            state = create_initial_state("Remember constraints")
+
+            invalid_type = loop._execute_action(
+                {
+                    "action": "save_memory",
+                    "target": "custom-kind",
+                    "args": {
+                        "name": "custom-kind",
+                        "description": "A custom memory kind",
+                        "type": "architecture",
+                        "content": "Do not allow this.",
+                    },
+                },
+                state,
+            )
+            missing_feedback_fields = loop._execute_action(
+                {
+                    "action": "save_memory",
+                    "target": "no-mocks",
+                    "args": {
+                        "name": "no-mocks",
+                        "description": "Do not mock integration tests",
+                        "type": "feedback",
+                        "content": "Do not mock integration tests.",
+                    },
+                },
+                state,
+            )
+            relative_project_date = loop._execute_action(
+                {
+                    "action": "save_memory",
+                    "target": "freeze-date",
+                    "args": {
+                        "name": "freeze-date",
+                        "description": "Freeze merges by next Thursday",
+                        "type": "project",
+                        "content": "Freeze merges by next Thursday.",
+                    },
+                },
+                state,
+            )
+
+        self.assertFalse(invalid_type.ok)
+        self.assertIn("type must be one of", invalid_type.summary)
+        self.assertFalse(missing_feedback_fields.ok)
+        self.assertIn("feedback memory must include Why", missing_feedback_fields.summary)
+        self.assertIn("feedback memory must include How to apply", missing_feedback_fields.summary)
+        self.assertFalse(relative_project_date.ok)
+        self.assertIn("relative dates", relative_project_date.summary)
+
+    def test_memory_index_is_truncated_by_lines_and_bytes(self) -> None:
+        by_lines = truncate_entrypoint_content("\n".join(f"- item {index}" for index in range(250)))
+        by_bytes = truncate_entrypoint_content("x" * 30_000)
+
+        self.assertTrue(by_lines.was_line_truncated)
+        self.assertIn("WARNING: memory.md was truncated", by_lines.content)
+        self.assertTrue(by_bytes.was_byte_truncated)
+        self.assertLessEqual(len(by_bytes.content.encode("utf-8")), 25_200)
+
+    def test_memory_retriever_scans_headers_and_loads_relevant_memory_with_local_fallback(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "state" / "memories"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "feedback_no_mock_db.md").write_text(
+                "---\n"
+                "name: no-mock-database\n"
+                "description: Integration tests must use real database\n"
+                "type: feedback\n"
+                "---\n\n"
+                "Integration tests must use the real database.\n\n"
+                "**Why:** Mock tests missed migration failures.\n"
+                "**How to apply:** Connect to the real test DB.\n",
+                encoding="utf-8",
+            )
+            (memory_dir / "user_preferences.md").write_text(
+                "---\n"
+                "name: user-preferences\n"
+                "description: User prefers terse responses\n"
+                "type: user\n"
+                "---\n\n"
+                + ("body line that should not affect header scanning\n" * 40),
+                encoding="utf-8",
+            )
+
+            headers = scan_memory_headers(memory_dir)
+            retrieved = MemoryRetriever(root / "state").retrieve("write integration tests against database")
+
+        self.assertEqual(len(headers), 2)
+        self.assertEqual(headers[0].filename.endswith(".md"), True)
+        self.assertEqual(retrieved.source, "local")
+        self.assertEqual(retrieved.selected_filenames, ["feedback_no_mock_db.md"])
+        self.assertIn("real database", retrieved.memories[0].content)
+
+    def test_agent_loop_injects_relevant_memories_into_context(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Write integration tests", max_steps=1)
+            loop._ensure_state_files()
+            memory_dir = root / "state" / "memories"
+            (memory_dir / "feedback_no_mock_db.md").write_text(
+                "---\n"
+                "name: no-mock-database\n"
+                "description: Integration tests must use real database\n"
+                "type: feedback\n"
+                "---\n\n"
+                "Integration tests must use the real database.\n\n"
+                "**Why:** Mock tests missed migration failures.\n"
+                "**How to apply:** Connect to the real test DB.\n",
+                encoding="utf-8",
+            )
+            (root / "state" / "memory.md").write_text(
+                "# Memory Index\n\n"
+                "## Entries\n"
+                "- [feedback] no-mock-database: Integration tests must use real database (`memories/feedback_no_mock_db.md`)\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Write integration tests against the database")
+
+            context = loop.context_builder.build(state, relevant_memories=loop._relevant_memory_context(state))
+
+        self.assertIn("# Relevant Memories", context)
+        self.assertIn("feedback_no_mock_db.md", context)
+        self.assertIn("Mock tests missed migration failures", context)
+        self.assertEqual(loop._last_memory_selection["source"], "local")
+
     def test_handoff_ready_blocks_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2508,8 +2720,6 @@ class HarnessBehaviorTests(unittest.TestCase):
             root = Path(tmp)
             (root / "state").mkdir()
             (root / "state" / "traces").mkdir()
-            (root / "state" / "hard_memory.md").write_text("# Hard Memory\n\n- [commit:x] fact\n", encoding="utf-8")
-            (root / "state" / "soft_memory.md").write_text("# Soft Memory\n\n- [next] inspect\n", encoding="utf-8")
             loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
             state = create_initial_state("Implement a feature")
             state.session_budget_tokens = 100
@@ -2526,8 +2736,13 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("## 2. Session Budget", handoff)
         self.assertIn("## 4. Handoff Data References", handoff)
         self.assertIn("structured_payload: state/handoff_payload.json", handoff)
+        self.assertIn("memory_index: state/memory.md", handoff)
+        self.assertIn("memories: state/memories/", handoff)
         self.assertIn("## 14. Resume Instructions", handoff)
         self.assertIn("threshold_tokens: 70", handoff)
+        self.assertNotIn("hard_memory", handoff)
+        self.assertNotIn("soft_memory", handoff)
+        self.assertNotIn("Soft Memory", handoff)
         self.assertEqual(payload["schema"], "long-agent.handoff-payload.v1")
         self.assertTrue(payload["session_budget"]["handoff_ready"])
 
@@ -2579,9 +2794,22 @@ class HarnessBehaviorTests(unittest.TestCase):
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state").mkdir()
-            (root / "state" / "memory.md").write_text("# Memory\n", encoding="utf-8")
-            (root / "state" / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
-            (root / "state" / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            (root / "state" / "memories").mkdir()
+            (root / "state" / "memory.md").write_text(
+                "# Memory Index\n\n"
+                "## Entries\n"
+                "- [user] user-react: User is experienced in Go and new to React (`memories/user-react.md`)\n",
+                encoding="utf-8",
+            )
+            (root / "state" / "memories" / "user-react.md").write_text(
+                "---\n"
+                "name: user-react\n"
+                "description: User is experienced in Go and new to React\n"
+                "type: user\n"
+                "---\n\n"
+                "User has ten years of Go backend experience and is new to React.\n",
+                encoding="utf-8",
+            )
             (root / "state" / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
             (root / "state" / "verifier_report.md").write_text("# Verifier\n", encoding="utf-8")
             (root / "project_spec.md").write_text("# Spec\n", encoding="utf-8")
@@ -2604,9 +2832,12 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
         self.assertIn("- write: create/overwrite/append file", context)
         self.assertIn("- verify: ask harness verifier", context)
-        self.assertIn("# Hard Memory", context)
-        self.assertIn("# Soft Memory", context)
-        self.assertIn("Soft Memory is not evidence", context)
+        self.assertIn("# Relevant Memories", context)
+        self.assertIn("[user] user-react", context)
+        self.assertNotIn("User has ten years of Go", context)
+        self.assertNotIn("# Hard Memory", context)
+        self.assertNotIn("# Soft Memory", context)
+        self.assertNotIn("Soft Memory is not evidence", context)
         self.assertNotIn("# Always-on Context", context)
         self.assertNotIn("## Non-Negotiable Rules", context)
         self.assertLess(context.index("# Critical Context"), context.index("# Working Context"))
@@ -2917,8 +3148,6 @@ class HarnessBehaviorTests(unittest.TestCase):
             state_dir = root / "state" / "benchmarks" / "todo_counter"
             (state_dir / "rejected_candidates").mkdir(parents=True)
             (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
-            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
-            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
             (state_dir / "project_spec.md").write_text("# Spec\n" + ("spec\n" * 500), encoding="utf-8")
             (state_dir / "handoff.md").write_text(
                 "# Worker Session Handoff\n\n"
@@ -2967,8 +3196,6 @@ class HarnessBehaviorTests(unittest.TestCase):
             state_dir = root / "state"
             state_dir.mkdir()
             (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
-            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
-            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
             (state_dir / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
             (state_dir / "project_spec.md").write_text("# Spec\n" + ("details\n" * 3000), encoding="utf-8")
             state = create_initial_state("Implement a feature")
@@ -2988,8 +3215,6 @@ class HarnessBehaviorTests(unittest.TestCase):
                 state_dir = root / "state"
                 state_dir.mkdir()
                 (state_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
-                (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
-                (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
                 (state_dir / "handoff.md").write_text("# Handoff\n", encoding="utf-8")
                 (state_dir / "project_spec.md").write_text("# Spec\n" + ("details\n" * 3000), encoding="utf-8")
                 state = create_initial_state("Implement a feature")
