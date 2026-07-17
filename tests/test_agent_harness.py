@@ -2715,6 +2715,124 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.session_used_tokens, 0)
         self.assertFalse(state.handoff_ready)
 
+    def test_resume_defaults_to_run_mode(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            (root / "state" / "current_task.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "current",
+                        "user_goal": "Resume task",
+                        "acceptance_criteria": [],
+                        "nodes": [],
+                        "iterations": 1,
+                        "last_action": {},
+                        "last_observation": {},
+                        "evidence_sources": [],
+                        "acceptance_contracts": [],
+                        "interaction_mode": "question",
+                        "pending_repair": {
+                            "summary": "Interactive question cannot use project-progress action 'bash'.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(root=root, task="Resume task", max_steps=1, resume=True)
+
+            state = loop._load_or_create_state()
+
+        self.assertEqual(state.interaction_mode, "")
+        self.assertEqual(state.pending_repair, {})
+
+    def test_resume_replaces_saved_conversation_with_current_session_messages(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            (root / "state" / "current_task.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "current",
+                        "user_goal": "Resume task",
+                        "acceptance_criteria": [],
+                        "nodes": [],
+                        "iterations": 1,
+                        "last_action": {},
+                        "last_observation": {},
+                        "evidence_sources": [],
+                        "acceptance_contracts": [],
+                        "conversation_messages": [
+                            {"role": "user", "content": "old session question"},
+                            {"role": "assistant", "content": "old session answer"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Resume task",
+                max_steps=1,
+                resume=True,
+                conversation_messages=[{"role": "user", "content": "new session question"}],
+            )
+
+            state = loop._load_or_create_state()
+
+        self.assertEqual(state.conversation_messages, [{"role": "user", "content": "new session question"}])
+
+    def test_resume_uses_existing_generated_tasks_as_task_graph(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "budget_management"
+            (state_dir / "traces").mkdir(parents=True)
+            generated = state_dir / "generated_tasks.json"
+            generated.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T7", "status": "in_progress", "priority": 2, "depends_on": []},
+                            {"id": "T9", "status": "pending", "priority": 2, "depends_on": ["T7"]},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "current_task.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T7",
+                        "user_goal": "T7: Implement periodic transactions",
+                        "acceptance_criteria": [],
+                        "nodes": [{"id": "T7", "status": "in_progress", "evidence": []}],
+                        "iterations": 1,
+                        "last_action": {},
+                        "last_observation": {},
+                        "evidence_sources": [],
+                        "acceptance_contracts": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loop = AgentLoop(
+                root=root,
+                task="Resume T7",
+                max_steps=1,
+                resume=True,
+                benchmark_id="budget_management",
+            )
+            loop.orchestrator.mark_verified("T7", True, "Verifier passed.")
+            data = json.loads(generated.read_text(encoding="utf-8"))
+
+        self.assertEqual(loop.generated_tasks_path, generated)
+        self.assertEqual(loop.tasks_path, generated)
+        self.assertEqual(data["tasks"][0]["status"], "completed")
+        self.assertEqual(data["tasks"][0]["evidence"], ["Verifier passed."])
+
     def test_budget_handoff_uses_current_turn_tokens_not_session_total(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)

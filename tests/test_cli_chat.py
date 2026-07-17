@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from agent.chat import ChatConfig, InteractiveCLI, launch_chat_window
+from agent.chat import ChatConfig, ChatMessage, InteractiveCLI, launch_chat_window
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop, RunResult
 from agent.main import build_parser, resolve_optional_task
@@ -67,7 +67,7 @@ class ChatCLITests(unittest.TestCase):
         self.assertIn("Use Shift+Enter/new lines as needed", outputs[-1])
         self.assertIn("/send", outputs[-1])
         self.assertNotIn("/ask", outputs[-1])
-        self.assertNotIn("file path", outputs[-1])
+        self.assertIn("project spec file", outputs[-1])
 
     def test_plain_message_requires_selected_mode(self) -> None:
         outputs: list[str] = []
@@ -184,7 +184,7 @@ class ChatCLITests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_agent_project_flow_treats_path_looking_text_as_plain_requirements(self) -> None:
+    def test_agent_project_flow_reads_project_spec_path_from_message(self) -> None:
         outputs: list[str] = []
         root = Path.cwd() / ".tmp_tests" / f"chat-agent-spec-{uuid4().hex}"
         spec_path = root / "eval" / "benchmarks" / "sample" / "task.md"
@@ -203,14 +203,43 @@ class ChatCLITests(unittest.TestCase):
             message="done",
         )
         try:
-            with patch("agent.chat.build_project_spec", return_value="# Built Spec\n") as build_spec:
-                with patch.object(AgentLoop, "run", return_value=run_result):
+            with patch("agent.chat.build_project_spec") as build_spec:
+                with patch.object(AgentLoop, "run", return_value=run_result) as run_loop:
                     cli._handle_command(f"/agent requirements are described by this text: `{spec_path}`")
-            self.assertIsNone(cli.config.benchmark_id)
-            self.assertEqual(cli.state_dir, root / "state")
-            self.assertEqual(build_spec.call_args.args[0], "offline")
-            self.assertEqual(build_spec.call_args.kwargs, {})
-            self.assertIn(str(spec_path), build_spec.call_args.args[1][0]["content"])
+            build_spec.assert_not_called()
+            run_loop.assert_called_once()
+            self.assertEqual(cli.config.benchmark_id, "sample")
+            self.assertEqual(cli.state_dir, root / "state" / "benchmarks" / "sample")
+            materialized = root / "state" / "benchmarks" / "sample" / "project_spec.md"
+            self.assertEqual(materialized.read_text(encoding="utf-8"), "Build sample app.")
+            self.assertTrue(any("project spec source" in output for output in outputs))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_agent_project_flow_accepts_direct_project_spec_path(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-agent-direct-spec-{uuid4().hex}"
+        spec_path = root / "specs" / "project_spec.md"
+        spec_path.parent.mkdir(parents=True)
+        spec_path.write_text("# Direct Spec\n", encoding="utf-8")
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=root / "state" / "traces" / "run.jsonl",
+            state_path=root / "state" / "current_task.json",
+            message="done",
+        )
+        try:
+            with patch("agent.chat.build_project_spec") as build_spec:
+                with patch.object(AgentLoop, "run", return_value=run_result):
+                    cli._handle_command(f"/agent {spec_path}")
+            build_spec.assert_not_called()
+            self.assertEqual((root / "state" / "project_spec.md").read_text(encoding="utf-8"), "# Direct Spec\n")
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -321,6 +350,27 @@ class ChatCLITests(unittest.TestCase):
         self.assertIn("First answer.", context)
         self.assertIn("Latest User Message:\nLatest question.", context)
 
+    def test_make_loop_uses_only_current_session_messages(self) -> None:
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            use_color=False,
+        )
+        cli.messages = [
+            ChatMessage("user", "old session question"),
+            ChatMessage("assistant", "old session answer"),
+            ChatMessage("user", "new session question"),
+        ]
+        cli.context_message_start = 2
+
+        loop = cli._make_loop(
+            "Resume task",
+            resume=True,
+            include_conversation=True,
+            interaction_mode="question",
+        )
+
+        self.assertEqual(loop.conversation_messages, [{"role": "user", "content": "new session question"}])
+
     def test_commands_work_without_starting_agent_loop(self) -> None:
         outputs: list[str] = []
         inputs = iter(["/status", "/history", "/new", "/exit"])
@@ -348,13 +398,56 @@ class ChatCLITests(unittest.TestCase):
                 "step": 2,
                 "action": "read",
                 "target": "README.md",
-                "thought_summary": "Inspect the README.",
+                "thought_summary": "Inspect the README without truncating the full reasoning summary.",
             }
         )
         cli._show_event({"type": "tool_result", "step": 2, "action": "read", "ok": True, "summary": "Read 20 lines."})
-        self.assertEqual(outputs[0], "      thought_summary Inspect the README.")
+        self.assertEqual(outputs[0], "      Inspect the README without truncating the full reasoning summary.")
         self.assertEqual(outputs[1], "      calling read README.md")
         self.assertEqual(len(outputs), 2)
+
+    def test_tool_event_thought_summary_is_not_truncated(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        long_summary = "Start " + ("x" * 180) + " end"
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "step": 2,
+                "action": "search",
+                "target": "needle",
+                "thought_summary": long_summary,
+            }
+        )
+        self.assertEqual(outputs[0], f"      {long_summary}")
+        self.assertNotIn("thought_summary", outputs[0])
+        self.assertEqual(outputs[1], "      calling search needle")
+
+    def test_tool_event_target_is_not_truncated(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        long_target = (
+            "eval/benchmarks/budget_management/workspace/src/transaction_service.py "
+            "lines 1-240 for periodic transaction implementation details"
+        )
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "step": 2,
+                "action": "read",
+                "target": long_target,
+            }
+        )
+        self.assertEqual(outputs[0], f"      calling read {long_target}")
+        self.assertNotIn("...", outputs[0])
 
     def test_verify_action_is_not_rendered(self) -> None:
         outputs: list[str] = []
@@ -381,7 +474,7 @@ class ChatCLITests(unittest.TestCase):
                 "summary": "Protocol error: The read operation timed out",
             }
         )
-        self.assertEqual(outputs, ["      thought_summary Run independent verification."])
+        self.assertEqual(outputs, ["      Run independent verification."])
 
     def test_answer_action_is_not_rendered_as_tool_call(self) -> None:
         outputs: list[str] = []

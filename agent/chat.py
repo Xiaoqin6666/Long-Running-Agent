@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ UI_WIDTH = 72
 TOOL_ACTIONS = {"bash", "debug_context", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /chat      Switch to read-only chat mode; messages can be answered but do not start project work
-  /agent     Switch to agent mode; collect project requirements before starting work
+  /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
   /send      Start agent work from the collected /agent requirements
   /clear     Clear collected /agent requirements
   /mode      Show the current input mode
@@ -83,6 +84,7 @@ class InteractiveCLI:
         self.last_result: RunResult | None = None
         self.active_mode = "idle"
         self.agent_draft: list[str] = []
+        self.context_message_start = 0
 
     def run(self) -> int:
         if self.use_color:
@@ -129,7 +131,7 @@ class InteractiveCLI:
         elif command == "/agent":
             self.active_mode = "agent"
             if not content:
-                self.output("Agent mode active. Paste or type project requirements. Use Shift+Enter/new lines as needed, then /send to start. Use /chat to switch to chat-only mode.")
+                self.output("Agent mode active. Paste or type project requirements, or say where the project spec file is. Use Shift+Enter/new lines as needed, then /send to start. Use /chat to switch to chat-only mode.")
             else:
                 self._run_agent_project_flow(content)
         elif command == "/send":
@@ -163,6 +165,7 @@ class InteractiveCLI:
             self._resume()
         elif command == "/new":
             self.messages.clear()
+            self.context_message_start = 0
             self.last_task = ""
             self.last_result = None
             self.active_mode = "idle"
@@ -421,22 +424,38 @@ class InteractiveCLI:
         self._run_agent_project_flow(requirement)
 
     def _run_agent_project_flow(self, message: str) -> None:
+        source_path = self._extract_project_spec_path(message)
+        if source_path:
+            benchmark_id = self._infer_benchmark_id_from_path(source_path)
+            if benchmark_id:
+                self._select_benchmark(benchmark_id)
+
         user_message = ChatMessage("user", message)
         self.messages.append(user_message)
         self._append_history(user_message)
         self.last_task = message
 
         self.output(self._paint("Agent > preparing project spec...", "green", bold=True))
-        try:
-            project_spec = build_project_spec(
-                self.config.provider,
-                [{"role": item.role, "content": item.content} for item in self.messages],
-            )
-        except Exception as exc:
-            answer = f"Could not build project spec: {exc}"
-            self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
-            self._record_assistant(answer)
-            return
+        if source_path:
+            try:
+                project_spec = source_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                answer = f"Could not read project spec file {self._relative_path(source_path)}: {exc}"
+                self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+                self._record_assistant(answer)
+                return
+            self.output(self._paint(f"Agent > project spec source: {self._relative_path(source_path)}", "green", bold=True))
+        else:
+            try:
+                project_spec = build_project_spec(
+                    self.config.provider,
+                    [{"role": item.role, "content": item.content} for item in self.messages],
+                )
+            except Exception as exc:
+                answer = f"Could not build project spec: {exc}"
+                self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+                self._record_assistant(answer)
+                return
 
         spec_path = self._write_project_spec(project_spec)
         self._reset_generated_project_state()
@@ -459,6 +478,86 @@ class InteractiveCLI:
             self._record_assistant(answer)
             return
         self._finish_turn(result)
+
+    def _extract_project_spec_path(self, message: str) -> Path | None:
+        candidates: list[str] = []
+        markers = [
+            "规格文件在",
+            "规格文件:",
+            "规格文件：",
+            "规格说明在",
+            "规格说明存放在",
+            "项目规格在",
+            "项目规格文件在",
+            "spec file is",
+            "spec file:",
+            "project spec is",
+            "project spec:",
+            "requirements are in",
+            "requirements are at",
+            "requirements are described in",
+            "requirements are described by",
+        ]
+        for line in message.splitlines():
+            lowered = line.lower()
+            for marker in markers:
+                index = lowered.find(marker)
+                if index == -1:
+                    continue
+                tail = line[index + len(marker) :].strip(" \t:：")
+                candidates.extend(self._path_candidates(tail))
+
+        stripped = message.strip()
+        if "\n" not in stripped:
+            candidates.extend(self._path_candidates(stripped, include_whole=True))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            cleaned = self._clean_user_path(candidate)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            path = Path(cleaned).expanduser()
+            if not path.is_absolute():
+                path = self.config.root / path
+            try:
+                if path.exists() and path.is_file():
+                    return path.resolve()
+            except OSError:
+                continue
+        return None
+
+    def _path_candidates(self, text: str, include_whole: bool = False) -> list[str]:
+        candidates: list[str] = []
+        if include_whole:
+            candidates.append(text)
+            return candidates
+        quoted = re.findall(r"[`\"']([^`\"']+\.(?:md|markdown|txt))[`\"']", text, flags=re.IGNORECASE)
+        candidates.extend(quoted)
+        unquoted = re.findall(
+            r"((?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|[A-Za-z0-9_.-]+[\\/]).*?\.(?:md|markdown|txt))",
+            text,
+            flags=re.IGNORECASE,
+        )
+        candidates.extend(unquoted)
+        return candidates
+
+    @staticmethod
+    def _clean_user_path(raw: str) -> str:
+        return raw.strip().strip("`\"'“”‘’<>").rstrip(" \t,.;，。；、")
+
+    def _infer_benchmark_id_from_path(self, path: Path) -> str | None:
+        try:
+            relative = path.resolve().relative_to((self.config.root / "eval" / "benchmarks").resolve())
+        except ValueError:
+            return None
+        return relative.parts[0] if relative.parts else None
+
+    def _select_benchmark(self, benchmark_id: str) -> None:
+        self.config.benchmark_id = benchmark_id
+        self.state_dir = self.config.root / "state" / "benchmarks" / benchmark_id
+        self.state_path = self.state_dir / "current_task.json"
+        self.history_path = self.state_dir / "chat_history.jsonl"
 
     def _write_project_spec(self, project_spec: str) -> Path:
         spec_path = self.state_dir / "project_spec.md"
@@ -509,6 +608,7 @@ class InteractiveCLI:
         if not task:
             self.output("The saved state has no user goal to resume.")
             return
+        self.context_message_start = len(self.messages)
         self.output(self._paint("Agent > resuming...", "green", bold=True))
         try:
             result = self._make_loop(task, resume=True, include_conversation=False, interaction_mode="").run()
@@ -539,7 +639,10 @@ class InteractiveCLI:
             max_sessions=self.config.max_sessions,
             event_handler=self._show_event,
             conversation_messages=(
-                [{"role": message.role, "content": message.content} for message in self.messages]
+                [
+                    {"role": message.role, "content": message.content}
+                    for message in self.messages[self.context_message_start :]
+                ]
                 if include_conversation
                 else None
             ),
@@ -554,13 +657,13 @@ class InteractiveCLI:
         if event_type != "tool_start":
             return
 
-        thought_summary = compact_text(event.get("thought_summary", ""), 100)
+        thought_summary = str(event.get("thought_summary", ""))
         if thought_summary:
-            self.output(self._paint(f"      thought_summary {thought_summary}", "gray"))
+            self.output(f"      {thought_summary}")
         if action == "verify":
             return
 
-        target = compact_text(event.get("target", ""), 56)
+        target = str(event.get("target", ""))
         detail = f" {target}" if target else ""
         verb = "calling" if action in TOOL_ACTIONS else "action"
         self.output(self._paint(f"      {verb} {action}{detail}", "gray"))

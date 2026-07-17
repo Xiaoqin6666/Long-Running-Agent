@@ -103,7 +103,11 @@ class AgentLoop:
         self.trace_dir = self.state_dir / "traces"
         self.debug_context_dir = self.state_dir / "debug_contexts"
         self.project_spec_materialized_path = self.state_dir / "project_spec.md" if project_spec_path else None
-        self.generated_tasks_path = self.state_dir / "generated_tasks.json" if project_spec_path and not tasks_path else None
+        state_generated_tasks_path = self.state_dir / "generated_tasks.json"
+        use_generated_tasks_path = bool(
+            not tasks_path and (project_spec_path or (resume and state_generated_tasks_path.exists()))
+        )
+        self.generated_tasks_path = state_generated_tasks_path if use_generated_tasks_path else None
         self.runtime_tasks_path = self.state_dir / "runtime_tasks.json" if tasks_path else None
         self.tasks_path = self.runtime_tasks_path or self.generated_tasks_path or tasks_path
         self.state_path = self.state_dir / "current_task.json"
@@ -235,6 +239,7 @@ class AgentLoop:
                         "step": step,
                         "action": str(action.get("action", "unknown")),
                         "target": str(action.get("target", "")),
+                        "thought_summary": str(action.get("thought_summary", "")),
                     }
                 )
                 observation = self._execute_action(action, state)
@@ -273,6 +278,7 @@ class AgentLoop:
                     "target": str(action.get("target", "")),
                     "ok": observation.ok,
                     "summary": observation.summary,
+                    "thought_summary": str(action.get("thought_summary", "")),
                 }
             )
 
@@ -325,6 +331,14 @@ class AgentLoop:
             state = TaskState.from_dict(json.loads(self.state_path.read_text(encoding="utf-8-sig")))
             state.session_used_tokens = 0
             state.handoff_ready = False
+            state.conversation_messages = list(self.conversation_messages)
+            state.interaction_mode = self.interaction_mode
+            pending_repair_summary = str(state.pending_repair.get("summary", ""))
+            if (
+                state.pending_repair.get("reason") == "interactive_question"
+                or pending_repair_summary.startswith("Interactive question cannot use project-progress action")
+            ):
+                state.pending_repair = {}
         elif self._initializer_needed():
             state = create_initializer_state(
                 self.task,
