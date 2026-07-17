@@ -3,12 +3,12 @@ from __future__ import annotations
 import shutil
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import patch
 from uuid import uuid4
 
-from agent.chat import ChatConfig, ChatMessage, InteractiveCLI, launch_chat_window
+from agent.chat import ChatConfig, InteractiveCLI, launch_chat_window
 from agent.context import ContextBuilder
-from agent.loop import AgentLoop
+from agent.loop import AgentLoop, RunResult
 from agent.main import build_parser, resolve_optional_task
 from agent.memory import parse_memory
 from agent.planner import TaskState, create_initial_state
@@ -30,35 +30,189 @@ class ChatCLITests(unittest.TestCase):
         args = build_parser().parse_args(["--chat", "--project-spec", "eval/benchmarks/budget_management/task.md"])
         self.assertIsNone(resolve_optional_task(args))
 
-    def test_explicit_ask_and_do_commands_select_mode(self) -> None:
+    def test_chat_command_runs_read_only_turn_without_starting_agent_flow(self) -> None:
         outputs: list[str] = []
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
             output_fn=outputs.append,
             use_color=False,
         )
-        with patch.object(cli, "_run_turn") as run_turn:
-            cli._handle_command("/ask 显示现在task的执行进度")
-            cli._handle_command("/do 继续执行当前任务")
-        self.assertEqual(
-            run_turn.call_args_list,
-            [
-                call("显示现在task的执行进度", interaction_mode="question"),
-                call("继续执行当前任务", interaction_mode="work"),
-            ],
-        )
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            with patch.object(cli, "_run_turn") as run_turn:
+                cli._handle_command("/chat show status")
+        run_agent.assert_not_called()
+        run_turn.assert_called_once_with("show status", interaction_mode="question")
+        self.assertEqual(cli.active_mode, "chat")
 
-    def test_plain_message_requires_explicit_mode(self) -> None:
+    def test_agent_command_starts_project_flow(self) -> None:
         outputs: list[str] = []
-        inputs = iter(["显示进度", "/exit"])
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            cli._handle_command("/agent build a budget app")
+        run_agent.assert_called_once_with("build a budget app")
+        self.assertEqual(cli.active_mode, "agent")
+
+    def test_agent_mode_prompt_requests_direct_requirements(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        cli._handle_command("/agent")
+        self.assertIn("Use Shift+Enter/new lines as needed", outputs[-1])
+        self.assertIn("/send", outputs[-1])
+        self.assertNotIn("/ask", outputs[-1])
+        self.assertNotIn("file path", outputs[-1])
+
+    def test_plain_message_requires_selected_mode(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["show status", "/exit"])
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
             input_fn=lambda prompt: next(inputs),
             output_fn=outputs.append,
             use_color=False,
         )
-        self.assertEqual(cli.run(), 0)
-        self.assertIn("Choose an explicit mode: /ask <question> or /do <task>.", outputs)
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            self.assertEqual(cli.run(), 0)
+        run_agent.assert_not_called()
+        self.assertIn("Choose /chat for conversation or /agent for autonomous project work.", outputs)
+
+    def test_plain_message_uses_active_mode(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["/chat", "show status", "/agent", "build a budget app", "/send", "/exit"])
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            with patch.object(cli, "_run_turn") as run_turn:
+                self.assertEqual(cli.run(), 0)
+        run_agent.assert_called_once_with("build a budget app")
+        run_turn.assert_called_once_with("show status", interaction_mode="question")
+
+    def test_agent_mode_collects_multiline_requirements_until_send(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["/agent", "line one", "line two", "/send", "/exit"])
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            self.assertEqual(cli.run(), 0)
+        run_agent.assert_called_once_with("line one\nline two")
+        self.assertEqual(cli.agent_draft, [])
+        self.assertTrue(any("Added to agent requirements draft" in output for output in outputs))
+
+    def test_agent_mode_clear_discards_collected_requirements(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        cli._handle_command("/agent")
+        cli._handle_plain_message("line one")
+        cli._handle_command("/clear")
+        self.assertEqual(cli.agent_draft, [])
+        self.assertIn("Cleared collected agent requirements.", outputs)
+
+    def test_chat_and_agent_modes_switch_directly(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        cli._handle_command("/chat")
+        self.assertEqual(cli.active_mode, "chat")
+        cli._handle_command("/agent")
+        self.assertEqual(cli.active_mode, "agent")
+        cli._handle_command("/chat")
+        self.assertEqual(cli.active_mode, "chat")
+        cli._handle_command("/mode")
+        self.assertIn("Current mode: chat.", outputs)
+
+    def test_legacy_ask_and_do_aliases_select_new_modes(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
+            with patch.object(cli, "_run_turn") as run_turn:
+                cli._handle_command("/ask chat only")
+                cli._handle_command("/do start work")
+        run_turn.assert_called_once_with("chat only", interaction_mode="question")
+        run_agent.assert_called_once_with("start work")
+
+    def test_agent_project_flow_writes_project_spec_and_starts_initializer(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-agent-{uuid4().hex}"
+        root.mkdir(parents=True)
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1, benchmark_id="sample"),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=root / "state" / "benchmarks" / "sample" / "traces" / "run.jsonl",
+            state_path=root / "state" / "benchmarks" / "sample" / "current_task.json",
+            message="done",
+        )
+        try:
+            with patch("agent.chat.build_project_spec", return_value="# Built Spec\n") as build_spec:
+                with patch.object(AgentLoop, "run", return_value=run_result) as run_loop:
+                    cli._handle_command("/agent build a budget app")
+            build_spec.assert_called_once()
+            run_loop.assert_called_once()
+            spec_path = root / "state" / "benchmarks" / "sample" / "project_spec.md"
+            self.assertEqual(spec_path.read_text(encoding="utf-8"), "# Built Spec\n")
+            self.assertTrue(any("project spec saved" in output for output in outputs))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_agent_project_flow_treats_path_looking_text_as_plain_requirements(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-agent-spec-{uuid4().hex}"
+        spec_path = root / "eval" / "benchmarks" / "sample" / "task.md"
+        spec_path.parent.mkdir(parents=True)
+        spec_path.write_text("Build sample app.", encoding="utf-8")
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=root / "state" / "benchmarks" / "sample" / "traces" / "run.jsonl",
+            state_path=root / "state" / "benchmarks" / "sample" / "current_task.json",
+            message="done",
+        )
+        try:
+            with patch("agent.chat.build_project_spec", return_value="# Built Spec\n") as build_spec:
+                with patch.object(AgentLoop, "run", return_value=run_result):
+                    cli._handle_command(f"/agent requirements are described by this text: `{spec_path}`")
+            self.assertIsNone(cli.config.benchmark_id)
+            self.assertEqual(cli.state_dir, root / "state")
+            self.assertEqual(build_spec.call_args.args[0], "offline")
+            self.assertEqual(build_spec.call_args.kwargs, {})
+            self.assertIn(str(spec_path), build_spec.call_args.args[1][0]["content"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_skill_command_collects_guided_fields(self) -> None:
         outputs: list[str] = []
@@ -72,9 +226,9 @@ class ChatCLITests(unittest.TestCase):
             use_color=False,
         )
         try:
-            with patch.object(cli, "_run_turn") as run_turn:
+            with patch.object(cli, "_run_agent_project_flow") as run_agent:
                 cli._handle_command("/skill")
-            run_turn.assert_not_called()
+            run_agent.assert_not_called()
             skill_path = root / "state" / "skills" / "debug-failures.md"
             skill = parse_skill(skill_path.read_text(encoding="utf-8"))
             self.assertEqual(skill.name, "debug-failures")
@@ -94,9 +248,9 @@ class ChatCLITests(unittest.TestCase):
             output_fn=outputs.append,
             use_color=False,
         )
-        with patch.object(cli, "_run_turn") as run_turn:
+        with patch.object(cli, "_run_agent_project_flow") as run_agent:
             cli._handle_command("/skill")
-        run_turn.assert_not_called()
+        run_agent.assert_not_called()
         self.assertIn("Name is required.", outputs)
         self.assertIn("Skill setup cancelled.", outputs)
 
@@ -119,9 +273,9 @@ class ChatCLITests(unittest.TestCase):
             use_color=False,
         )
         try:
-            with patch.object(cli, "_run_turn") as run_turn:
+            with patch.object(cli, "_run_agent_project_flow") as run_agent:
                 cli._handle_command("/memory")
-            run_turn.assert_not_called()
+            run_agent.assert_not_called()
             memory_path = root / "state" / "memories" / "go-react-profile.md"
             memory = parse_memory(memory_path.read_text(encoding="utf-8"))
             self.assertEqual(memory.name, "go-react-profile")
@@ -145,10 +299,27 @@ class ChatCLITests(unittest.TestCase):
         context = ContextBuilder(Path.cwd())._working_context(state)
         self.assertIn("# Active Task\nT3: Persistence layer", context)
         self.assertIn("# User Conversation", context)
-        self.assertIn("Agent: The parser rejects null end values.", context)
-        self.assertIn("Latest User Message: Fix it and run the focused test", context)
+        self.assertIn("## Conversation Turn 1", context)
+        self.assertIn("User:\nInspect the failing test", context)
+        self.assertIn("Agent:\nThe parser rejects null end values.", context)
+        self.assertIn("## Conversation Turn 2", context)
+        self.assertIn("Latest User Message:\nFix it and run the focused test", context)
         restored = TaskState.from_dict(state.to_dict())
         self.assertEqual(restored.conversation_messages, state.conversation_messages)
+
+    def test_conversation_context_keeps_all_messages_without_truncation(self) -> None:
+        state = create_initial_state("Explain everything")
+        old_message = "old-start-" + ("x" * 9000) + "-old-end"
+        state.conversation_messages = [
+            {"role": "user", "content": old_message},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Latest question."},
+        ]
+        context = ContextBuilder(Path.cwd())._conversation_context(state)
+        self.assertIn("old-start-", context)
+        self.assertIn("-old-end", context)
+        self.assertIn("First answer.", context)
+        self.assertIn("Latest User Message:\nLatest question.", context)
 
     def test_commands_work_without_starting_agent_loop(self) -> None:
         outputs: list[str] = []
@@ -164,18 +335,53 @@ class ChatCLITests(unittest.TestCase):
         self.assertTrue(any("No messages" in line for line in outputs))
         append_history.assert_called_once()
 
-    def test_tool_events_are_rendered_as_start_and_result(self) -> None:
+    def test_tool_events_render_thought_and_start_without_results(self) -> None:
         outputs: list[str] = []
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
             output_fn=outputs.append,
             use_color=False,
         )
-        cli._show_event({"type": "tool_start", "step": 2, "action": "read", "target": "README.md"})
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "step": 2,
+                "action": "read",
+                "target": "README.md",
+                "thought_summary": "Inspect the README.",
+            }
+        )
         cli._show_event({"type": "tool_result", "step": 2, "action": "read", "ok": True, "summary": "Read 20 lines."})
-        self.assertEqual(outputs[0], "   2  calling read README.md")
-        self.assertEqual(outputs[1], "      result OK")
-        self.assertEqual(outputs[2], "      Read 20 lines.")
+        self.assertEqual(outputs[0], "      thought_summary Inspect the README.")
+        self.assertEqual(outputs[1], "      calling read README.md")
+        self.assertEqual(len(outputs), 2)
+
+    def test_verify_action_is_not_rendered(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "step": 3,
+                "action": "verify",
+                "target": "default",
+                "thought_summary": "Run independent verification.",
+            }
+        )
+        cli._show_event(
+            {
+                "type": "tool_result",
+                "step": 3,
+                "action": "verify",
+                "ok": False,
+                "summary": "Protocol error: The read operation timed out",
+            }
+        )
+        self.assertEqual(outputs, ["      thought_summary Run independent verification."])
 
     def test_answer_action_is_not_rendered_as_tool_call(self) -> None:
         outputs: list[str] = []
@@ -231,7 +437,6 @@ class ChatCLITests(unittest.TestCase):
             state,
         )
         self.assertTrue(observation.ok)
-
 
     @patch("agent.chat.os.name", "nt")
     @patch("agent.chat.subprocess.Popen")

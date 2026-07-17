@@ -11,14 +11,18 @@ from typing import Callable
 
 from agent.loop import AgentLoop, RunResult
 from agent.memory import MemoryDocument, normalize_memory_content, render_memory, render_memory_index, safe_memory_id, validate_memory
+from agent.spec_builder import build_project_spec
 from agent.skills import SkillDocument, parse_skill, render_skill
 
 
 UI_WIDTH = 72
 TOOL_ACTIONS = {"bash", "debug_context", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
-  /ask TEXT  Ask a question without advancing project work
-  /do TEXT   Give the agent a project task to execute
+  /chat      Switch to read-only chat mode; messages can be answered but do not start project work
+  /agent     Switch to agent mode; collect project requirements before starting work
+  /send      Start agent work from the collected /agent requirements
+  /clear     Clear collected /agent requirements
+  /mode      Show the current input mode
   /skill     Add a user-authored Skill with a guided form
   /memory    Add a typed Memory with a guided form
   /help      Show this help
@@ -77,6 +81,8 @@ class InteractiveCLI:
         self.messages: list[ChatMessage] = []
         self.last_task = ""
         self.last_result: RunResult | None = None
+        self.active_mode = "idle"
+        self.agent_draft: list[str] = []
 
     def run(self) -> int:
         if self.use_color:
@@ -88,7 +94,7 @@ class InteractiveCLI:
 
         pending = self.config.initial_message.strip() if self.config.initial_message else ""
         if pending and not pending.startswith("/"):
-            pending = f"/do {pending}"
+            pending = f"/agent {pending}"
         while True:
             try:
                 message = pending or self.input(self._paint("You > ", "cyan", bold=True)).strip()
@@ -103,7 +109,7 @@ class InteractiveCLI:
                 if self._handle_command(message):
                     return 0
                 continue
-            self.output("Choose an explicit mode: /ask <question> or /do <task>.")
+            self._handle_plain_message(message)
 
     def _handle_command(self, raw: str) -> bool:
         parts = raw.split(maxsplit=1)
@@ -114,11 +120,37 @@ class InteractiveCLI:
             return True
         if command == "/help":
             self.output(HELP_TEXT.rstrip())
+        elif command == "/chat":
+            self.active_mode = "chat"
+            if not content:
+                self.output("Chat mode active. Ask questions normally; messages will not start project work. \nUse /agent to switch to autonomous project work.")
+            else:
+                self._run_chat_turn(content)
+        elif command == "/agent":
+            self.active_mode = "agent"
+            if not content:
+                self.output("Agent mode active. Paste or type project requirements. Use Shift+Enter/new lines as needed, then /send to start. Use /chat to switch to chat-only mode.")
+            else:
+                self._run_agent_project_flow(content)
+        elif command == "/send":
+            if content:
+                self._append_agent_draft(content)
+            self._send_agent_draft()
+        elif command == "/clear":
+            self.agent_draft.clear()
+            self.output("Cleared collected agent requirements.")
+        elif command == "/mode":
+            self.output(f"Current mode: {self.active_mode}.")
         elif command in {"/ask", "/do"}:
+            # Compatibility aliases for older scripts and tests.
             if not content:
                 self.output(f"Usage: {command} <message>")
+            elif command == "/ask":
+                self.active_mode = "chat"
+                self._run_chat_turn(content)
             else:
-                self._run_turn(content, interaction_mode="question" if command == "/ask" else "work")
+                self.active_mode = "agent"
+                self._run_agent_project_flow(content)
         elif command == "/skill":
             self._run_skill_wizard()
         elif command == "/memory":
@@ -133,6 +165,8 @@ class InteractiveCLI:
             self.messages.clear()
             self.last_task = ""
             self.last_result = None
+            self.active_mode = "idle"
+            self.agent_draft.clear()
             self._append_history(ChatMessage("system", "Conversation context reset."))
             self.output("Started a new conversation context.")
         else:
@@ -337,7 +371,7 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /ask for questions, /do for work, /skill or /memory to add durable guidance, /help for commands.", "dim"))
+        self.output(self._paint("  Use /chat for conversation, /agent for autonomous project work, /help for commands.", "dim"))
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:
@@ -357,6 +391,94 @@ class InteractiveCLI:
         if bold:
             prefix = f"1;{prefix}"
         return f"\033[{prefix}m{value}\033[0m"
+
+    def _handle_plain_message(self, message: str) -> None:
+        if self.active_mode == "agent":
+            self._append_agent_draft(message)
+            return
+        if self.active_mode != "chat":
+            self.output("Choose /chat for conversation or /agent for autonomous project work.")
+            return
+        self._run_chat_turn(message)
+
+    def _run_chat_turn(self, message: str) -> None:
+        self._run_turn(message, interaction_mode="question")
+
+    def _append_agent_draft(self, message: str) -> None:
+        self.agent_draft.append(message)
+        line_count = sum(max(1, len(item.splitlines())) for item in self.agent_draft)
+        self.output(f"Added to agent requirements draft ({line_count} line(s)). Use /send to start or /clear to reset.")
+
+    def _send_agent_draft(self) -> None:
+        if self.active_mode != "agent":
+            self.output("Switch to /agent before sending project requirements.")
+            return
+        requirement = "\n".join(item.strip() for item in self.agent_draft if item.strip()).strip()
+        if not requirement:
+            self.output("No agent requirements collected yet. Paste or type requirements first.")
+            return
+        self.agent_draft.clear()
+        self._run_agent_project_flow(requirement)
+
+    def _run_agent_project_flow(self, message: str) -> None:
+        user_message = ChatMessage("user", message)
+        self.messages.append(user_message)
+        self._append_history(user_message)
+        self.last_task = message
+
+        self.output(self._paint("Agent > preparing project spec...", "green", bold=True))
+        try:
+            project_spec = build_project_spec(
+                self.config.provider,
+                [{"role": item.role, "content": item.content} for item in self.messages],
+            )
+        except Exception as exc:
+            answer = f"Could not build project spec: {exc}"
+            self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+            self._record_assistant(answer)
+            return
+
+        spec_path = self._write_project_spec(project_spec)
+        self._reset_generated_project_state()
+        self.output(self._paint(f"Agent > project spec saved: {self._relative_path(spec_path)}", "green", bold=True))
+        self.output(self._paint("Agent > working...", "green", bold=True))
+
+        try:
+            loop = self._make_loop(
+                project_spec,
+                resume=False,
+                include_conversation=True,
+                interaction_mode="work",
+                project_spec_path=spec_path,
+                use_config_tasks_path=False,
+            )
+            result = loop.run()
+        except Exception as exc:
+            answer = f"Run failed: {exc}"
+            self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+            self._record_assistant(answer)
+            return
+        self._finish_turn(result)
+
+    def _write_project_spec(self, project_spec: str) -> Path:
+        spec_path = self.state_dir / "project_spec.md"
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        spec_path.write_text(project_spec, encoding="utf-8")
+        return spec_path
+
+    def _reset_generated_project_state(self) -> None:
+        for path in [
+            self.state_dir / "generated_tasks.json",
+            self.state_dir / "init.sh",
+            self.state_dir / "current_task.json",
+            self.state_dir / "handoff.md",
+            self.state_dir / "handoff_payload.json",
+        ]:
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
 
     def _run_turn(self, message: str, interaction_mode: str) -> None:
         user_message = ChatMessage("user", message)
@@ -401,6 +523,8 @@ class InteractiveCLI:
         resume: bool,
         include_conversation: bool,
         interaction_mode: str,
+        project_spec_path: Path | None = None,
+        use_config_tasks_path: bool = True,
     ) -> AgentLoop:
         return AgentLoop(
             root=self.config.root,
@@ -408,8 +532,8 @@ class InteractiveCLI:
             max_steps=self.config.max_steps,
             provider=self.config.provider,
             resume=resume,
-            tasks_path=self.config.tasks_path,
-            project_spec_path=self.config.project_spec_path,
+            tasks_path=self.config.tasks_path if use_config_tasks_path else None,
+            project_spec_path=project_spec_path or self.config.project_spec_path,
             benchmark_id=self.config.benchmark_id,
             auto_resume=self.config.auto_resume,
             max_sessions=self.config.max_sessions,
@@ -427,20 +551,19 @@ class InteractiveCLI:
         action = str(event.get("action", "unknown"))
         if action == "answer":
             return
-        target = compact_text(event.get("target", ""), 56)
-        detail = f" {target}" if target else ""
-        if event_type == "tool_start":
-            step = f"{event.get('step', '?'):>2}"
-            verb = "calling" if action in TOOL_ACTIONS else "action"
-            self.output(self._paint(f"  {step}  {verb} {action}{detail}", "gray"))
+        if event_type != "tool_start":
             return
 
-        ok = bool(event.get("ok"))
-        status = "OK" if ok else "FAILED"
-        summary = compact_text(event.get("summary", ""), 100)
-        self.output(self._paint(f"      result {status}", "gray"))
-        if summary:
-            self.output(self._paint(f"      {summary}", "gray"))
+        thought_summary = compact_text(event.get("thought_summary", ""), 100)
+        if thought_summary:
+            self.output(self._paint(f"      thought_summary {thought_summary}", "gray"))
+        if action == "verify":
+            return
+
+        target = compact_text(event.get("target", ""), 56)
+        detail = f" {target}" if target else ""
+        verb = "calling" if action in TOOL_ACTIONS else "action"
+        self.output(self._paint(f"      {verb} {action}{detail}", "gray"))
 
     def _finish_turn(self, result: RunResult) -> None:
         self.last_result = result

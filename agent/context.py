@@ -207,9 +207,6 @@ class ContextBuilder:
             "# Active Task Artifact Policy",
             *self._artifact_policy_lines(state),
             "",
-            "# Evidence Sources",
-            *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in state.evidence_sources[-8:]],
-            "",
             "# Active Acceptance Contract",
             *([self._format_contract(item) for item in self._active_acceptance_contracts(state)] or ["- none"]),
             "",
@@ -255,7 +252,9 @@ class ContextBuilder:
 
     def _conversation_context(self, state: TaskState) -> str:
         messages = state.conversation_messages if isinstance(state.conversation_messages, list) else []
-        rendered: list[str] = []
+        turns: list[str] = []
+        current_turn: list[str] = []
+        turn_number = 0
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
                 continue
@@ -263,17 +262,25 @@ class ContextBuilder:
             content = str(message.get("content", "")).strip()
             if role not in {"user", "assistant"} or not content:
                 continue
-            label = "User" if role == "user" else "Agent"
-            if role == "user" and not any(
-                isinstance(later, dict) and str(later.get("role", "")).strip().lower() == "user"
-                for later in messages[index + 1 :]
-            ):
-                label = "Latest User Message"
-            rendered.append(f"{label}: {content}")
-        text = "\n\n".join(rendered)
-        if len(text) > 8000:
-            text = text[-8000:]
-        return text or "No interactive user conversation is attached to this run."
+            if role == "user":
+                if current_turn:
+                    turns.append("\n".join(current_turn))
+                turn_number += 1
+                label = "User"
+                if not any(
+                    isinstance(later, dict) and str(later.get("role", "")).strip().lower() == "user"
+                    for later in messages[index + 1 :]
+                ):
+                    label = "Latest User Message"
+                current_turn = [f"## Conversation Turn {turn_number}", "", f"{label}:\n{content}"]
+                continue
+            if not current_turn:
+                turn_number += 1
+                current_turn = [f"## Conversation Turn {turn_number}", ""]
+            current_turn.append(f"\nAgent:\n{content}")
+        if current_turn:
+            turns.append("\n".join(current_turn))
+        return "\n\n---\n\n".join(turns) or "No interactive user conversation is attached to this run."
 
     def _format_contract(self, contract: dict[str, object]) -> str:
         requirements = contract.get("frozen_requirements", contract.get("required_evidence", []))

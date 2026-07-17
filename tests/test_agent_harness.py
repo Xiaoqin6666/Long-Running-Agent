@@ -3040,7 +3040,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertNotIn("## 10a. Pending Repair", context)
         self.assertNotIn("## 15. Suggested Next Action", context)
 
-    def test_context_builder_omits_handoff_focus_evidence_sources(self) -> None:
+    def test_context_builder_omits_working_context_evidence_sources(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             state_dir = root / "state"
@@ -3064,10 +3064,10 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state, include_handoff=True)
 
-        self.assertIn("# Evidence Sources", context)
-        self.assertIn("CURRENT_CONTEXT_EVIDENCE", context)
         self.assertIn("### Active Acceptance Contract", context)
         self.assertIn("### Active Verification Commands", context)
+        self.assertNotIn("# Evidence Sources", context)
+        self.assertNotIn("CURRENT_CONTEXT_EVIDENCE", context)
         self.assertNotIn("OLD_HANDOFF_EVIDENCE", context)
 
     def test_session_startup_context_summarizes_task_graph_without_full_json(self) -> None:
