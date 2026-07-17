@@ -37,7 +37,17 @@ def load_events(path: Path) -> list[dict]:
     return events
 
 
-PROGRESS_ACTIONS = {"contract", "edit", "write", "verify", "finish", "save_skill", "dismiss_skill", "skill"}
+PROGRESS_ACTIONS = {
+    "contract",
+    "edit",
+    "write",
+    "verify",
+    "finish",
+    "save_memory",
+    "save_skill",
+    "dismiss_skill",
+    "skill",
+}
 
 
 def summarize(path: Path, tasks_path: Path | None = None) -> dict:
@@ -51,6 +61,9 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
     skill_promotions = 0
     skill_rejections = 0
     skill_metadata_impressions = 0
+    memory_metadata_impressions = 0
+    memory_saves = 0
+    memory_rejections = 0
     skill_loads = 0
     skill_load_failures = 0
     duplicate_skill_loads_avoided = 0
@@ -71,6 +84,7 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         summary = str(observation.get("summary", ""))
         data = observation.get("data", {})
         skill_metadata_impressions += int(event.get("skill_catalog_size", 0) or 0)
+        memory_metadata_impressions += int(event.get("memory_catalog_size", 0) or 0)
         pending_review = event.get("pending_skill_review", {})
         if isinstance(pending_review, dict) and pending_review.get("report_id"):
             skill_reflection_reports.add(str(pending_review["report_id"]))
@@ -88,6 +102,10 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
             skill_promotions += 1
         if name in {"save_skill", "skill"} and not ok:
             skill_rejections += 1
+        if name == "save_memory" and ok:
+            memory_saves += 1
+        if name == "save_memory" and not ok:
+            memory_rejections += 1
         if name == "load_skill" and ok:
             skill_loads += 1
             if data.get("already_loaded"):
@@ -128,6 +146,9 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         "skill_promotions": skill_promotions,
         "skill_rejections": skill_rejections,
         "skill_metadata_impressions": skill_metadata_impressions,
+        "memory_metadata_impressions": memory_metadata_impressions,
+        "memory_saves": memory_saves,
+        "memory_rejections": memory_rejections,
         "skill_loads": skill_loads,
         "skill_load_failures": skill_load_failures,
         "duplicate_skill_loads_avoided": duplicate_skill_loads_avoided,
@@ -143,6 +164,7 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         "skill_reflections_dismissed": skill_reflections_dismissed,
         "no_progress_sessions": no_progress_session,
         "max_session_used_tokens": max_session_tokens,
+        "max_turn_used_tokens": max_session_tokens,
         "completed_tasks": task_counts["completed_tasks"],
         "blocked_tasks": task_counts["blocked_tasks"],
         "task_final_status": task_counts["task_final_status"],

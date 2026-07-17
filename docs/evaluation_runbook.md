@@ -35,20 +35,22 @@ $env:LONG_AGENT_MODEL="gpt-4.1-mini"
 Start the first Worker session:
 
 ```powershell
-python -m agent.main --benchmark issue_tracker --task-file eval\benchmarks\issue_tracker\task.md --tasks-json eval\benchmarks\issue_tracker\tasks.json --provider openai-compatible --max-steps 12
+python -m agent.main --benchmark issue_tracker --task-file eval\benchmarks\issue_tracker\task.md --tasks-json eval\benchmarks\issue_tracker\tasks.json --provider openai-compatible
 ```
 
 Resume after max steps or handoff:
 
 ```powershell
-python -m agent.main --benchmark issue_tracker --task-file eval\benchmarks\issue_tracker\task.md --tasks-json eval\benchmarks\issue_tracker\tasks.json --provider openai-compatible --max-steps 12 --resume
+python -m agent.main --benchmark issue_tracker --task-file eval\benchmarks\issue_tracker\task.md --tasks-json eval\benchmarks\issue_tracker\tasks.json --provider openai-compatible --resume
 ```
 
 Repeat resume runs until the task graph reaches `completed`, `stopped_with_failure`, or `requires_human_intervention`.
 
-Benchmark execution never owns the host Long-Running Agent repository. `git add` and `git commit` are rejected in benchmark mode, and host worktree cleanliness is not part of benchmark completion. Do not commit harness source, root `state/`, or unrelated traces to make a benchmark finish.
+Benchmark execution never owns the host Long-Running Agent repository. In benchmark mode, Git commands are scoped to the benchmark application workspace, and host worktree cleanliness is not part of benchmark completion. Do not commit harness source, root `state/`, or unrelated traces to make a benchmark finish.
 
-The handoff threshold is an artificial experiment control: `session_budget_tokens * handoff_threshold`. With the default `64000 * 0.75`, a Worker prepares handoff after roughly `48000` estimated tokens. The handoff Markdown is only a concise resume index; structured details are written to the active benchmark state directory, for example `state/benchmarks/issue_tracker/handoff_payload.json`.
+The handoff threshold is an artificial experiment control: `session_budget_tokens * handoff_threshold`. With the default `100000 * 0.75`, a Worker prepares handoff when a single model/tool turn is estimated at roughly `75000` tokens or more. The handoff Markdown is only a concise resume index; structured details are written to the active benchmark state directory, for example `state/benchmarks/issue_tracker/handoff_payload.json`.
+
+Worker sessions do not have a default step cap. Use `--max-steps <N>` only when deliberately running a bounded diagnostic session.
 
 ## Local Checks
 
@@ -76,7 +78,7 @@ python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl 
 - Session handoff: `state/benchmarks/issue_tracker/handoff.md`
 - Structured handoff payload: `state/benchmarks/issue_tracker/handoff_payload.json`
 - Latest verifier report: `state/benchmarks/issue_tracker/verifier_report.md`
-- Hard/Soft memory: `state/benchmarks/issue_tracker/hard_memory.md`, `state/benchmarks/issue_tracker/soft_memory.md`
+- Memory index and entries: `state/benchmarks/issue_tracker/memory.md`, `state/benchmarks/issue_tracker/memories/`
 - Skills: `state/benchmarks/issue_tracker/skills/`
 - Raw traces: `state/benchmarks/issue_tracker/traces/run_*.jsonl`
 - Metrics JSON: terminal output from `python eval\metrics.py ...`
@@ -113,8 +115,7 @@ state/
       handoff_payload.json
       verifier_report.md
       memory.md
-      hard_memory.md
-      soft_memory.md
+      memories/
       skills/
       traces/
     todo_counter/
@@ -129,8 +130,7 @@ state/
       handoff_payload.json
       verifier_report.md
       memory.md
-      hard_memory.md
-      soft_memory.md
+      memories/
       skills/
       traces/
 ```
@@ -154,7 +154,7 @@ After a failed acceptance command, the repair gate preserves already-read diagno
 For benchmark cases where the agent should plan autonomously, provide only a project specification:
 
 ```powershell
-python -m agent.main --benchmark todo_counter --project-spec eval\benchmarks\todo_counter\project_spec.md --provider openai-compatible --max-steps 12
+python -m agent.main --benchmark todo_counter --project-spec eval\benchmarks\todo_counter\project_spec.md --provider openai-compatible
 ```
 
 When `--project-spec` is used without `--tasks-json`, the harness starts a one-time `INIT` task. The initializer must produce:

@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import unittest
 import uuid
 from pathlib import Path
@@ -111,6 +112,9 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn('"implementation_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"verification_commands"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("commands run from the repository root", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("Read narrowly instead of preloading the repository", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("continue read has_more pages", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("Avoid Unix-only commands", MAIN_AGENT_SYSTEM_PROMPT)
 
     def test_generated_task_validator_requires_workspace_import_bootstrap(self) -> None:
         workspace = "eval/benchmarks/todo_counter/workspace"
@@ -398,6 +402,12 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(args.auto_resume)
         self.assertEqual(args.max_sessions, 3)
 
+    def test_cli_defaults_to_unlimited_steps_per_session(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task"])
+
+        self.assertIsNone(args.max_steps)
+
     def test_cli_accepts_explicit_log_file(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["Task", "--log-file", "diagnostics/run.log"])
@@ -443,6 +453,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Full Model Context", snapshot_content)
         self.assertIn("## System Message", observation.data["content"])
         self.assertEqual(trace_events[0]["context_ref"]["path"], snapshot["path"])
+        self.assertEqual(trace_events[0]["tool_return"], trace_events[0]["observation"])
 
     def test_default_log_path_uses_benchmark_state_directory(self) -> None:
         parser = build_parser()
@@ -1063,25 +1074,56 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("not allowed", result.summary)
 
-    def test_benchmark_git_rejects_add_and_commit(self) -> None:
+    def test_benchmark_git_writes_to_isolated_workspace(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
-            tool = GitTool(root, allow_write=False)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            (workspace / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            tool = GitTool(
+                workspace,
+                allow_write=True,
+                auto_init=True,
+                scope_description="benchmark workspace eval/benchmarks/sample/workspace",
+            )
 
             add_result = tool.run({"action": "git", "target": "add --all", "args": {}})
             commit_result = tool.run({"action": "git", "target": "commit -m benchmark", "args": {}})
+            root_git_exists = (root / ".git").exists()
 
-        self.assertFalse(add_result.ok)
-        self.assertFalse(commit_result.ok)
-        self.assertTrue(add_result.data["benchmark_git_read_only"])
-        self.assertIn("host Agent repository", commit_result.summary)
+        self.assertTrue(add_result.ok, add_result.data.get("output"))
+        self.assertTrue(commit_result.ok, commit_result.data.get("output"))
+        self.assertTrue((workspace / ".git").is_dir())
+        self.assertFalse(root_git_exists)
 
-    def test_benchmark_loop_configures_read_only_git(self) -> None:
+    def test_benchmark_loop_configures_workspace_git(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             loop = AgentLoop(root=root, task="Benchmark", max_steps=1, benchmark_id="sample")
 
-        self.assertFalse(loop.tools["git"].allow_write)
+        self.assertTrue(loop.tools["git"].allow_write)
+        self.assertEqual(
+            loop.tools["git"].root,
+            root / "eval" / "benchmarks" / "sample" / "workspace",
+        )
+        self.assertTrue(loop.tools["git"].auto_init)
+
+    def test_benchmark_context_uses_workspace_git_scope(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess_result = subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True)
+            self.assertEqual(subprocess_result.returncode, 0, subprocess_result.stderr)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            context = ContextBuilder(root, state_dir=state_dir, git_root=workspace).build(
+                create_initial_state("Benchmark")
+            )
+
+        self.assertIn("benchmark workspace git (eval/benchmarks/sample/workspace) git status", context)
+        self.assertIn("Git workspace is not initialized yet", context)
+        self.assertIn("Git commands are scoped to the benchmark workspace", context)
 
     def test_bash_accepts_args_command(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1489,7 +1531,8 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertIn("# Recent Tool Observations", context)
+        self.assertIn("## Recent Step Trace", context)
+        self.assertIn("### Detailed Tool Observations", context)
         self.assertIn("- action: read", context)
         self.assertIn("workspace/pkg/store.py", context)
 
@@ -1786,7 +1829,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             }
 
             context = ContextBuilder(root).build(state)
-            repair_details = context.split("# Repair Details", 1)[1].split("# Just-in-Time Discovery", 1)[0]
+            repair_details = context.split("# Repair Details", 1)[1].split("## Recent Step Trace", 1)[0]
 
         self.assertNotIn("failure_output", repair_details)
         self.assertNotIn("LONG_FAILURE_OUTPUT_MARKER", repair_details)
@@ -2672,6 +2715,24 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.session_used_tokens, 0)
         self.assertFalse(state.handoff_ready)
 
+    def test_budget_handoff_uses_current_turn_tokens_not_session_total(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Implement a feature", max_steps=1)
+            state = create_initial_state("Implement a feature")
+            state.session_budget_tokens = 100
+            state.handoff_threshold = 1.0
+            action = {"action": "read", "target": "a.py", "args": {}}
+            observation = ToolResult(True, "ok", {})
+
+            loop._record_budget_usage(state, "x" * 220, action, observation)
+            first_turn_tokens = state.session_used_tokens
+            loop._record_budget_usage(state, "x" * 220, action, observation)
+
+        self.assertLess(first_turn_tokens, 100)
+        self.assertEqual(state.session_used_tokens, first_turn_tokens)
+        self.assertFalse(state.handoff_ready)
+
     def test_auto_resume_continues_after_handoff_until_session_limit(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2727,24 +2788,47 @@ class HarnessBehaviorTests(unittest.TestCase):
             state.session_used_tokens = 71
             state.handoff_ready = True
             state.evidence_sources.append({"action": "read", "target": "agent/loop.py", "summary": "read"})
+            state.task_id = "T2"
+            state.nodes = [
+                {"id": "T1", "title": "Old feature", "status": "done"},
+                {"id": "T2", "title": "Active feature", "status": "in_progress"},
+                {"id": "T3", "title": "Future feature", "status": "pending"},
+            ]
+            state.acceptance_contracts.extend(
+                [
+                    {"task_id": "T1", "summary": "old contract", "checks": ["old-check"]},
+                    {"task_id": "T2", "summary": "active contract", "checks": ["active-check"]},
+                    {"task_id": "T3", "summary": "future contract", "checks": ["future-check"]},
+                ]
+            )
 
             loop._write_handoff(state)
             handoff = (root / "state" / "handoff.md").read_text(encoding="utf-8")
             payload = json.loads((root / "state" / "handoff_payload.json").read_text(encoding="utf-8"))
 
         self.assertIn("# Worker Session Handoff", handoff)
-        self.assertIn("## 2. Session Budget", handoff)
-        self.assertIn("## 4. Handoff Data References", handoff)
+        self.assertIn("## Critical Context", handoff)
+        self.assertIn("### Session Budget", handoff)
+        self.assertIn("## Working Context", handoff)
+        self.assertIn("## Reference Context", handoff)
+        self.assertIn("### Handoff Data References", handoff)
         self.assertIn("structured_payload: state/handoff_payload.json", handoff)
         self.assertIn("memory_index: state/memory.md", handoff)
         self.assertIn("memories: state/memories/", handoff)
-        self.assertIn("## 14. Resume Instructions", handoff)
+        self.assertNotIn("latest_verifier_report", handoff)
+        self.assertIn("### Active Acceptance Contract", handoff)
+        self.assertIn("active contract", handoff)
+        self.assertNotIn("old contract", handoff)
+        self.assertNotIn("future contract", handoff)
+        self.assertIn("## Resume Guidance", handoff)
+        self.assertIn("### Resume Instructions", handoff)
         self.assertIn("threshold_tokens: 70", handoff)
         self.assertNotIn("hard_memory", handoff)
         self.assertNotIn("soft_memory", handoff)
         self.assertNotIn("Soft Memory", handoff)
         self.assertEqual(payload["schema"], "long-agent.handoff-payload.v1")
         self.assertTrue(payload["session_budget"]["handoff_ready"])
+        self.assertEqual([item["task_id"] for item in payload["acceptance_contracts"]], ["T2"])
 
     def test_handoff_includes_command_only_pending_repair(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2785,10 +2869,10 @@ class HarnessBehaviorTests(unittest.TestCase):
             loop._write_handoff(state)
             handoff = (root / "state" / "handoff.md").read_text(encoding="utf-8")
 
-        self.assertIn("## 10a. Pending Repair", handoff)
+        self.assertIn("### Pending Repair", handoff)
         self.assertIn("- command_failure_type: command_syntax_error", handoff)
         self.assertIn("- suggested_command:", handoff)
-        self.assertNotIn("## 10a. Pending Repair\n- none", handoff)
+        self.assertNotIn("### Pending Repair\n- none", handoff)
 
     def test_context_builder_uses_reorganized_context_layers(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2821,7 +2905,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("# Critical Context", context)
         self.assertIn("# Working Context", context)
         self.assertIn("# Session Startup Context", context)
-        self.assertIn("# Just-in-Time Discovery", context)
+        self.assertNotIn("# Just-in-Time Discovery", context)
         self.assertIn("# Persistent Context", context)
         self.assertNotIn("# Tail Guard", context)
         self.assertIn("# Available Tools And Calling Format", context)
@@ -2829,7 +2913,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("- list_files: inspect a directory or file entry", context)
         self.assertIn("- search: grep-style literal text search", context)
         self.assertIn("Use this before read when locating T7, validation errors", context)
-        self.assertIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
+        self.assertNotIn("read target='<file>' args={'query': '\"id\": \"T7\"'}", context)
         self.assertIn("- write: create/overwrite/append file", context)
         self.assertIn("- verify: ask harness verifier", context)
         self.assertIn("# Relevant Memories", context)
@@ -2843,7 +2927,31 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertLess(context.index("# Critical Context"), context.index("# Working Context"))
         self.assertLess(context.index("# Working Context"), context.index("# Session Startup Context"))
 
-    def test_context_builder_uses_incremental_reference_after_session_start(self) -> None:
+    def test_context_builder_includes_only_active_acceptance_contract(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            state = create_initial_state("Implement active feature")
+            state.task_id = "T2"
+            state.nodes = [
+                {"id": "T1", "title": "Old feature", "status": "done"},
+                {"id": "T2", "title": "Active feature", "status": "in_progress"},
+                {"id": "T3", "title": "Future feature", "status": "pending"},
+            ]
+            state.acceptance_contracts = [
+                {"task_id": "T1", "summary": "old contract", "checks": ["old-check"], "status": "agreed"},
+                {"task_id": "T2", "summary": "active contract", "checks": ["active-check"], "status": "agreed"},
+                {"task_id": "T3", "summary": "future contract", "checks": ["future-check"], "status": "agreed"},
+            ]
+
+            context = ContextBuilder(root).build(state)
+
+        self.assertIn("# Active Acceptance Contract", context)
+        self.assertIn("active contract", context)
+        self.assertNotIn("old contract", context)
+        self.assertNotIn("future contract", context)
+
+    def test_context_builder_keeps_startup_reference_without_later_handoff(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             state_dir = root / "state"
@@ -2871,13 +2979,96 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertIn("# Incremental Reference Context", context)
-        self.assertNotIn("# Session Startup Context", context)
-        self.assertNotIn("VERY_DETAILED_SPEC_BODY", context)
-        self.assertIn("generated_tasks_summary: 1 task(s)", context)
-        self.assertIn("runtime_tasks_summary: 1 task(s)", context)
-        self.assertIn("Verifier passed.", context)
-        self.assertIn("Run verifier.", context)
+        self.assertIn("# Session Startup Context", context)
+        self.assertIn("VERY_DETAILED_SPEC_BODY", context)
+        self.assertIn("Task graph: state/generated_tasks.json", context)
+        self.assertIn("Task graph: state/runtime_tasks.json", context)
+        self.assertNotIn("Verifier passed.", context)
+        self.assertNotIn("## state/verifier_report.md", context)
+        self.assertNotIn("handoff.md focus", context)
+        self.assertNotIn("Run verifier.", context)
+
+    def test_context_builder_includes_handoff_only_on_explicit_session_start(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "handoff.md").write_text(
+                "# Worker Session Handoff\n\n## 15. Suggested Next Action\nHANDOFF_ONLY_ON_SESSION_START\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Resume work")
+            state.session_used_tokens = 250
+
+            first_step = ContextBuilder(root).build(state, include_handoff=True)
+            later_step = ContextBuilder(root).build(state, include_handoff=False)
+
+        self.assertIn("# Session Startup Context", first_step)
+        self.assertIn("HANDOFF_ONLY_ON_SESSION_START", first_step)
+        self.assertIn("# Session Startup Context", later_step)
+        self.assertNotIn("handoff.md focus", later_step)
+        self.assertNotIn("HANDOFF_ONLY_ON_SESSION_START", later_step)
+
+    def test_context_builder_normalizes_legacy_handoff_focus_sections(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "handoff.md").write_text(
+                "# Worker Session Handoff\n\n"
+                "## 10a. Pending Repair\n"
+                "- none\n\n"
+                "## 10b. Initializer Repair\n"
+                "- none\n\n"
+                "## 12. Known Risks And Failed Attempts\n"
+                "- Do not repeat failed actions unchanged.\n\n"
+                "## 14. Resume Instructions\n"
+                "1. Read this handoff first.\n\n"
+                "## 15. Suggested Next Action\n"
+                "Resume T9 with a small evidence-backed action.\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Resume work")
+
+            context = ContextBuilder(root).build(state, include_handoff=True)
+
+        self.assertIn("## Critical Context", context)
+        self.assertIn("### Pending Repair", context)
+        self.assertIn("## Resume Guidance", context)
+        self.assertIn("### Suggested Next Action", context)
+        self.assertIn("Resume T9 with a small evidence-backed action.", context)
+        self.assertNotIn("## 10a. Pending Repair", context)
+        self.assertNotIn("## 15. Suggested Next Action", context)
+
+    def test_context_builder_omits_handoff_focus_evidence_sources(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "handoff.md").write_text(
+                "# Worker Session Handoff\n\n"
+                "## Working Context\n"
+                "### Active Acceptance Contract\n"
+                "- T2: active contract\n\n"
+                "### Evidence Sources\n"
+                "- read: old.py -- OLD_HANDOFF_EVIDENCE\n\n"
+                "### Active Verification Commands\n"
+                "- python -m unittest\n\n"
+                "## Resume Guidance\n"
+                "### Suggested Next Action\n"
+                "Continue with verification.\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Resume work")
+            state.evidence_sources.append({"action": "read", "target": "new.py", "summary": "CURRENT_CONTEXT_EVIDENCE"})
+
+            context = ContextBuilder(root).build(state, include_handoff=True)
+
+        self.assertIn("# Evidence Sources", context)
+        self.assertIn("CURRENT_CONTEXT_EVIDENCE", context)
+        self.assertIn("### Active Acceptance Contract", context)
+        self.assertIn("### Active Verification Commands", context)
+        self.assertNotIn("OLD_HANDOFF_EVIDENCE", context)
 
     def test_session_startup_context_summarizes_task_graph_without_full_json(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2956,11 +3147,12 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertIn("# Recent Tool Observations", context)
+        self.assertIn("## Recent Step Trace", context)
+        self.assertIn("### Detailed Tool Observations", context)
         self.assertIn("- range: 20-40", context)
         self.assertIn("def calculate_total(items):", context)
         self.assertIn("return sum(items)", context)
-        self.assertLess(context.index("# Recent Tool Observations"), context.index("# Just-in-Time Discovery"))
+        self.assertLess(context.index("## Recent Step Trace"), context.index("### Detailed Tool Observations"))
 
     def test_working_context_includes_recent_successful_bash_output(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2984,12 +3176,13 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertIn("# Recent Tool Observations", context)
+        self.assertIn("## Recent Step Trace", context)
+        self.assertIn("### Detailed Tool Observations", context)
         self.assertIn("- action: bash", context)
         self.assertIn("- command: python -m unittest", context)
         self.assertIn("Ran 12 tests", context)
 
-    def test_working_context_omits_failed_bash_output_from_recent_observations(self) -> None:
+    def test_working_context_includes_failed_bash_output_from_session_observations(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state").mkdir()
@@ -3003,7 +3196,8 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state)
 
-        self.assertNotIn("# Recent Tool Observations", context)
+        self.assertIn("### Detailed Tool Observations", context)
+        self.assertIn("FAILURE_MARKER", context)
 
     def test_working_context_includes_recent_list_entries(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3050,16 +3244,16 @@ class HarnessBehaviorTests(unittest.TestCase):
             }
 
             context = ContextBuilder(root).build(state)
-            observation_section = context.split("# Recent Tool Observations", 1)[1].split(
-                "# Just-in-Time Discovery", 1
+            observation_section = context.split("### Detailed Tool Observations", 1)[1].split(
+                "# Session Startup Context", 1
             )[0]
 
         self.assertIn('"path": "src/app.py"', observation_section)
         self.assertIn('"line": 42', observation_section)
         self.assertIn("[tool output truncated]", observation_section)
-        self.assertLessEqual(len(observation_section), 8050)
+        self.assertLessEqual(len(observation_section), 8400)
 
-    def test_working_context_keeps_five_distinct_recent_tool_targets(self) -> None:
+    def test_working_context_includes_all_current_session_tool_observations(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             trace_dir = root / "state" / "traces"
@@ -3120,6 +3314,18 @@ class HarnessBehaviorTests(unittest.TestCase):
                     },
                 },
             ]
+            for step in range(6, 12):
+                events.append(
+                    {
+                        "step": step,
+                        "action": {"action": "read", "target": f"src/file_{step}.py", "args": {}},
+                        "observation": {
+                            "ok": True,
+                            "summary": f"Read file {step}.",
+                            "data": {"start": 1, "end": 5, "content": f"FILE_{step}_CONTENT"},
+                        },
+                    }
+                )
             trace.write_text(
                 "".join(json.dumps(event) + "\n" for event in events),
                 encoding="utf-8",
@@ -3132,15 +3338,18 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "data": {"start": 1, "end": 20, "content": "NEW_APP_CONTENT"},
             }
 
-            context = ContextBuilder(root).build(state)
+            builder = ContextBuilder(root)
+            builder.current_trace_path = trace
+            context = builder.build(state)
 
-        self.assertIn("NEW_APP_CONTENT", context)
-        self.assertNotIn("OLD_APP_CONTENT", context)
+        self.assertIn("OLD_APP_CONTENT", context)
         self.assertIn("TEST_CONTENT", context)
         self.assertIn("src/helpers.py", context)
         self.assertIn("src/pkg/core.py", context)
         self.assertIn("README_CONTENT", context)
-        self.assertEqual(context.count("## Observation "), 5)
+        self.assertIn("FILE_11_CONTENT", context)
+        self.assertIn("tool_return=", context)
+        self.assertEqual(context.count("### Tool Observation "), 11)
 
     def test_context_builder_preserves_last_action_when_reference_context_is_large(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3153,6 +3362,7 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "# Worker Session Handoff\n\n"
                 "## 9. Evidence Sources\n"
                 + ("- noisy evidence\n" * 500)
+                + "\n## 10. Last Step Summary\nHANDOFF_STALE_LAST_STEP_MARKER\n"
                 + "\n## 15. Suggested Next Action\nRepair the saved INIT candidate.\n",
                 encoding="utf-8",
             )
@@ -3186,6 +3396,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("## Safety Boundary", context)
         self.assertIn("INIT write rejected", context)
         self.assertIn("Repair the saved INIT candidate", context)
+        self.assertNotIn("HANDOFF_STALE_LAST_STEP_MARKER", context)
         self.assertNotIn("# Tail Guard", context)
         self.assertNotIn("reference context omitted", context)
         self.assertNotIn("[context truncated by harness]", context)
@@ -3620,6 +3831,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(summary["handoff_count"], 1)
         self.assertEqual(summary["no_progress_sessions"], 0)
         self.assertEqual(summary["max_session_used_tokens"], 30)
+        self.assertEqual(summary["max_turn_used_tokens"], 30)
         self.assertEqual(summary["completed_tasks"], 1)
         self.assertEqual(summary["blocked_tasks"], 1)
 

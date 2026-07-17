@@ -10,21 +10,27 @@ from agent.planner import TaskState
 from agent.skills import parse_skill, skill_catalog
 
 
-RECENT_TOOL_OBSERVATION_LIMIT = 5
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
-RECENT_TOOL_OBSERVATIONS_MAX_CHARS = 18000
 
 
 class ContextBuilder:
-    def __init__(self, root: Path, max_chars: int | None = None, state_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        max_chars: int | None = None,
+        state_dir: Path | None = None,
+        git_root: Path | None = None,
+    ) -> None:
         self.root = root
         del max_chars
         self.state_dir = state_dir or root / "state"
+        self.git_root = git_root or root
+        self.current_trace_path: Path | None = None
 
-    def build(self, state: TaskState, relevant_memories: str = "") -> str:
+    def build(self, state: TaskState, relevant_memories: str = "", include_handoff: bool | None = None) -> str:
         critical = self._critical_context(state)
         working = self._working_context(state)
-        reference = self._reference_context(state, relevant_memories=relevant_memories)
+        reference = self._reference_context(state, relevant_memories=relevant_memories, include_handoff=include_handoff)
         return self._pack_context(critical, working, reference)
 
     def _pack_context(self, critical: str, working: str, reference: str) -> str:
@@ -48,7 +54,8 @@ class ContextBuilder:
                 [
                     "",
                     "## Safety Boundary",
-                    "- Benchmark isolation: Git is read-only. Never run git add or git commit, and never try to clean the host Agent repository.",
+                    "- Benchmark isolation: Git commands are scoped to the benchmark workspace, not the host Agent repository.",
+                    "- Host Agent repository cleanliness and commits are outside this benchmark.",
                 ]
             )
         return "\n".join(lines)
@@ -115,11 +122,11 @@ class ContextBuilder:
         ]
         if self.state_dir != self.root / "state":
             lines.append(
-                "Benchmark isolation: Git is read-only; host Agent repository cleanliness and commits are outside this benchmark."
+                "Benchmark isolation: Git commands are scoped to the benchmark workspace; host Agent repository cleanliness and commits are outside this benchmark."
             )
         return "\n".join(lines)
 
-    def _session_startup_context(self, state: TaskState | None = None) -> str:
+    def _session_startup_context(self, state: TaskState | None = None, include_handoff: bool = True) -> str:
         state_label = self._rel(self.state_dir)
         project_spec = self._read_optional(self.state_dir / "project_spec.md", max_chars=2500)
         root_tasks_overview = ""
@@ -142,31 +149,26 @@ class ContextBuilder:
             self._task_graph_overview(self.state_dir / "runtime_tasks.json", state),
             f"### {state_label}/rejected_candidates/generated_tasks.json",
             candidate_path or "No initializer repair candidate.",
-            f"## {state_label}/handoff.md focus",
-            self._handoff_focus_context(),
-            f"## {state_label}/verifier_report.md",
-            self._read_optional(self.state_dir / "verifier_report.md", max_chars=2500),
-            "## git log",
+            f"## {self._git_context_label()} git log",
             self._run_git(["log", "--oneline", "-5"]),
-            "## git status",
+            f"## {self._git_context_label()} git status",
             self._run_git(["status", "--short", "--branch"]),
         ]
+        if include_handoff:
+            insert_at = lines.index(f"## {self._git_context_label()} git log")
+            lines[insert_at:insert_at] = [
+                f"## {state_label}/handoff.md focus",
+                self._handoff_focus_context(),
+            ]
         return "\n".join(lines)
 
     def _incremental_reference_context(self, state: TaskState) -> str:
-        state_label = self._rel(self.state_dir)
-        verifier = ""
-        if state.last_verified_at or state.last_action.get("action") == "verify":
-            verifier = self._read_optional(self.state_dir / "verifier_report.md", max_chars=1200)
-        handoff = ""
-        if state.handoff_ready or self._read_optional(self.state_dir / "handoff.md", max_chars=1):
-            handoff = self._handoff_focus_context()
         generated_summary = self._task_graph_summary(self.state_dir / "generated_tasks.json")
         runtime_summary = self._task_graph_summary(self.state_dir / "runtime_tasks.json")
         git_status = self._run_git(["status", "--short", "--branch"])
         lines = [
             "# Incremental Reference Context",
-            "Subsequent-call reference state. Full startup files are omitted; this block carries compact task, verifier, handoff, and git signals.",
+            "Subsequent-call reference state. Full startup handoff details are omitted after the first step of a Worker session.",
             f"- current_task_id: {self._active_task_id(state)}",
             f"- state_iterations: {state.iterations}",
             f"- last_verified_at: {state.last_verified_at or 'never'}",
@@ -174,18 +176,13 @@ class ContextBuilder:
             f"- orchestrator_decision: {state.orchestrator_decision}",
             f"- generated_tasks_summary: {generated_summary}",
             f"- runtime_tasks_summary: {runtime_summary}",
-            f"## {state_label}/handoff.md focus",
-            handoff or "No new handoff state.",
-            f"## {state_label}/verifier_report.md",
-            verifier or "No new verifier result.",
-            "## git status",
+            f"## {self._git_context_label()} git status",
             git_status,
         ]
         return "\n".join(lines)
 
     def _working_context(self, state: TaskState) -> str:
         repair_details = self._pending_repair_context(state)
-        recent_tool_observations = self._recent_tool_observations_context(state)
         lines = [
             "# Working Context",
             "Use this to choose the next task-local action.",
@@ -213,8 +210,8 @@ class ContextBuilder:
             "# Evidence Sources",
             *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in state.evidence_sources[-8:]],
             "",
-            "# Acceptance Contracts",
-            *[self._format_contract(item) for item in state.acceptance_contracts[-3:]],
+            "# Active Acceptance Contract",
+            *([self._format_contract(item) for item in self._active_acceptance_contracts(state)] or ["- none"]),
             "",
             "# Active Verification Commands",
             *[
@@ -225,24 +222,8 @@ class ContextBuilder:
             ],
             "",
             *(["# Repair Details", repair_details, ""] if repair_details else []),
-            *(["# Recent Tool Observations", recent_tool_observations, ""] if recent_tool_observations else []),
-            "# Just-in-Time Discovery",
-            "Do not preload the whole repository. Read only what is needed for the active task.",
-            "Recommended discovery flow:",
-            "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='initializer_validation_errors' args={'path': '<candidate-or-dir>'};",
-            "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
-            "4. read corresponding tests;",
-            "5. use errors or verifier output to guide the next search.",
-            "PowerShell/Python examples:",
-            "- list_files target='agent'",
-            "- search target='create_issue' args={'path': 'agent'}",
-            "- search target='initializer_validation_errors' args={'path': 'state/benchmarks/issue_tracker'}",
-            "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
-            "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
-            "",
             "## Recent Step Trace",
-            self._recent_step_trace_context(),
+            self._recent_step_trace_context(state),
         ]
         return "\n".join(lines)
 
@@ -313,8 +294,24 @@ class ContextBuilder:
             f"frozen_requirements: {requirement_text or 'none'} | verification_procedure: {procedure_text or 'none'}"
         )
 
-    def _reference_context(self, state: TaskState, relevant_memories: str = "") -> str:
-        reference = self._session_startup_context(state) if self._is_session_start(state) else self._incremental_reference_context(state)
+    def _active_acceptance_contracts(self, state: TaskState) -> list[dict[str, object]]:
+        active = self._active_task_id(state)
+        active_ids = {active, "current"}
+        if active == "INIT":
+            active_ids = {"INIT"}
+        for contract in reversed(state.acceptance_contracts):
+            if contract.get("task_id") in active_ids:
+                return [contract]
+        return []
+
+    def _reference_context(
+        self,
+        state: TaskState,
+        relevant_memories: str = "",
+        include_handoff: bool | None = None,
+    ) -> str:
+        show_handoff = self._is_session_start(state) if include_handoff is None else include_handoff
+        reference = self._session_startup_context(state, include_handoff=show_handoff)
         lines = [
             reference,
             self._memory_context(relevant_memories=relevant_memories),
@@ -421,28 +418,6 @@ class ContextBuilder:
         suffix = f", ... +{len(items) - limit}" if len(items) > limit else ""
         return ", ".join(visible) + suffix
 
-    def _just_in_time_context(self, state: TaskState) -> str:
-        lines = [
-            "# Just-in-Time Context",
-            "Do not preload the whole repository. Read only what is needed for the active task.",
-            "Recommended discovery flow:",
-            "1. list a small directory with read target='.' or read target='<dir>';",
-            "2. search/grep relevant ids, symbols, filenames, or error strings before reading; for example search target='T7' or search target='initializer_validation_errors' args={'path': '<candidate-or-dir>'};",
-            "3. read matching code with args.query before falling back to explicit ranges; for example read target='<file>' args={'query': '\"id\": \"T7\"'};",
-            "4. read corresponding tests;",
-            "5. use errors or verifier output to guide the next search.",
-            "PowerShell/Python examples:",
-            "- list_files target='agent'",
-            "- search target='create_issue' args={'path': 'agent'}",
-            "- search target='initializer_validation_errors' args={'path': 'state/benchmarks/issue_tracker'}",
-            "- read target='agent/loop.py' args={'query': 'def _execute_action'}",
-            "- if read returns has_more=true, continue with data.next_read args only when the needed content was not found; otherwise act on the returned evidence.",
-            "",
-            "## Evidence Sources Read So Far",
-            *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in state.evidence_sources[-12:]],
-        ]
-        return "\n".join(lines)
-
     def _persistent_context(self, state: TaskState) -> str:
         memory_index = self._read_memory_index()
         skills = self._read_skills()
@@ -517,31 +492,70 @@ class ContextBuilder:
         text = self._read_optional(self.state_dir / "handoff.md", max_chars=12000)
         if not text.strip():
             return "No handoff.md available."
-        wanted = {
-            "## 10. Last Step Summary",
-            "## 10a. Pending Repair",
-            "## 10b. Initializer Repair",
-            "## 12. Known Risks And Failed Attempts",
-            "## 14. Resume Instructions",
-            "## 15. Suggested Next Action",
+        modern_wanted = {
+            "## Critical Context",
+            "## Working Context",
+            "## Resume Guidance",
+        }
+        legacy_mapping = {
+            "## 10a. Pending Repair": ("## Critical Context", "### Pending Repair"),
+            "## 10b. Initializer Repair": ("## Critical Context", "### Initializer Repair"),
+            "## 12. Known Risks And Failed Attempts": ("## Resume Guidance", "### Known Risks And Failed Attempts"),
+            "## 14. Resume Instructions": ("## Resume Guidance", "### Resume Instructions"),
+            "## 15. Suggested Next Action": ("## Resume Guidance", "### Suggested Next Action"),
         }
         sections: list[str] = []
+        legacy_groups: dict[str, list[str]] = {}
         current: list[str] = []
         keep = False
+        legacy_target: tuple[str, str] | None = None
         for line in text.splitlines():
             if line.startswith("## "):
                 if keep and current:
-                    sections.append("\n".join(current).strip())
+                    rendered = "\n".join(current).strip()
+                    if legacy_target:
+                        group, heading = legacy_target
+                        body = "\n".join(rendered.splitlines()[1:]).strip()
+                        legacy_groups.setdefault(group, []).extend([heading, body])
+                    else:
+                        sections.append(self._filter_handoff_focus_section(rendered))
                 current = [line]
-                keep = line.strip() in wanted
+                stripped = line.strip()
+                keep = stripped in modern_wanted or stripped in legacy_mapping
+                legacy_target = legacy_mapping.get(stripped)
                 continue
             if keep:
                 current.append(line)
         if keep and current:
-            sections.append("\n".join(current).strip())
+            rendered = "\n".join(current).strip()
+            if legacy_target:
+                group, heading = legacy_target
+                body = "\n".join(rendered.splitlines()[1:]).strip()
+                legacy_groups.setdefault(group, []).extend([heading, body])
+            else:
+                sections.append(self._filter_handoff_focus_section(rendered))
+        if legacy_groups:
+            for group in ("## Critical Context", "## Resume Guidance"):
+                items = [item for item in legacy_groups.get(group, []) if item]
+                if items:
+                    sections.append("\n".join([group, *items]).strip())
         if not sections:
             return text[:1500]
         return "\n\n".join(sections)[:3000]
+
+    def _filter_handoff_focus_section(self, section: str) -> str:
+        lines: list[str] = []
+        skip_subsection = False
+        for line in section.splitlines():
+            if line.startswith("### "):
+                skip_subsection = line.strip() == "### Evidence Sources"
+                if skip_subsection:
+                    continue
+            elif line.startswith("## "):
+                skip_subsection = False
+            if not skip_subsection:
+                lines.append(line)
+        return "\n".join(lines).strip()
 
     def _pending_repair_context(self, state: TaskState) -> str:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -574,62 +588,24 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _recent_tool_observations_context(self, state: TaskState) -> str:
-        records: list[tuple[dict[str, object], dict[str, object]]] = []
-        seen_targets: set[str] = set()
-
-        def consider(action: object, observation: object) -> None:
-            if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
-                return
-            if not isinstance(action, dict) or not isinstance(observation, dict):
-                return
-            action_name = str(action.get("action", ""))
-            data = observation.get("data", {})
-            command = data.get("command", "") if isinstance(data, dict) else ""
-            target = str(command if action_name == "bash" and command else action.get("target", ""))
-            target = target.replace("\\", "/").strip().rstrip("/")
-            if not target:
-                return
-            if action_name in {"write", "edit"} and observation.get("ok") is True:
-                seen_targets.add(target)
-                return
-            if action_name not in {"read", "list_files", "search", "bash"} or observation.get("ok") is not True:
-                return
-            if target in seen_targets:
-                return
-            seen_targets.add(target)
-            records.append((action, observation))
-
-        consider(state.last_action, state.last_observation)
-        trace_dir = self.state_dir / "traces"
-        if trace_dir.exists() and len(records) < RECENT_TOOL_OBSERVATION_LIMIT:
-            trace_paths = sorted(
-                trace_dir.glob("run_*.jsonl"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for trace_path in trace_paths[:5]:
-                for event in reversed(self._load_trace_events(trace_path)):
-                    consider(event.get("action"), event.get("observation"))
-                    if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
-                        break
-                if len(records) >= RECENT_TOOL_OBSERVATION_LIMIT:
-                    break
+        records: list[tuple[object, dict[str, object], dict[str, object]]] = []
+        for event in self._current_session_trace_events():
+            action = event.get("action", {})
+            observation = event.get("tool_return", event.get("observation", {}))
+            if isinstance(action, dict) and isinstance(observation, dict):
+                records.append((event.get("step", "?"), action, observation))
+        if not records and isinstance(state.last_action, dict) and isinstance(state.last_observation, dict):
+            records.append(("current", state.last_action, state.last_observation))
 
         chunks: list[str] = []
-        used = 0
-        for index, (action, observation) in enumerate(records, start=1):
-            heading = f"## Observation {index}{' (most recent)' if index == 1 else ''}\n"
-            separator = "\n\n" if chunks else ""
-            remaining = RECENT_TOOL_OBSERVATIONS_MAX_CHARS - used - len(separator) - len(heading)
-            if remaining < 200:
-                break
+        for index, (step, action, observation) in enumerate(records, start=1):
+            heading = f"### Tool Observation {index} (step {step})\n"
             block = self._format_tool_observation(
                 action,
                 observation,
-                max_chars=min(RECENT_TOOL_OBSERVATION_MAX_CHARS, remaining),
+                max_chars=RECENT_TOOL_OBSERVATION_MAX_CHARS,
             )
             chunks.append(heading + block)
-            used += len(separator) + len(heading) + len(block)
         return "\n\n".join(chunks)
 
     def _format_tool_observation(
@@ -641,26 +617,17 @@ class ContextBuilder:
     ) -> str:
         action_name = str(action.get("action", ""))
         data = observation.get("data", {})
-        if not isinstance(data, dict):
-            return ""
 
         target = str(action.get("target", ""))
         metadata = [f"- action: {action_name}", f"- target: {target}", f"- ok: {observation.get('ok')}"]
-        if action_name == "read":
+        if action_name == "read" and isinstance(data, dict):
             metadata.append(f"- range: {data.get('start', '?')}-{data.get('end', '?')}")
-            payload = str(data.get("content", ""))
-        elif action_name == "list_files":
-            payload = json.dumps(data.get("entries", []), ensure_ascii=False, indent=2)
-        elif action_name == "search":
-            payload = json.dumps(data.get("matches", []), ensure_ascii=False, indent=2)
-        elif action_name == "bash":
+        elif action_name == "bash" and isinstance(data, dict):
             if data.get("command"):
                 metadata.append(f"- command: {data.get('command')}")
             if data.get("cwd"):
                 metadata.append(f"- cwd: {data.get('cwd')}")
-            payload = str(data.get("output", ""))
-        else:
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
+        payload = json.dumps(observation, ensure_ascii=False, indent=2)
 
         prefix = "\n".join([*metadata, "--- BEGIN TOOL OUTPUT ---", ""])
         suffix = "\n--- END TOOL OUTPUT ---"
@@ -719,37 +686,51 @@ class ContextBuilder:
                     return "workspace"
         return None
 
-    def _recent_step_trace_context(self, limit: int = 8) -> str:
+    def _recent_step_trace_context(self, state: TaskState) -> str:
+        events = self._current_session_trace_events()
+        if not events and state.last_action:
+            events = [
+                {
+                    "step": "current",
+                    "action": state.last_action,
+                    "tool_return": state.last_observation,
+                }
+            ]
+        lines = []
+        if events:
+            for event in events:
+                step = event.get("step", "?")
+                action = event.get("action", {})
+                observation = event.get("tool_return", event.get("observation", {}))
+                if not isinstance(action, dict):
+                    action = {}
+                if not isinstance(observation, dict):
+                    observation = {}
+                action_text = self._compact_action(action)
+                ok = observation.get("ok")
+                summary = str(observation.get("summary", "")).replace("\n", " ")[:240]
+                data_text = self._compact_observation_data(observation.get("data", {}))
+                if data_text:
+                    data_text = f"; data={data_text}"
+                tool_return = self._compact_tool_return(observation)
+                lines.append(
+                    f"- step {step}: action={action_text}; ok={ok}; summary={summary}{data_text}; tool_return={tool_return}"
+                )
+        else:
+            lines.append("No trace events available.")
+        observations = self._recent_tool_observations_context(state)
+        if observations:
+            lines.extend(["", "### Detailed Tool Observations", observations])
+        return "\n".join(lines)
+
+    def _current_session_trace_events(self) -> list[dict[str, object]]:
+        if self.current_trace_path is not None:
+            return self._load_trace_events(self.current_trace_path) if self.current_trace_path.exists() else []
         trace_dir = self.state_dir / "traces"
         if not trace_dir.exists():
-            return "No trace events available."
+            return []
         trace_paths = sorted(trace_dir.glob("run_*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
-        events: list[dict[str, object]] = []
-        for trace_path in trace_paths[:3]:
-            events = self._load_trace_events(trace_path)
-            if events:
-                break
-        if not events:
-            return "No trace events available."
-        lines = []
-        for event in events[-limit:]:
-            step = event.get("step", "?")
-            action = event.get("action", {})
-            observation = event.get("observation", {})
-            if not isinstance(action, dict):
-                action = {}
-            if not isinstance(observation, dict):
-                observation = {}
-            action_text = self._compact_action(action)
-            ok = observation.get("ok")
-            summary = str(observation.get("summary", "")).replace("\n", " ")[:240]
-            data_text = self._compact_observation_data(observation.get("data", {}))
-            if data_text:
-                data_text = f"; data={data_text}"
-            lines.append(
-                f"- step {step}: action={action_text}; ok={ok}; summary={summary}{data_text}"
-            )
-        return "\n".join(lines)
+        return self._load_trace_events(trace_paths[0]) if trace_paths else []
 
     def _load_trace_events(self, trace_path: Path) -> list[dict[str, object]]:
         try:
@@ -778,6 +759,13 @@ class ContextBuilder:
         name = str(action.get("action", ""))
         target = str(action.get("target", "")).replace("\n", " ")[:180]
         return f"{name} {target}".strip()
+
+    def _compact_tool_return(self, observation: object, limit: int = 700) -> str:
+        if not isinstance(observation, dict):
+            return "{}"
+        text = json.dumps(observation, ensure_ascii=False, separators=(",", ":"))
+        text = text.replace("\n", " ")
+        return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
     def _compact_observation_data(self, data: object) -> str:
         if not isinstance(data, dict):
@@ -1206,10 +1194,14 @@ class ContextBuilder:
             return str(path).replace("\\", "/")
 
     def _run_git(self, args: list[str]) -> str:
+        if self.git_root != self.root and not self.git_root.exists():
+            return f"Git workspace does not exist yet: {self._rel(self.git_root)}"
+        if self.git_root != self.root and not self._git_root_is_initialized():
+            return f"Git workspace is not initialized yet: {self._rel(self.git_root)}"
         try:
             completed = subprocess.run(
                 ["git", *args],
-                cwd=self.root,
+                cwd=self.git_root,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1220,6 +1212,31 @@ class ContextBuilder:
             return f"git command failed: {exc}"
         output = (completed.stdout + completed.stderr).strip()
         return output[:2500]
+
+    def _git_context_label(self) -> str:
+        if self.git_root == self.root:
+            return "git"
+        return f"benchmark workspace git ({self._rel(self.git_root)})"
+
+    def _git_root_is_initialized(self) -> bool:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=self.git_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except Exception:
+            return False
+        if completed.returncode != 0:
+            return False
+        try:
+            return Path(completed.stdout.strip()).resolve() == self.git_root.resolve()
+        except OSError:
+            return False
 
     def _active_task_id(self, state: TaskState) -> str:
         if state.task_id == "INIT":

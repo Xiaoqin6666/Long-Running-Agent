@@ -37,8 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=8,
-        help="Maximum agent loop iterations.",
+        default=None,
+        help="Maximum agent loop iterations per session. Defaults to unlimited.",
     )
     parser.add_argument(
         "--provider",

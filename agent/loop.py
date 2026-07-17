@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import count
 import json
 import logging
 import re
@@ -73,7 +74,7 @@ class AgentLoop:
         self,
         root: Path,
         task: str,
-        max_steps: int,
+        max_steps: int | None,
         provider: str = "offline",
         resume: bool = False,
         tasks_path: Path | None = None,
@@ -87,7 +88,7 @@ class AgentLoop:
     ) -> None:
         self.root = root
         self.task = task
-        self.max_steps = max_steps
+        self.max_steps = max_steps if max_steps and max_steps > 0 else None
         self.provider = provider
         self.resume = resume
         self.auto_resume = auto_resume
@@ -113,7 +114,8 @@ class AgentLoop:
         self.trace_path = self.trace_dir / self._trace_name()
         expected_workspace = self._expected_initializer_workspace_root()
         benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
-        self.context_builder = ContextBuilder(root, state_dir=self.state_dir)
+        benchmark_git_root = benchmark_python_path if self.benchmark_id else None
+        self.context_builder = ContextBuilder(root, state_dir=self.state_dir, git_root=benchmark_git_root)
         self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
         self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path, benchmark_id=self.benchmark_id)
@@ -122,7 +124,14 @@ class AgentLoop:
         self.tools = {
             "bash": BashTool(root, python_path=benchmark_python_path),
             "edit": EditTool(root),
-            "git": GitTool(root, allow_write=self.benchmark_id is None),
+            "git": GitTool(
+                benchmark_git_root or root,
+                allow_write=True,
+                auto_init=bool(benchmark_git_root),
+                scope_description=(
+                    f"benchmark workspace {expected_workspace}" if benchmark_git_root else "workspace"
+                ),
+            ),
             "list_files": ListFilesTool(root),
             "read": ReadTool(root),
             "search": SearchTool(root),
@@ -209,12 +218,14 @@ class AgentLoop:
         message = "Reached max steps before completion."
         self._record_task_session(state)
 
-        for step in range(1, self.max_steps + 1):
+        step_iter = count(1) if self.max_steps is None else range(1, self.max_steps + 1)
+        for step in step_iter:
             steps = step
             self._current_trace_step = step
             self._record_task_session(state)
             memory_context = self._relevant_memory_context(state)
-            context = self.context_builder.build(state, relevant_memories=memory_context)
+            self.context_builder.current_trace_path = self.trace_path
+            context = self.context_builder.build(state, relevant_memories=memory_context, include_handoff=(step == 1))
             context_snapshot = self._record_context_snapshot(step, state, context)
             try:
                 action = self.decision_maker.next_action(context, state)
@@ -243,7 +254,7 @@ class AgentLoop:
             self._append_trace(step, action, observation, state, context_snapshot)
             self._write_state(state)
             LOGGER.info(
-                "Step %s action=%s target=%s ok=%s task_id=%s used_tokens=%s handoff_ready=%s observation=%s",
+                "Step %s action=%s target=%s ok=%s task_id=%s turn_tokens=%s handoff_ready=%s observation=%s",
                 step,
                 action.get("action", "unknown"),
                 action.get("target", ""),
@@ -2674,6 +2685,7 @@ class AgentLoop:
             "context_ref": context_snapshot or {},
             "action": action,
             "observation": observation.to_dict(),
+            "tool_return": observation.to_dict(),
             "state_summary": state.summary(),
             "task_id": state.task_id,
             "session_used_tokens": state.session_used_tokens,
@@ -2695,82 +2707,89 @@ class AgentLoop:
         active_node = self._active_node(state)
         completed = [node for node in state.nodes if node.get("status") == "done"]
         pending = [node for node in state.nodes if node.get("status") != "done"]
-        contracts = state.acceptance_contracts[-5:]
+        contracts = self._active_handoff_contracts(state)
         evidence = state.evidence_sources[-20:]
         payload = self._write_handoff_payload(state, active_node, completed, pending, contracts, evidence)
         lines = [
             "# Worker Session Handoff",
             "",
-            "## 1. User Goal",
+            "## Critical Context",
+            "### User Goal",
             state.user_goal,
             "",
-            "## 2. Session Budget",
+            "### Session Budget",
             f"- budget_tokens: {state.session_budget_tokens}",
             f"- threshold_ratio: {state.handoff_threshold}",
             f"- threshold_tokens: {int(state.session_budget_tokens * state.handoff_threshold)}",
-            f"- estimated_used_tokens: {state.session_used_tokens}",
+            f"- estimated_turn_tokens: {state.session_used_tokens}",
             f"- handoff_ready: {state.handoff_ready}",
             "",
-            "## 3. Active Task",
+            "### Active Task",
             self._format_node(active_node) if active_node else "No active task.",
             "",
-            "## 4. Handoff Data References",
+            "### Last Step Summary",
+            f"- last_action: {state.last_action.get('action')} {state.last_action.get('target', '')}",
+            f"- last_observation_ok: {state.last_observation.get('ok')}",
+            f"- last_observation_summary: {state.last_observation.get('summary')}",
+            "",
+            "### Pending Repair",
+            *self._format_pending_repair(state),
+            "",
+            "### Initializer Repair",
+            *self._format_initializer_repair(state),
+            "",
+            "## Working Context",
+            "### Orchestrator Decision",
+            f"- selected_task_id: {state.orchestrator_decision.get('selected_task_id')}",
+            f"- reason: {state.orchestrator_decision.get('reason')}",
+            f"- ready_task_ids: {state.orchestrator_decision.get('ready_task_ids')}",
+            "",
+            "### Active Acceptance Contract",
+            *([self._format_contract(contract) for contract in contracts] or ["- none"]),
+            "",
+            "### Active Verification Commands",
+            *self._active_verification_commands_for_handoff(state),
+            "",
+            "### Evidence Sources",
+            *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in evidence],
+            "",
+            "### Task Progress",
+            "#### Completed Tasks",
+            *[self._format_node(node) for node in completed],
+            "",
+            "#### Pending Or Blocked Tasks",
+            *[self._format_node(node) for node in pending],
+            "",
+            "### Pending Skill Reflection",
+            json.dumps(state.pending_skill_review, ensure_ascii=False) if state.pending_skill_review else "none",
+            "",
+            "### Verification Status",
+            f"- last_verified_at: {state.last_verified_at}",
+            "- deterministic verifier: run `python -m unittest discover -s tests` and `python -m compileall agent eval tests`.",
+            "",
+            "## Reference Context",
+            "### Handoff Data References",
             f"- structured_payload: {payload['payload_path']}",
             f"- current_state: {self._rel(self.state_path)}",
             f"- task_graph_runtime: {self._rel(self.runtime_tasks_path) if self.runtime_tasks_path else 'not used'}",
             f"- task_graph_generated: {self._rel(self.generated_tasks_path) if self.generated_tasks_path else 'not used'}",
             f"- rejected_initializer_candidate: {self._rel(self.initializer_candidate_path)}",
             "- task_graph_source: the original `--tasks-json` file is benchmark input and should remain read-only",
-            f"- latest_verifier_report: {self._rel(self.state_dir / 'verifier_report.md')}",
             f"- immutable_verifier_reports: {self._rel(self.state_dir / 'verifier_reports')}/",
             f"- memory_index: {self._rel(self.memory_path)}",
             f"- memories: {self._rel(self.state_dir / 'memories')}/",
             f"- traces: {self._rel(self.trace_dir)}/",
             "",
-            "## 5. Orchestrator Decision",
-            f"- selected_task_id: {state.orchestrator_decision.get('selected_task_id')}",
-            f"- reason: {state.orchestrator_decision.get('reason')}",
-            f"- ready_task_ids: {state.orchestrator_decision.get('ready_task_ids')}",
+            "### Current State Summary",
+            state.summary(),
             "",
-            "## 6. Completed Tasks",
-            *[self._format_node(node) for node in completed],
-            "",
-            "## 7. Pending Or Blocked Tasks",
-            *[self._format_node(node) for node in pending],
-            "",
-            "## 8. Acceptance Contracts",
-            *[self._format_contract(contract) for contract in contracts],
-            "",
-            "## 9. Evidence Sources",
-            *[f"- {item.get('action')}: {item.get('target')} -- {item.get('summary')}" for item in evidence],
-            "",
-            "## 10. Last Step Summary",
-            f"- last_action: {state.last_action.get('action')} {state.last_action.get('target', '')}",
-            f"- last_observation_ok: {state.last_observation.get('ok')}",
-            f"- last_observation_summary: {state.last_observation.get('summary')}",
-            "",
-            "## 10a. Pending Repair",
-            *self._format_pending_repair(state),
-            "",
-            "## 10b. Initializer Repair",
-            *self._format_initializer_repair(state),
-            "",
-            "## 10c. Pending Skill Reflection",
-            json.dumps(state.pending_skill_review, ensure_ascii=False) if state.pending_skill_review else "none",
-            "",
-            "## 11. Verification Status",
-            f"- last_verified_at: {state.last_verified_at}",
-            "- deterministic verifier: run `python -m unittest discover -s tests` and `python -m compileall agent eval tests`.",
-            "",
-            "## 12. Known Risks And Failed Attempts",
+            "## Resume Guidance",
+            "### Known Risks And Failed Attempts",
             "- Review trace for failed observations and protocol errors before resuming.",
             "- Do not repeat failed actions unchanged.",
             "- Do not start new large edits until the next worker session has rebuilt context from this handoff.",
             "",
-            "## 13. Current State Summary",
-            state.summary(),
-            "",
-            "## 14. Resume Instructions",
+            "### Resume Instructions",
             "1. Read this handoff first.",
             f"2. Load `{self._rel(self.state_path)}`, the active task graph, and relevant source files.",
             "3. Continue the active task only after checking the acceptance contract.",
@@ -2778,7 +2797,7 @@ class AgentLoop:
             "5. Prefer verification or small repair actions before new feature work.",
             f"6. Inspect `{payload['payload_path']}` only when the summary above is insufficient.",
             "",
-            "## 15. Suggested Next Action",
+            "### Suggested Next Action",
             self._suggest_next_action(state),
             "",
         ]
@@ -2804,6 +2823,7 @@ class AgentLoop:
                 "threshold_ratio": state.handoff_threshold,
                 "threshold_tokens": int(state.session_budget_tokens * state.handoff_threshold),
                 "estimated_used_tokens": state.session_used_tokens,
+                "estimated_turn_tokens": state.session_used_tokens,
                 "handoff_ready": state.handoff_ready,
             },
             "orchestrator_decision": state.orchestrator_decision,
@@ -2847,7 +2867,7 @@ class AgentLoop:
         observation: ToolResult,
     ) -> None:
         payload = context + json.dumps(action, ensure_ascii=False) + json.dumps(observation.to_dict(), ensure_ascii=False)
-        state.session_used_tokens += max(1, len(payload) // 4)
+        state.session_used_tokens = max(1, len(payload) // 4)
         threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
         if state.session_used_tokens >= threshold_tokens:
             state.handoff_ready = True
@@ -2857,6 +2877,26 @@ class AgentLoop:
             if node.get("status") in {"in_progress", "pending"}:
                 return node
         return None
+
+    def _active_handoff_contracts(self, state: TaskState) -> list[dict[str, Any]]:
+        active = self._active_task_id(state)
+        active_ids = {active, "current"}
+        if active == "INIT":
+            active_ids = {"INIT"}
+        for contract in reversed(state.acceptance_contracts):
+            if contract.get("task_id") in active_ids:
+                return [contract]
+        return []
+
+    def _active_verification_commands_for_handoff(self, state: TaskState) -> list[str]:
+        commands: list[str] = []
+        for node in state.nodes:
+            if node.get("status") not in {"in_progress", "pending"}:
+                continue
+            raw_commands = node.get("verification_commands", [])
+            if isinstance(raw_commands, list):
+                commands.extend(str(command) for command in raw_commands if str(command).strip())
+        return [f"- {command}" for command in commands] or ["- none"]
 
     def _format_node(self, node: dict[str, Any]) -> str:
         evidence = node.get("evidence", [])

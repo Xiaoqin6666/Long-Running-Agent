@@ -331,12 +331,9 @@ Cross-session information is written to files:
 
 Persistent context is the substrate for handoff and ablation analysis.
 
-Persistent memory is split into two levels:
-
-- Hard Memory: verifiable hard state, including Git commits, test results, task status, verifier reports, confirmed architecture decisions, and verified facts.
-- Soft Memory: language-level soft state, including current assumptions, unconfirmed fault hypotheses, suggested next steps, and agent reflections.
-
-Only Hard Memory can be used as evidence for completion or recovery decisions. Soft Memory can guide what to inspect next, but it must be verified before promotion.
+Persistent memory is stored as typed Markdown files under `<active_state_dir>/memories/`.
+Each memory has exactly one type: `user`, `feedback`, `project`, or `reference`.
+The root `<active_state_dir>/memory.md` file is only an index.
 
 When context grows too large, the harness creates `<active_state_dir>/handoff.md`.
 For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>/`; for ordinary non-benchmark runs it remains `state/`.
@@ -383,9 +380,9 @@ Raw logs are not passed to the model unless needed; they remain in trace files.
 
 For experiments, the harness intentionally uses a small Worker session budget even if the underlying model supports a larger context window:
 
-- `session_budget_tokens = 64000`
+- `session_budget_tokens = 100000`
 - `handoff_threshold = 0.75`
-- `threshold_tokens = 24000`
+- `threshold_tokens = 75000`
 
 The budget is estimated with a lightweight heuristic rather than an exact tokenizer. This is sufficient for controlled experiments because the goal is to force context-boundary behavior consistently.
 
@@ -397,7 +394,7 @@ When the threshold is reached:
 - full structured handoff data is written separately to `<active_state_dir>/handoff_payload.json`;
 - the next session must rebuild context from persisted state, handoff, memory, contracts, and relevant source files.
 
-The threshold is not the model provider's real context limit. It is an artificial experiment budget: `session_budget_tokens * handoff_threshold`. With the default `64000 * 0.75`, the Worker prepares handoff after roughly `48000` estimated tokens. Token usage is estimated by character count, so it is a reproducible control signal rather than an exact tokenizer count.
+The threshold is not the model provider's real context limit. It is an artificial experiment budget: `session_budget_tokens * handoff_threshold`. With the default `100000 * 0.75`, the Worker prepares handoff when a single model/tool turn is estimated at roughly `75000` tokens or more. Token usage is estimated by character count, so it is a reproducible control signal rather than an exact tokenizer count.
 
 ### Detailed Handoff Format
 
@@ -456,7 +453,7 @@ Successful termination requires all of the following:
 - configured public verification procedures pass;
 - for non-benchmark Agent-project runs, the Git worktree is clean and runnable.
 
-Benchmark runs are isolated from the host Agent repository. Their Git tool is read-only, host `git status` is not a completion criterion, and host Agent regression tests are outside benchmark scope. Benchmark completion is based on its runtime/generated task graph and structured public task-verification evidence. A benchmark Worker must never use `git add` or `git commit` to clean or finalize the host repository.
+Benchmark runs are isolated from the host Agent repository. Their Git tool is scoped to the benchmark application workspace, host `git status` is not a completion criterion, and host Agent regression tests are outside benchmark scope. Benchmark completion is based on its runtime/generated task graph and structured public task-verification evidence. A benchmark Worker may use local `git add` and `git commit` inside the benchmark workspace, but must never use Git to clean or finalize the host repository.
 
 Failure termination is explicit and must not be reported as success. Examples:
 
@@ -501,43 +498,40 @@ Write to Skill only when:
 - it was validated by a verifier-confirmed successful run, or it captures a failure mode confirmed by evidence;
 - it is not just a temporary fact about this repository.
 
-Worker reflections should go to Soft Memory, not Skill. The harness rejects Skill promotion without evidence.
+Worker reflections should not become Skill or Memory unless they are durable and pass the relevant save rules. The harness rejects Skill promotion without evidence.
 
 ## 10. Memory Mechanism
 
-Memory is split into Hard Memory and Soft Memory.
+Memory is split into four fixed types:
 
-Hard Memory stores verifiable hard state:
+- `user`: user profile information such as role, preferences, expertise, and knowledge level.
+- `feedback`: behavioral feedback about what to do or avoid. Feedback must record the rule, why it exists, and how to apply it.
+- `project`: durable project dynamics such as deadlines, collaborators, active initiatives, and decisions. Relative dates must be converted to absolute dates before saving.
+- `reference`: external pointers such as issue trackers, dashboards, documents, or channels where information can be found.
 
-- Git commits;
-- test results;
-- task status;
-- verifier reports;
-- confirmed architecture decisions;
-- verified facts.
+Each memory is one Markdown file with YAML frontmatter:
 
-Soft Memory stores language-level soft state:
+```text
+---
+name: no-mock-database
+description: Integration tests must use a real database
+type: feedback
+---
 
-- current assumptions;
-- unconfirmed fault causes;
-- suggested next steps;
-- agent reflections.
+Integration tests must use a real database, not mocks.
+
+**Why:** Mock-backed tests passed while production migrations failed.
+**How to apply:** Connect the integration test module to the real test database.
+```
 
 Memory should not store:
 
-- full command logs;
-- duplicate summaries;
-- stale TODOs that already moved into the plan tree.
-
-Soft Memory may contain unverified assumptions, but they must be clearly marked and cannot be used as evidence.
-
-To reduce memory pollution, Hard Memory entries must have source evidence:
-
-```text
-- [confirmed][trace:42] The project uses pytest through `python -m pytest`.
-- [decision][trace:51] Use JSONL traces because they are append-only and easy to analyze.
-- [commit:391325a] Add session budget handoff mechanism.
-```
+- code patterns, architecture, or file structure that can be discovered from the current repository;
+- Git history or recent changes, because `git log` and `git blame` are authoritative;
+- debug plans or fixes already captured in code and commit messages;
+- content already present in `CLAUDE.md`;
+- temporary task state or current conversation context;
+- full command logs, duplicate summaries, or stale TODOs already represented in the plan tree.
 
 ## 11. Minimal Tools
 
@@ -548,7 +542,7 @@ The initial implementation only needs:
 - `read(path, query, continue_from, max_lines)`: prefer literal `query` to find and return matching code. If the returned payload has `has_more=true`, call `read` again with the returned `next_read.args` to continue. Explicit `start`/`end` ranges remain available for known line numbers.
 - `edit(path, old, new, count)`: apply a precise text replacement.
 - `bash(command, timeout)`: run bounded shell commands.
-- `git(command, timeout)`: run allowlisted Git operations. Agent-project runs may use status, diff, log, show, branch, add, and commit; benchmark runs are restricted to read-only Git operations and reject add/commit.
+- `git(command, timeout)`: run allowlisted Git operations. Agent-project runs use the project root. Benchmark runs use the benchmark application workspace as their Git root, so local status, diff, log, show, branch, add, and commit stay isolated from the host Agent repository.
 - `write(path, content, mode)`: compatibility whole-file writer, still gated by acceptance contracts.
 - `verify(profile)`: run configured checks.
 

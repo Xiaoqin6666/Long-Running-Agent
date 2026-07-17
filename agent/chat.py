@@ -34,7 +34,7 @@ HELP_TEXT = """Commands:
 class ChatConfig:
     root: Path
     provider: str
-    max_steps: int
+    max_steps: int | None
     benchmark_id: str | None = None
     tasks_path: Path | None = None
     project_spec_path: Path | None = None
@@ -468,7 +468,7 @@ class InteractiveCLI:
             "State: "
             f"task={state.get('task_id', 'unknown')}, "
             f"iterations={state.get('iterations', 0)}, "
-            f"tokens={state.get('session_used_tokens', 0)}/{state.get('session_budget_tokens', '?')}, "
+            f"turn_tokens={state.get('session_used_tokens', 0)}/{state.get('session_budget_tokens', '?')}, "
             f"handoff_ready={state.get('handoff_ready', False)}"
         )
 
