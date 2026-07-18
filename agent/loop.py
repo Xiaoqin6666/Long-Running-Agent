@@ -116,6 +116,7 @@ class AgentLoop:
         self.handoff_payload_path = self.state_dir / "handoff_payload.json"
         self.initializer_candidate_path = self.state_dir / "rejected_candidates" / "generated_tasks.json"
         self.trace_path = self.trace_dir / self._trace_name()
+        self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
         expected_workspace = self._expected_initializer_workspace_root()
         benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
         benchmark_git_root = benchmark_python_path if self.benchmark_id else None
@@ -126,7 +127,7 @@ class AgentLoop:
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
-            "bash": BashTool(root, python_path=benchmark_python_path),
+            "bash": BashTool(root, python_path=benchmark_python_path, output_dir=self.tool_output_dir),
             "edit": EditTool(root),
             "git": GitTool(
                 benchmark_git_root or root,
@@ -317,6 +318,10 @@ class AgentLoop:
     def _prepare_auto_resume_session(self) -> TaskState:
         self.resume = True
         self.trace_path = self.trace_dir / self._trace_name()
+        self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
+        bash_tool = self.tools.get("bash")
+        if isinstance(bash_tool, BashTool):
+            bash_tool.output_dir = self.tool_output_dir
         state = self._load_or_create_state()
         self._write_state(state)
         return state
@@ -832,7 +837,11 @@ class AgentLoop:
         command = str(repair.get("command", ""))
         output = str(repair.get("output", ""))
         if command or output:
-            targets = list(targets) + self._module_repair_targets_from_failure(command, output, state)
+            targets = (
+                list(targets)
+                + self._traceback_source_repair_targets_from_failure(command, output, state)
+                + self._module_repair_targets_from_failure(command, output, state)
+            )
         result: list[str] = []
         for target in targets:
             normalized = self._normalize_target(target)
@@ -845,7 +854,8 @@ class AgentLoop:
         command = str(repair.get("command", ""))
         output = str(repair.get("output", ""))
         dynamic_targets = (
-            self._module_repair_targets_from_failure(command, output, state)
+            self._traceback_source_repair_targets_from_failure(command, output, state)
+            + self._module_repair_targets_from_failure(command, output, state)
             if command or output
             else []
         )
@@ -857,7 +867,7 @@ class AgentLoop:
             return [
                 target
                 for target in (self._normalize_target(item) for item in combined)
-                if (target in active or "/workspace/" in target)
+                if (target in active or "/workspace/" in target or target.startswith("workspace/"))
                 and (not self._looks_like_test_artifact(target) or self._is_test_repair_allowed(target, state))
                 and not (target in seen or seen.add(target))
             ]
@@ -882,13 +892,17 @@ class AgentLoop:
 
     def _repair_targets_from_failed_output(self, command: str, output: str, state: TaskState) -> list[str]:
         artifacts = [self._normalize_target(target) for target in self._active_task_expected_artifacts(state)]
-        if not artifacts:
-            return []
         combined = f"{command}\n{output}".replace("\\", "/")
         targets: list[str] = []
+        for target in self._traceback_source_repair_targets_from_failure(command, output, state):
+            if target not in targets:
+                targets.append(target)
         for target in self._module_repair_targets_from_failure(command, output, state):
             if target not in targets:
                 targets.append(target)
+
+        if not artifacts:
+            return targets
 
         for pattern in [
             r"from ['\"]([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)['\"]",
@@ -941,6 +955,56 @@ class AgentLoop:
             and self._looks_like_test_artifact(artifact)
         ]
         return implementation_targets + test_targets or artifacts
+
+    def _traceback_source_repair_targets_from_failure(
+        self,
+        command: str,
+        output: str,
+        state: TaskState,
+    ) -> list[str]:
+        del command, state
+        normalized_output = output.replace("\\", "/")
+        raw_targets: list[str] = []
+        for pattern in (
+            r"File\s+\"([^\"\n]*workspace/[^\"\n]*?\.py)\"",
+            r"(?m)(?:^|\s|>)([^\s\"']*workspace/[^\s\"']*?\.py)(?::\d+|\"|\s|$)",
+        ):
+            for match in re.finditer(pattern, normalized_output):
+                raw_targets.append(match.group(1))
+
+        targets: list[str] = []
+        for raw_target in raw_targets:
+            target = self._normalize_failure_path_target(raw_target)
+            if not target:
+                continue
+            path = Path(target)
+            if (
+                path.suffix.lower() != ".py"
+                or path.name == "__init__.py"
+                or self._looks_like_test_artifact(target)
+                or "/workspace/" not in target and not target.startswith("workspace/")
+            ):
+                continue
+            if (self.root / target).exists() or "/workspace/" in target or target.startswith("workspace/"):
+                if target not in targets:
+                    targets.append(target)
+        return targets
+
+    def _normalize_failure_path_target(self, target: str) -> str:
+        text = self._normalize_target(target.strip().strip("\"'"))
+        root = self._normalize_target(self.root)
+        if text.lower().startswith(f"{root.lower()}/"):
+            text = text[len(root) + 1 :]
+        elif text.lower().startswith("eval/benchmarks/") or text.lower().startswith("workspace/"):
+            pass
+        else:
+            lowered = text.lower()
+            for marker in ("/eval/benchmarks/", "/workspace/"):
+                index = lowered.find(marker)
+                if index != -1:
+                    text = text[index + 1 :]
+                    break
+        return self._normalize_target(text)
 
     def _module_repair_targets_from_failure(self, command: str, output: str, state: TaskState) -> list[str]:
         combined = f"{command}\n{output}".replace("\\", "/")
@@ -1193,6 +1257,7 @@ class AgentLoop:
         defaults = {
             "acceptance_tests_mutable_by_worker": False,
             "acceptance_test_repair_requires_verifier_approval": True,
+            "worker_tests_mutable_by_worker": False,
         }
         defaults.update(policy)
         return defaults
@@ -1222,8 +1287,14 @@ class AgentLoop:
         if self._is_frozen_acceptance_artifact(target, state):
             return False
         normalized = self._normalize_target(target)
+        policy = self._active_task_test_policy(state)
+        acceptance_tests = {self._normalize_target(item) for item in self._active_task_acceptance_artifacts(state)}
+        if normalized in acceptance_tests:
+            return bool(policy.get("acceptance_tests_mutable_by_worker"))
         worker_tests = {self._normalize_target(item) for item in self._active_task_worker_test_artifacts(state)}
-        return normalized in worker_tests
+        if normalized in worker_tests:
+            return bool(policy.get("worker_tests_mutable_by_worker"))
+        return False
 
     def _active_task_verification_commands(self, state: TaskState) -> list[str]:
         task = self._active_task_metadata(state)
@@ -1591,18 +1662,20 @@ class AgentLoop:
                 return
             command = str(failed.get("command", ""))
             output = str(failed.get("output", ""))
-            failure_type = self._command_failure_type(output, command=command, state=state)
+            full_output = self._full_output_from_data(failed)
+            failure_type = self._command_failure_type(full_output, command=command, state=state)
             if failure_type in {"command_syntax_error", "command_environment_error"}:
                 targets: list[str] = []
                 required_reads: list[str] = []
             else:
-                targets = self._repair_targets_from_failed_output(command, output, state)
-                required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+                targets = self._repair_targets_from_failed_output(command, full_output, state)
+                required_reads = self._repair_read_targets_from_failed_output(command, full_output, state)
             state.pending_repair = {
                 "reason": "failed_verification_command",
                 "command": command,
                 "summary": str(failed.get("summary", observation.summary)),
-                "output": output[:4000],
+                "output": output,
+                **self._output_reference_fields(failed),
                 "targets": targets,
                 "repair_targets": self._default_repair_write_targets(targets, state),
                 "required_reads": required_reads,
@@ -1627,19 +1700,21 @@ class AgentLoop:
                 state.pending_repair = {}
                 return
             output = str(observation.data.get("output", ""))
-            failure_type = self._command_failure_type(output, command=command, state=state)
+            full_output = self._full_output_from_data(observation.data)
+            failure_type = self._command_failure_type(full_output, command=command, state=state)
             if failure_type in {"command_syntax_error", "command_environment_error"}:
                 targets: list[str] = []
                 required_reads: list[str] = []
             else:
-                targets = self._repair_targets_from_failed_output(command, output, state)
-                required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+                targets = self._repair_targets_from_failed_output(command, full_output, state)
+                required_reads = self._repair_read_targets_from_failed_output(command, full_output, state)
             read_targets = self._preserve_pending_repair_reads(state, required_reads)
             state.pending_repair = {
                 "reason": "failed_acceptance_command",
                 "command": canonical_command,
                 "summary": observation.summary,
-                "output": output[:4000],
+                "output": output,
+                **self._output_reference_fields(observation.data),
                 "targets": targets,
                 "repair_targets": self._default_repair_write_targets(targets, state),
                 "required_reads": required_reads,
@@ -1680,6 +1755,31 @@ class AgentLoop:
                 preserved.append(normalized)
         return preserved
 
+    def _full_output_from_data(self, data: dict[str, Any]) -> str:
+        output_path = str(data.get("output_path", ""))
+        if output_path:
+            try:
+                path = (self.root / output_path).resolve()
+                path.relative_to(self.root.resolve())
+                if path.exists() and path.is_file():
+                    return path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+        return str(data.get("output", ""))
+
+    @staticmethod
+    def _output_reference_fields(data: dict[str, Any]) -> dict[str, Any]:
+        keys = [
+            "stdout_path",
+            "stderr_path",
+            "output_path",
+            "stdout_chars",
+            "stderr_chars",
+            "output_chars",
+            "output_truncated",
+        ]
+        return {key: data[key] for key in keys if key in data}
+
     def _recover_pending_repair_from_recent_trace(self, state: TaskState) -> None:
         if not self.trace_dir.exists():
             return
@@ -1718,13 +1818,14 @@ class AgentLoop:
                 if observation.get("ok") is True:
                     return
                 output = str(data.get("output", ""))
-                failure_type = self._command_failure_type(output, command=command, state=state)
+                full_output = self._full_output_from_data(data)
+                failure_type = self._command_failure_type(full_output, command=command, state=state)
                 if failure_type in {"command_syntax_error", "command_environment_error"}:
                     targets = []
                     required_reads = []
                 else:
-                    targets = self._repair_targets_from_failed_output(command, output, state)
-                    required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+                    targets = self._repair_targets_from_failed_output(command, full_output, state)
+                    required_reads = self._repair_read_targets_from_failed_output(command, full_output, state)
                 read_targets = [
                     target
                     for target in reversed(read_after_failure)
@@ -1735,7 +1836,8 @@ class AgentLoop:
                         "reason": "failed_acceptance_command",
                         "command": self._canonical_contract_command(command, state),
                         "summary": observation.get("summary", ""),
-                        "output": output[:4000],
+                        "output": output,
+                        **self._output_reference_fields(data),
                         "targets": targets,
                         "repair_targets": self._default_repair_write_targets(targets, state),
                         "required_reads": required_reads,
@@ -2943,6 +3045,8 @@ class AgentLoop:
             f"- read_targets: {', '.join(str(item) for item in repair.get('read_targets', []))}",
             f"- repaired_targets: {', '.join(str(item) for item in repair.get('repaired_targets', []))}",
             f"- command_failure_type: {failure_type}",
+            f"- output_path: {repair.get('output_path', '')}",
+            f"- stderr_path: {repair.get('stderr_path', '')}",
             f"- summary: {repair.get('summary', '')}",
         ]
         if suggested:

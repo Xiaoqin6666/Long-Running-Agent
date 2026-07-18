@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.output_capture import capture_command_output
 from agent.planner import TaskState, verification_command_portability_error
 from agent.tools import ToolResult
 
@@ -139,7 +140,7 @@ class Verifier:
                             "ok": False,
                             "returncode": None,
                             "summary": "Verification working directory is outside the workspace.",
-                            "output": working_directory[-4000:],
+                            "output": working_directory,
                         }
                     )
                     continue
@@ -155,7 +156,13 @@ class Verifier:
                     errors="replace",
                     timeout=180,
                 )
-                output = (completed.stdout + completed.stderr).strip()
+                output_data = capture_command_output(
+                    root=self.root,
+                    output_dir=self.state_dir / "tool_outputs" / "verifier",
+                    label="verify",
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                )
                 results.append(
                     {
                         "command": command,
@@ -163,7 +170,7 @@ class Verifier:
                         "ok": completed.returncode == 0,
                         "returncode": completed.returncode,
                         "summary": f"Verification command exited with code {completed.returncode}.",
-                        "output": output[-4000:],
+                        **output_data,
                     }
                 )
             except (OSError, subprocess.SubprocessError) as exc:
@@ -174,7 +181,7 @@ class Verifier:
                         "ok": False,
                         "returncode": None,
                         "summary": "Verification command could not be executed.",
-                        "output": str(exc)[-4000:],
+                        "output": str(exc),
                     }
                 )
         return bool(results) and all(item["ok"] for item in results), results
@@ -488,8 +495,14 @@ class Verifier:
             errors="replace",
             timeout=60,
         )
-        output = (completed.stdout + completed.stderr).strip()
-        return completed.returncode == 0, output[-4000:]
+        output_data = capture_command_output(
+            root=self.root,
+            output_dir=self.state_dir / "tool_outputs" / "verifier",
+            label="unit-tests",
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+        return completed.returncode == 0, str(output_data.get("output", ""))
 
     def _write_report(self, result: ToolResult) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)

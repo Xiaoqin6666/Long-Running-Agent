@@ -5,13 +5,15 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from agent.output_capture import capture_command_output
 from agent.tools.base import WorkspaceTool
 
 
 class BashTool(WorkspaceTool):
-    def __init__(self, root: Path, python_path: Path | None = None) -> None:
+    def __init__(self, root: Path, python_path: Path | None = None, output_dir: Path | None = None) -> None:
         super().__init__(root)
         self.python_path = python_path.resolve() if python_path else None
+        self.output_dir = output_dir or root / "state" / "tool_outputs"
 
     def run(self, action: dict[str, Any]):
         from agent.tools import ToolResult
@@ -39,14 +41,20 @@ class BashTool(WorkspaceTool):
             errors="replace",
             timeout=timeout,
         )
-        output = (completed.stdout + completed.stderr).strip()
+        output_data = capture_command_output(
+            root=self.root,
+            output_dir=self.output_dir,
+            label="bash",
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
         return ToolResult(
             completed.returncode == 0,
             f"Command exited with code {completed.returncode}.",
             {
                 "command": command,
-                "output": output[:8000],
                 "cwd": str(self.root),
                 "python_path": str(self.python_path) if self.python_path else "",
+                **output_data,
             },
         )

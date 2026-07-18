@@ -574,6 +574,8 @@ class ContextBuilder:
                     f"- reason: {repair.get('reason', 'pending_repair')}",
                     f"- command: {str(repair.get('command', '')).replace(chr(10), ' ')[:1000] or 'none'}",
                     f"- summary: {str(repair.get('summary', ''))[:1000] or 'none'}",
+                    f"- output_path: {repair.get('output_path', 'none') or 'none'}",
+                    f"- stderr_path: {repair.get('stderr_path', 'none') or 'none'}",
                     f"- diagnostic_targets: {repair.get('targets', [])}",
                     f"- repair_targets: {self._pending_repair_write_targets(state)}",
                     f"- required_reads: {repair.get('required_reads', [])}",
@@ -1015,7 +1017,11 @@ class ContextBuilder:
         result: list[str] = []
         for target in targets:
             normalized = str(target).replace("\\", "/").strip().rstrip("/")
-            if normalized in active_artifacts and normalized not in result:
+            if (
+                normalized in active_artifacts
+                or "/workspace/" in normalized
+                or normalized.startswith("workspace/")
+            ) and normalized not in result:
                 result.append(normalized)
         return result
 
@@ -1032,7 +1038,8 @@ class ContextBuilder:
             return [
                 target
                 for target in (str(item).replace("\\", "/").strip().rstrip("/") for item in explicit)
-                if target in active and (not self._looks_like_test_artifact(target) or self._is_test_repair_allowed(target, state))
+                if (target in active or "/workspace/" in target or target.startswith("workspace/"))
+                and (not self._looks_like_test_artifact(target) or self._is_test_repair_allowed(target, state))
             ]
         targets = self._pending_repair_targets(state)
         implementation_targets = [
@@ -1056,7 +1063,8 @@ class ContextBuilder:
             f"- frozen_acceptance_artifacts: {', '.join(frozen) if frozen else 'none'}",
             f"- missing_owned_artifacts: {', '.join(missing_owned) if missing_owned else 'none'}",
             f"- test_policy: {policy}",
-            "- Rule: implementation artifacts are normal repair targets; worker tests remain mutable unless explicitly listed in frozen_acceptance_artifacts.",
+            "- Rule: implementation artifacts are normal repair targets; verifier traceback source files under workspace are valid repair targets even when they are outside expected_artifacts.",
+            "- Rule: frozen or contract acceptance tests are not repair targets by default; worker tests are repair targets only when test_policy.worker_tests_mutable_by_worker is true.",
         ]
 
     def _missing_active_owned_artifacts(self, state: TaskState) -> list[str]:
@@ -1129,12 +1137,14 @@ class ContextBuilder:
                     merged: dict[str, object] = {
                         "acceptance_tests_mutable_by_worker": False,
                         "acceptance_test_repair_requires_verifier_approval": True,
+                        "worker_tests_mutable_by_worker": False,
                     }
                     merged.update(policy)
                     return merged
         return {
             "acceptance_tests_mutable_by_worker": False,
             "acceptance_test_repair_requires_verifier_approval": True,
+            "worker_tests_mutable_by_worker": False,
         }
 
     def _is_frozen_acceptance_artifact(self, target: str, state: TaskState) -> bool:
@@ -1153,11 +1163,20 @@ class ContextBuilder:
         if self._is_frozen_acceptance_artifact(target, state):
             return False
         normalized = target.replace("\\", "/").strip().rstrip("/")
+        policy = self._active_task_test_policy(state)
+        acceptance_tests = {
+            item.replace("\\", "/").strip().rstrip("/")
+            for item in self._active_task_acceptance_artifacts(state)
+        }
+        if normalized in acceptance_tests:
+            return bool(policy.get("acceptance_tests_mutable_by_worker"))
         worker_tests = {
             item.replace("\\", "/").strip().rstrip("/")
             for item in self._active_task_worker_test_artifacts(state)
         }
-        return normalized in worker_tests
+        if normalized in worker_tests:
+            return bool(policy.get("worker_tests_mutable_by_worker"))
+        return False
 
     def _looks_like_test_artifact(self, target: str) -> bool:
         normalized = target.replace("\\", "/")
