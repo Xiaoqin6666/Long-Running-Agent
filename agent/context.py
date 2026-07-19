@@ -11,6 +11,7 @@ from agent.skills import parse_skill, skill_catalog
 
 
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
+READ_OBSERVATION_SUPERSEDE_STEP_GAP = 5
 
 
 class ContextBuilder:
@@ -20,11 +21,13 @@ class ContextBuilder:
         max_chars: int | None = None,
         state_dir: Path | None = None,
         git_root: Path | None = None,
+        project_spec_path: Path | None = None,
     ) -> None:
         self.root = root
         del max_chars
         self.state_dir = state_dir or root / "state"
         self.git_root = git_root or root
+        self.project_spec_path = project_spec_path
         self.current_trace_path: Path | None = None
 
     def build(self, state: TaskState, relevant_memories: str = "", include_handoff: bool | None = None) -> str:
@@ -128,10 +131,10 @@ class ContextBuilder:
 
     def _session_startup_context(self, state: TaskState | None = None, include_handoff: bool = True) -> str:
         state_label = self._rel(self.state_dir)
-        project_spec = self._read_optional(self.state_dir / "project_spec.md", max_chars=2500)
+        project_spec_path = self._project_spec_context_path()
+        project_spec = self._read_optional(project_spec_path, max_chars=2500) if project_spec_path else ""
         root_tasks_overview = ""
         if self.state_dir == self.root / "state":
-            project_spec = project_spec or self._read_optional(self.root / "project_spec.md", max_chars=2500)
             root_tasks_overview = self._task_graph_overview(self.root / "tasks.json", state)
         candidate_path = ""
         if state and isinstance(state.initializer_repair, dict) and state.initializer_repair.get("candidate_path"):
@@ -139,7 +142,7 @@ class ContextBuilder:
         lines = [
             "# Session Startup Context",
             "Included only on the first model call of a Worker session.",
-            f"## {state_label}/project_spec.md",
+            f"## {self._rel(project_spec_path) if project_spec_path else state_label + '/project_spec.md'}",
             project_spec,
             "## Task Graph Overview",
             *(["### repository tasks.json (non-benchmark runs only)", root_tasks_overview] if root_tasks_overview else []),
@@ -204,6 +207,8 @@ class ContextBuilder:
             "",
             *self._initializer_instruction_lines(state),
             "",
+            self._requirement_matrix_summary_context(),
+            "",
             "# Active Task Artifact Policy",
             *self._artifact_policy_lines(state),
             "",
@@ -231,7 +236,6 @@ class ContextBuilder:
             '{"thought_summary":"brief non-hidden reasoning","action":"<one action>","target":"<path|command|query|task|empty>","args":{},"expected_observation":"expected result","risk":"low|medium|high"}',
             "Callable actions:",
             "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
-            "- debug_context: inspect the exact model context snapshot for the current or a previous step; target='current' or target='<step>'; args.include_content=true returns the content in observation data, otherwise returns file references.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
             "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
@@ -418,6 +422,38 @@ class ContextBuilder:
         current_text = ", ".join(current) if current else "none"
         return f"{len(tasks)} task(s); {count_text}; next={current_text}"
 
+    def _requirement_matrix_summary_context(self) -> str:
+        path = self.state_dir / "requirements.json"
+        if not path.exists():
+            return "# Requirement Matrix Summary\n\nNo requirements.json is available yet."
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"# Requirement Matrix Summary\n\nrequirements.json is unreadable: {exc}"
+        requirements = data.get("requirements") if isinstance(data, dict) else None
+        if not isinstance(requirements, list):
+            return "# Requirement Matrix Summary\n\nrequirements.json has no requirements list."
+
+        lines = [
+            "# Requirement Matrix Summary",
+            "Use this list when generating generated_tasks.json; do not search/read requirements.json just to recover ids.",
+        ]
+        must_ids: list[str] = []
+        for item in requirements:
+            if not isinstance(item, dict):
+                continue
+            req_id = str(item.get("id", "")).strip()
+            priority = str(item.get("priority", "")).strip()
+            req_type = str(item.get("type", "")).strip()
+            frozen = item.get("frozen_acceptance", {})
+            targets = frozen.get("assertion_targets", []) if isinstance(frozen, dict) else []
+            target_count = len(targets) if isinstance(targets, list) else 0
+            if priority == "must" and req_id:
+                must_ids.append(req_id)
+            lines.append(f"- {req_id or 'UNKNOWN'} | priority={priority or 'unknown'} | type={req_type or 'unknown'} | assertion_targets={target_count}")
+        lines.append(f"- must_requirement_ids: {', '.join(must_ids) if must_ids else 'none'}")
+        return "\n".join(lines)
+
     def _format_id_list(self, items: list[str], limit: int = 12) -> str:
         if not items:
             return "none"
@@ -500,13 +536,9 @@ class ContextBuilder:
         if not text.strip():
             return "No handoff.md available."
         modern_wanted = {
-            "## Critical Context",
-            "## Working Context",
             "## Resume Guidance",
         }
         legacy_mapping = {
-            "## 10a. Pending Repair": ("## Critical Context", "### Pending Repair"),
-            "## 10b. Initializer Repair": ("## Critical Context", "### Initializer Repair"),
             "## 12. Known Risks And Failed Attempts": ("## Resume Guidance", "### Known Risks And Failed Attempts"),
             "## 14. Resume Instructions": ("## Resume Guidance", "### Resume Instructions"),
             "## 15. Suggested Next Action": ("## Resume Guidance", "### Suggested Next Action"),
@@ -542,7 +574,7 @@ class ContextBuilder:
             else:
                 sections.append(self._filter_handoff_focus_section(rendered))
         if legacy_groups:
-            for group in ("## Critical Context", "## Resume Guidance"):
+            for group in ("## Resume Guidance",):
                 items = [item for item in legacy_groups.get(group, []) if item]
                 if items:
                     sections.append("\n".join([group, *items]).strip())
@@ -598,13 +630,11 @@ class ContextBuilder:
 
     def _recent_tool_observations_context(self, state: TaskState) -> str:
         records: list[tuple[object, dict[str, object], dict[str, object]]] = []
-        for event in self._current_session_trace_events():
+        for event in self._current_session_context_events(state):
             action = event.get("action", {})
             observation = event.get("tool_return", event.get("observation", {}))
             if isinstance(action, dict) and isinstance(observation, dict):
                 records.append((event.get("step", "?"), action, observation))
-        if not records and isinstance(state.last_action, dict) and isinstance(state.last_observation, dict):
-            records.append(("current", state.last_action, state.last_observation))
 
         chunks: list[str] = []
         for index, (step, action, observation) in enumerate(records, start=1):
@@ -696,15 +726,7 @@ class ContextBuilder:
         return None
 
     def _recent_step_trace_context(self, state: TaskState) -> str:
-        events = self._current_session_trace_events()
-        if not events and state.last_action:
-            events = [
-                {
-                    "step": "current",
-                    "action": state.last_action,
-                    "tool_return": state.last_observation,
-                }
-            ]
+        events = self._current_session_context_events(state)
         lines = []
         if events:
             for event in events:
@@ -731,6 +753,66 @@ class ContextBuilder:
         if observations:
             lines.extend(["", "### Detailed Tool Observations", observations])
         return "\n".join(lines)
+
+    def _current_session_context_events(self, state: TaskState) -> list[dict[str, object]]:
+        events = self._current_session_trace_events()
+        if not events and state.last_action:
+            events = [
+                {
+                    "step": "current",
+                    "action": state.last_action,
+                    "tool_return": state.last_observation,
+                }
+            ]
+        return self._prune_superseded_read_events(events)
+
+    def _prune_superseded_read_events(self, events: list[dict[str, object]]) -> list[dict[str, object]]:
+        current_step = self._current_context_step(events)
+        read_counts_by_target: dict[str, int] = {}
+        for event in events:
+            key = self._successful_read_event_key(event)
+            if key is not None:
+                read_counts_by_target[key] = read_counts_by_target.get(key, 0) + 1
+
+        kept: list[dict[str, object]] = []
+        for event in events:
+            key = self._successful_read_event_key(event)
+            step = self._event_step_number(event)
+            if (
+                key is not None
+                and step is not None
+                and current_step is not None
+                and read_counts_by_target.get(key, 0) > 1
+                and current_step - step > READ_OBSERVATION_SUPERSEDE_STEP_GAP
+            ):
+                continue
+            kept.append(event)
+        return kept
+
+    def _current_context_step(self, events: list[dict[str, object]]) -> int | None:
+        numeric_steps = [step for event in events if (step := self._event_step_number(event)) is not None]
+        if not numeric_steps:
+            return None
+        return max(numeric_steps) + 1
+
+    def _successful_read_event_key(self, event: dict[str, object]) -> str | None:
+        action = event.get("action", {})
+        observation = event.get("tool_return", event.get("observation", {}))
+        if not isinstance(action, dict) or not isinstance(observation, dict):
+            return None
+        if action.get("action") != "read" or observation.get("ok") is not True:
+            return None
+        data = observation.get("data", {})
+        if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+            return None
+        target = str(action.get("target", "")).replace("\\", "/").strip().rstrip("/")
+        return target.lower() or None
+
+    def _event_step_number(self, event: dict[str, object]) -> int | None:
+        try:
+            return int(event.get("step", ""))
+        except (TypeError, ValueError):
+            return None
 
     def _current_session_trace_events(self) -> list[dict[str, object]]:
         if self.current_trace_path is not None:
@@ -810,29 +892,72 @@ class ContextBuilder:
     def _initializer_instruction_lines(self, state: TaskState) -> list[str]:
         if self._active_task_id(state) != "INIT":
             return []
+        project_spec_path = self._project_spec_context_path()
+        project_spec_ref = self._rel(project_spec_path) if project_spec_path else self._rel(self.state_dir / "project_spec.md")
+        state_spec_path = self.state_dir / "project_spec.md"
+        uses_external_spec = bool(
+            project_spec_path
+            and (
+                not state_spec_path.exists()
+                or self._normalize_path(project_spec_path) != self._normalize_path(state_spec_path)
+            )
+        )
+        spec_requirement = (
+            f"- Use {project_spec_ref} as the durable project specification input; do not rewrite or regenerate it."
+            if uses_external_spec
+            else f"- {self._rel(state_spec_path)} must exist as the durable project specification."
+        )
         return [
             "# Initializer Requirements",
             "This is the one-time Initializer / Planner stage.",
-            f"Read {self._rel(self.state_dir / 'project_spec.md')} and transform it into a structured task graph.",
+            f"Read {project_spec_ref} and transform it into a structured task graph.",
             "Required outputs:",
-            f"- {self._rel(self.state_dir / 'project_spec.md')} must exist as the durable project specification.",
-            f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list.",
+            spec_requirement,
+            f"- {self._rel(self.state_dir / 'requirements.json')} must contain a JSON object with a non-empty requirements list.",
+            f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list whose tasks reference requirements.json.",
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
-            "Each generated task should include: id, title, priority, depends_on, status, acceptance_criteria, criterion_command_map, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, and verification_commands.",
-            "criterion_command_map must map every exact acceptance criterion string to one or more exact entries from verification_commands, and every verification command must be mapped.",
+            "First extract a Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance:{intent, assertion_targets, forbidden_weak_assertions?}}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. frozen_acceptance is immutable: Worker may repair test syntax, paths, imports, or platform issues, but must not weaken the requirement intent or assertion_targets.",
+            "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
+            "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
+            "Each generated task must include both requirement_ids and requirements. requirement_ids is the machine-readable id list; requirements is the exact snapshot of the matching requirement objects from requirements.json, including frozen_acceptance.",
+            "Each generated task should include: id, title, priority, depends_on, status, requirement_ids, requirements, acceptance_criteria, criterion_command_map, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, verification_assets, and verification_commands.",
+            "verification_assets declares test files or verification files. One asset may cover one or more current-task requirements, but all current-task requirement_ids must be covered. For each covered requirement, assertion_targets must include the frozen_acceptance assertion_targets for that requirement. repair_policy must be infra_only.",
+            "verification_commands may also cover one or more current-task requirements, but all current-task requirement_ids must be covered by commands. Prefer structured command objects {id, command, covers, asset_ids}; asset_ids must point to verification_assets that cover the same requirements.",
+            "criterion_command_map must map every exact acceptance criterion string to one or more exact command strings from verification_commands, and every command string must be mapped.",
             "Verification commands run from the repository root and must be direct, portable Python commands without Unix-only shell setup. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls. Do not mix os.chdir('<workspace>') with subprocess cwd='<workspace>'; for contract repairs prefer verification_procedure.working_directory.",
+            "Verification commands must prove behavior, not just imports or shallow construction. Avoid weak checks such as assert callable(main), assert app is not None, assert isinstance(result, dict), or assert isinstance(conflicts, list). GUI workflow requirements must use test-file evidence that exercises handlers or observable state changes.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
-            "Minimal complete task example:",
-            '{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","acceptance_criteria":["Behavior is verified."],"criterion_command_map":{"Behavior is verified.":["python -m unittest discover -s <workspace>/tests"]},"expected_artifacts":["<workspace>/pkg/feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":[],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true},"verification_commands":["python -m unittest discover -s <workspace>/tests"]}',
+            "Minimal requirements.json example:",
+            '{\n  "requirements": [\n    {\n      "id": "REQ-FEATURE-BEHAVIOR",\n      "source": "task.md:1",\n      "text": "The feature produces the requested observable behavior.",\n      "type": "service_logic",\n      "priority": "must",\n      "acceptance_intent": "A user-visible or test-visible output changes as specified.",\n      "frozen_acceptance": {\n        "intent": "Verify the feature changes observable output as specified.",\n        "assertion_targets": [\n          "given representative input, output equals the requested value"\n        ],\n        "forbidden_weak_assertions": [\n          "do not only import the module",\n          "do not only check callable"\n        ]\n      }\n    }\n  ]\n}',
+            "Minimal generated_tasks.json task example:",
+            '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","requirement_ids":["REQ-FEATURE-BEHAVIOR"],"requirements":[{"id":"REQ-FEATURE-BEHAVIOR","source":"task.md:1","text":"The feature produces the requested observable behavior.","type":"service_logic","priority":"must","acceptance_intent":"A user-visible or test-visible output changes as specified.","frozen_acceptance":{"intent":"Verify the feature changes observable output as specified.","assertion_targets":["given representative input, output equals the requested value"],"forbidden_weak_assertions":["do not only import the module","do not only check callable"]}}],"acceptance_criteria":["Behavior is verified with observable output."],"criterion_command_map":{"Behavior is verified with observable output.":["python -m unittest discover -s <workspace>/tests"]},"expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":true,"acceptance_test_repair_requires_verifier_approval":true},"verification_assets":[{"id":"VA-FEATURE-BEHAVIOR","path":"<workspace>/tests/test_feature.py","runner":"unittest","covers":["REQ-FEATURE-BEHAVIOR"],"assertion_targets":{"REQ-FEATURE-BEHAVIOR":["given representative input, output equals the requested value"]},"repair_policy":"infra_only"}],"verification_commands":[{"id":"VC-FEATURE-BEHAVIOR","command":"python -m unittest discover -s <workspace>/tests","covers":["REQ-FEATURE-BEHAVIOR"],"asset_ids":["VA-FEATURE-BEHAVIOR"]}]}]}',
             "Implementation tasks must declare non-empty implementation_artifacts, and every owned implementation/test/acceptance artifact must also appear in expected_artifacts.",
             "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation). Verification commands must be substantive and must not be placeholders such as bare echo, TODO, or 'not implemented'.",
             "INIT does not require an acceptance contract.",
-            "During INIT, write or edit only the three initializer artifacts listed above. Do not create application code, tests, skeleton files, or workspace files.",
+            "During INIT, write or edit only the writable initializer outputs listed above. Do not create application code, tests, skeleton files, workspace files, or a regenerated project spec.",
             "The repository-root init.sh belongs to the Long-Running Agent harness and must not be modified by a benchmark INIT.",
             "Any application artifact in the generated task graph must be under the workspace path required by project_spec.md.",
             "Do not use answer or finish during INIT.",
             "After writing initializer artifacts, use verify. The verifier executes the INIT verification command itself; only Verifier PASS completes INIT and allows Orchestrator to schedule the first Worker task.",
         ]
+
+    def _project_spec_context_path(self) -> Path | None:
+        if self.project_spec_path and self.project_spec_path.exists():
+            return self.project_spec_path
+        state_spec = self.state_dir / "project_spec.md"
+        if state_spec.exists():
+            return state_spec
+        root_spec = self.root / "project_spec.md"
+        if self.state_dir == self.root / "state" and root_spec.exists():
+            return root_spec
+        return state_spec
+
+    @staticmethod
+    def _normalize_path(path: Path) -> str:
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path)
 
     def _required_next_action(self, state: TaskState) -> str:
         if state.pending_skill_review:

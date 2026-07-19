@@ -27,6 +27,7 @@ from agent.tools.edit import EditTool
 from agent.tools.git import GitTool
 from agent.tools.list_files import ListFilesTool
 from agent.tools.read import ReadTool
+from agent.tools.search import SearchTool
 from agent.verifier import Verifier
 from eval.metrics import load_events, summarize
 
@@ -46,6 +47,20 @@ class WorkspaceTemporaryDirectory:
 
 
 class HarnessBehaviorTests(unittest.TestCase):
+    def test_search_tool_caps_matches_at_ten(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "notes.txt").write_text(
+                "\n".join(f"needle line {index}" for index in range(12)),
+                encoding="utf-8",
+            )
+
+            result = SearchTool(root).run({"action": "search", "target": "needle", "args": {"path": "."}})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary, "Found 10 match(es).")
+        self.assertEqual(len(result.data["matches"]), 10)
+
     def test_initializer_script_validator_rejects_python_source_and_state_workspace(self) -> None:
         errors = validate_initializer_script(
             "#!/usr/bin/env python3\n"
@@ -109,12 +124,352 @@ class HarnessBehaviorTests(unittest.TestCase):
     def test_initializer_prompt_requires_integer_priority_with_complete_example(self) -> None:
         self.assertIn("priority MUST be an integer", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"priority":1', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"requirements"', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"requirement_ids"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"implementation_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"verification_commands"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("commands run from the repository root", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Read narrowly instead of preloading the repository", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("continue read has_more pages", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Avoid Unix-only commands", MAIN_AGENT_SYSTEM_PROMPT)
+
+    def test_initializer_task_graph_requires_requirement_coverage_matrix(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        command = "python -c \"assert 1 + 1 == 2\""
+
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement behavior",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "acceptance_criteria": ["Behavior is verified."],
+                        "criterion_command_map": {"Behavior is verified.": [command]},
+                        "expected_artifacts": [f"{workspace}/core.py"],
+                        "implementation_artifacts": [f"{workspace}/core.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [command],
+                    }
+                ]
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+        )
+
+        self.assertIn("requirements must be a non-empty list", " ".join(errors))
+
+    def test_task_graph_reviewer_rejects_weak_gui_verification(self) -> None:
+        workspace = "eval/benchmarks/employee_system/workspace"
+        command = (
+            "python -c \"import sys, tkinter as tk; "
+            f"sys.path.insert(0,'{workspace}'); "
+            "from mprs.ui.main_window import MainWindow; root=tk.Tk(); "
+            "root.withdraw(); app=MainWindow(root); assert app is not None; root.destroy()\""
+        )
+
+        errors = validate_generated_task_graph(
+            {
+                "requirements": [
+                    {
+                        "id": "REQ-GUI-AUTO-ALLOCATE",
+                        "source": "task.md:3.3",
+                        "text": "The automatic allocation button updates the allocation view.",
+                        "type": "gui_workflow",
+                        "priority": "must",
+                    }
+                ],
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Main GUI workflow",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-GUI-AUTO-ALLOCATE"],
+                        "acceptance_criteria": ["Automatic allocation is available from the GUI."],
+                        "criterion_command_map": {"Automatic allocation is available from the GUI.": [command]},
+                        "expected_artifacts": [f"{workspace}/mprs/ui/main_window.py"],
+                        "implementation_artifacts": [f"{workspace}/mprs/ui/main_window.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [command],
+                    }
+                ],
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+        )
+
+        self.assertIn("too weak", " ".join(errors))
+
+    def test_task_graph_reviewer_accepts_separate_requirements_with_task_snapshots(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        requirement = {
+            "id": "REQ-COUNT",
+            "source": "task.md:1",
+            "text": "The counter returns the number of todo lines.",
+            "type": "service_logic",
+            "priority": "must",
+            "acceptance_intent": "A unit test observes the computed count.",
+            "frozen_acceptance": {
+                "intent": "Verify the counter computes todo line counts.",
+                "assertion_targets": ["given todo lines, the returned count equals the number of todo items"],
+                "forbidden_weak_assertions": ["do not only import the module"],
+            },
+        }
+        command = "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-COUNT"],
+                        "requirements": [requirement],
+                        "acceptance_criteria": ["Counter behavior is verified."],
+                        "criterion_command_map": {"Counter behavior is verified.": [command]},
+                        "expected_artifacts": [f"{workspace}/todo_counter/core.py"],
+                        "implementation_artifacts": [f"{workspace}/todo_counter/core.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_assets": [
+                            {
+                                "id": "VA-COUNT",
+                                "path": f"{workspace}/tests/test_counter.py",
+                                "runner": "unittest",
+                                "covers": ["REQ-COUNT"],
+                                "assertion_targets": {
+                                    "REQ-COUNT": [
+                                        "given todo lines, the returned count equals the number of todo items"
+                                    ]
+                                },
+                                "repair_policy": "infra_only",
+                            }
+                        ],
+                        "verification_commands": [
+                            {
+                                "id": "VC-COUNT",
+                                "command": command,
+                                "covers": ["REQ-COUNT"],
+                                "asset_ids": ["VA-COUNT"],
+                            }
+                        ],
+                    }
+                ]
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": [requirement]},
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_task_graph_reviewer_allows_one_verification_for_multiple_requirements(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        requirements = [
+            {
+                "id": "REQ-COUNT",
+                "source": "task.md:1",
+                "text": "The counter returns the number of todo lines.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify todo counting.",
+                    "assertion_targets": ["todo count equals number of todo lines"],
+                },
+            },
+            {
+                "id": "REQ-EMPTY",
+                "source": "task.md:2",
+                "text": "The counter returns zero for empty input.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify empty input behavior.",
+                    "assertion_targets": ["empty input returns zero"],
+                },
+            },
+        ]
+        command = "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+        task = {
+            "id": "T1",
+            "title": "Implement counter",
+            "priority": 1,
+            "depends_on": [],
+            "status": "pending",
+            "requirement_ids": ["REQ-COUNT", "REQ-EMPTY"],
+            "requirements": requirements,
+            "acceptance_criteria": ["Counter behavior is verified."],
+            "criterion_command_map": {"Counter behavior is verified.": [command]},
+            "expected_artifacts": [
+                f"{workspace}/todo_counter/core.py",
+                f"{workspace}/tests/test_counter.py",
+            ],
+            "implementation_artifacts": [f"{workspace}/todo_counter/core.py"],
+            "worker_test_artifacts": [f"{workspace}/tests/test_counter.py"],
+            "acceptance_artifacts": [],
+            "frozen_acceptance_artifacts": [],
+            "verification_assets": [
+                {
+                    "id": "VA-COUNTER",
+                    "path": f"{workspace}/tests/test_counter.py",
+                    "runner": "unittest",
+                    "covers": ["REQ-COUNT", "REQ-EMPTY"],
+                    "assertion_targets": {
+                        "REQ-COUNT": ["todo count equals number of todo lines"],
+                        "REQ-EMPTY": ["empty input returns zero"],
+                    },
+                    "repair_policy": "infra_only",
+                }
+            ],
+            "verification_commands": [
+                {
+                    "id": "VC-COUNTER",
+                    "command": command,
+                    "covers": ["REQ-COUNT", "REQ-EMPTY"],
+                    "asset_ids": ["VA-COUNTER"],
+                }
+            ],
+        }
+
+        errors = validate_generated_task_graph(
+            {"tasks": [task]},
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": requirements},
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_task_graph_reviewer_rejects_missing_verification_command_requirement_coverage(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        requirements = [
+            {
+                "id": "REQ-COUNT",
+                "source": "task.md:1",
+                "text": "The counter returns the number of todo lines.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify todo counting.",
+                    "assertion_targets": ["todo count equals number of todo lines"],
+                },
+            },
+            {
+                "id": "REQ-EMPTY",
+                "source": "task.md:2",
+                "text": "The counter returns zero for empty input.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify empty input behavior.",
+                    "assertion_targets": ["empty input returns zero"],
+                },
+            },
+        ]
+        command = "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+        task = {
+            "id": "T1",
+            "title": "Implement counter",
+            "priority": 1,
+            "depends_on": [],
+            "status": "pending",
+            "requirement_ids": ["REQ-COUNT", "REQ-EMPTY"],
+            "requirements": requirements,
+            "acceptance_criteria": ["Counter behavior is verified."],
+            "criterion_command_map": {"Counter behavior is verified.": [command]},
+            "expected_artifacts": [
+                f"{workspace}/todo_counter/core.py",
+                f"{workspace}/tests/test_counter.py",
+            ],
+            "implementation_artifacts": [f"{workspace}/todo_counter/core.py"],
+            "worker_test_artifacts": [f"{workspace}/tests/test_counter.py"],
+            "acceptance_artifacts": [],
+            "frozen_acceptance_artifacts": [],
+            "verification_assets": [
+                {
+                    "id": "VA-COUNTER",
+                    "path": f"{workspace}/tests/test_counter.py",
+                    "runner": "unittest",
+                    "covers": ["REQ-COUNT", "REQ-EMPTY"],
+                    "assertion_targets": {
+                        "REQ-COUNT": ["todo count equals number of todo lines"],
+                        "REQ-EMPTY": ["empty input returns zero"],
+                    },
+                    "repair_policy": "infra_only",
+                }
+            ],
+            "verification_commands": [
+                {
+                    "id": "VC-COUNT",
+                    "command": command,
+                    "covers": ["REQ-COUNT"],
+                    "asset_ids": ["VA-COUNTER"],
+                }
+            ],
+        }
+
+        errors = validate_generated_task_graph(
+            {"tasks": [task]},
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": requirements},
+        )
+
+        self.assertIn("verification_commands do not cover task requirements", " ".join(errors))
+
+    def test_task_graph_reviewer_rejects_requirement_snapshot_drift(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        requirement = {
+            "id": "REQ-COUNT",
+            "source": "task.md:1",
+            "text": "The counter returns the number of todo lines.",
+            "type": "service_logic",
+            "priority": "must",
+        }
+        command = "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+        drifted = dict(requirement)
+        drifted["text"] = "The counter only imports successfully."
+
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-COUNT"],
+                        "requirements": [drifted],
+                        "acceptance_criteria": ["Counter behavior is verified."],
+                        "criterion_command_map": {"Counter behavior is verified.": [command]},
+                        "expected_artifacts": [f"{workspace}/todo_counter/core.py"],
+                        "implementation_artifacts": [f"{workspace}/todo_counter/core.py"],
+                        "worker_test_artifacts": [],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_commands": [command],
+                    }
+                ]
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": [requirement]},
+        )
+
+        self.assertIn("must match requirements.json", " ".join(errors))
 
     def test_generated_task_validator_requires_workspace_import_bootstrap(self) -> None:
         workspace = "eval/benchmarks/todo_counter/workspace"
@@ -414,23 +769,37 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(str(args.log_file), "diagnostics\\run.log")
 
-    def test_debug_context_action_is_validated(self) -> None:
+    def test_debug_context_action_is_rejected_by_validation(self) -> None:
         state = create_initial_state("Inspect context")
 
-        action = validate_action(
-            {
-                "thought_summary": "Inspect the current model context.",
-                "action": "debug_context",
-                "target": "current",
-                "args": {"include_content": True},
-                "expected_observation": "Context snapshot is returned.",
-                "risk": "low",
-            },
-            state,
-        )
+        with self.assertRaisesRegex(ValueError, "Unsupported model action: debug_context"):
+            validate_action(
+                {
+                    "thought_summary": "Inspect the current model context.",
+                    "action": "debug_context",
+                    "target": "current",
+                    "args": {"include_content": True},
+                    "expected_observation": "Context snapshot is returned.",
+                    "risk": "low",
+                },
+                state,
+            )
 
-        self.assertEqual(action["action"], "debug_context")
-        self.assertTrue(action["args"]["include_content"])
+    def test_debug_context_action_is_rejected_by_executor(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect context", max_steps=1)
+            loop._ensure_state_files()
+            state = create_initial_state("Inspect context")
+
+            observation = loop._execute_action(
+                {"action": "debug_context", "target": "current", "args": {"include_content": True}},
+                state,
+            )
+
+        self.assertFalse(observation.ok)
+        self.assertIn("disabled", observation.summary)
+        self.assertEqual(observation.data["disabled_action"], "debug_context")
 
     def test_debug_context_snapshot_is_written_and_trace_references_it(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -452,6 +821,8 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(observation.ok)
         self.assertIn("# Full Model Context", snapshot_content)
         self.assertIn("## System Message", observation.data["content"])
+        self.assertLess(snapshot_content.index("## System Message"), snapshot_content.index("- trace:"))
+        self.assertLess(snapshot_content.index("- written_at:"), snapshot_content.index("## User Context"))
         self.assertEqual(trace_events[0]["context_ref"]["path"], snapshot["path"])
         self.assertEqual(trace_events[0]["tool_return"], trace_events[0]["observation"])
 
@@ -503,6 +874,37 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertTrue((root / "state" / "benchmarks" / "todo_counter" / "project_spec.md").exists())
             self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "runtime_tasks.json").exists())
 
+    def test_project_spec_path_can_drive_initializer_without_materialized_copy(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "specs" / "user_project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                materialize_project_spec=False,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+
+            state = loop._load_or_create_state()
+            context = loop.context_builder.build(state)
+
+            self.assertEqual(state.task_id, "INIT")
+            self.assertIn("specs/user_project_spec.md", state.acceptance_criteria[0])
+            self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "project_spec.md").exists())
+            self.assertIn("Read specs/user_project_spec.md", context)
+            self.assertIn("do not rewrite or regenerate it", context)
+            self.assertNotIn("state/benchmarks/todo_counter/project_spec.md must exist", context)
+            self.assertNotIn("state/benchmarks/todo_counter/project_spec.md", loop._initializer_allowed_targets(state))
+
     def test_initializer_update_plan_does_not_complete_init(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -533,6 +935,26 @@ class HarnessBehaviorTests(unittest.TestCase):
             spec.write_text("# Todo Counter\n", encoding="utf-8")
             generated = root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json"
             generated.parent.mkdir(parents=True)
+            requirement = {
+                "id": "REQ-SKELETON",
+                "source": "project_spec.md:1",
+                "text": "The todo counter skeleton exists in the workspace.",
+                "type": "artifact",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify the skeleton artifact exists in the workspace.",
+                    "assertion_targets": ["workspace README.md exists"],
+                    "forbidden_weak_assertions": ["do not only check Python imports"],
+                },
+            }
+            command = (
+                "python -c \"import pathlib; "
+                "assert pathlib.Path('eval/benchmarks/todo_counter/workspace/README.md').is_file()\""
+            )
+            (generated.parent / "requirements.json").write_text(
+                json.dumps({"requirements": [requirement]}),
+                encoding="utf-8",
+            )
             generated.write_text(
                 json.dumps(
                     {
@@ -543,18 +965,33 @@ class HarnessBehaviorTests(unittest.TestCase):
                                 "status": "pending",
                                 "priority": 1,
                                 "depends_on": [],
+                                "requirement_ids": ["REQ-SKELETON"],
+                                "requirements": [requirement],
                                 "acceptance_criteria": ["Skeleton exists."],
-                                "criterion_command_map": {
-                                    "Skeleton exists.": [
-                                        "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/README.md').is_file()\""
-                                    ]
-                                },
+                                "criterion_command_map": {"Skeleton exists.": [command]},
                                 "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/README.md"],
                                 "implementation_artifacts": [
                                     "eval/benchmarks/todo_counter/workspace/README.md"
                                 ],
+                                "verification_assets": [
+                                    {
+                                        "id": "VA-SKELETON",
+                                        "path": "eval/benchmarks/todo_counter/workspace/README.md",
+                                        "runner": "python",
+                                        "covers": ["REQ-SKELETON"],
+                                        "assertion_targets": {
+                                            "REQ-SKELETON": ["workspace README.md exists"]
+                                        },
+                                        "repair_policy": "infra_only",
+                                    }
+                                ],
                                 "verification_commands": [
-                                    "python -c \"import pathlib; assert pathlib.Path('eval/benchmarks/todo_counter/workspace/README.md').is_file()\""
+                                    {
+                                        "id": "VC-SKELETON",
+                                        "command": command,
+                                        "covers": ["REQ-SKELETON"],
+                                        "asset_ids": ["VA-SKELETON"],
+                                    }
                                 ],
                             }
                         ]
@@ -648,6 +1085,30 @@ class HarnessBehaviorTests(unittest.TestCase):
             loop._ensure_state_files()
             loop._prepare_runtime_task_graph()
             state = loop._load_or_create_state()
+            requirement = {
+                "id": "REQ-COUNTER",
+                "source": "project_spec.md:1",
+                "text": "The counter behavior is implemented and verified.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify the counter behavior with a unit test.",
+                    "assertion_targets": ["counter returns the expected result for representative input"],
+                    "forbidden_weak_assertions": ["do not only import the module"],
+                },
+            }
+            command = "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+            requirements_observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/requirements.json",
+                    "args": {
+                        "mode": "overwrite",
+                        "content": json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                    },
+                },
+                state,
+            )
             graph = {
                 "tasks": [
                     {
@@ -656,20 +1117,41 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "priority": 1,
                         "depends_on": [],
                         "status": "pending",
+                        "requirement_ids": ["REQ-COUNTER"],
+                        "requirements": [requirement],
                         "acceptance_criteria": ["Counter works."],
-                        "criterion_command_map": {
-                            "Counter works.": [
-                                "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
-                            ]
-                        },
+                        "criterion_command_map": {"Counter works.": [command]},
                         "expected_artifacts": [
-                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py",
+                            "eval/benchmarks/todo_counter/workspace/tests/test_counter.py",
                         ],
                         "implementation_artifacts": [
                             "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
                         ],
+                        "worker_test_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/tests/test_counter.py"
+                        ],
+                        "verification_assets": [
+                            {
+                                "id": "VA-COUNTER",
+                                "path": "eval/benchmarks/todo_counter/workspace/tests/test_counter.py",
+                                "runner": "unittest",
+                                "covers": ["REQ-COUNTER"],
+                                "assertion_targets": {
+                                    "REQ-COUNTER": [
+                                        "counter returns the expected result for representative input"
+                                    ]
+                                },
+                                "repair_policy": "infra_only",
+                            }
+                        ],
                         "verification_commands": [
-                            "python -m unittest discover -s eval/benchmarks/todo_counter/workspace/tests"
+                            {
+                                "id": "VC-COUNTER",
+                                "command": command,
+                                "covers": ["REQ-COUNTER"],
+                                "asset_ids": ["VA-COUNTER"],
+                            }
                         ],
                     }
                 ]
@@ -685,8 +1167,52 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             generated_exists = (root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json").exists()
 
+        self.assertTrue(requirements_observation.ok)
         self.assertTrue(observation.ok)
         self.assertTrue(generated_exists)
+
+    def test_initializer_rejects_single_line_requirements_json(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace/`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = loop._load_or_create_state()
+            requirement = {
+                "id": "REQ-COUNTER",
+                "source": "project_spec.md:1",
+                "text": "The counter behavior is implemented and verified.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify the counter behavior with a unit test.",
+                    "assertion_targets": ["counter returns the expected result for representative input"],
+                },
+            }
+
+            observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/requirements.json",
+                    "args": {"mode": "overwrite", "content": json.dumps({"requirements": [requirement]})},
+                },
+                state,
+            )
+
+        self.assertFalse(observation.ok)
+        self.assertIn("single-line JSON is not allowed", " ".join(observation.data["initializer_validation_errors"]))
 
     def test_initializer_rejects_application_code_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -738,6 +1264,29 @@ class HarnessBehaviorTests(unittest.TestCase):
             loop._ensure_state_files()
             loop._prepare_runtime_task_graph()
             state = loop._load_or_create_state()
+            requirement = {
+                "id": "REQ-COUNTER",
+                "source": "project_spec.md:1",
+                "text": "The counter behavior is implemented and verified.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify the counter behavior with a unit test.",
+                    "assertion_targets": ["counter returns the expected result for representative input"],
+                    "forbidden_weak_assertions": ["do not only import the module"],
+                },
+            }
+            requirements_observation = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": "state/benchmarks/todo_counter/requirements.json",
+                    "args": {
+                        "mode": "overwrite",
+                        "content": json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                    },
+                },
+                state,
+            )
             graph = {
                 "tasks": [
                     {
@@ -746,9 +1295,31 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "priority": 1,
                         "depends_on": [],
                         "status": "pending",
+                        "requirement_ids": ["REQ-COUNTER"],
+                        "requirements": [requirement],
                         "acceptance_criteria": ["Counter works."],
+                        "criterion_command_map": {
+                            "Counter works.": ["python -c \"assert True\""]
+                        },
                         "expected_artifacts": [
                             "state/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "state/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "verification_assets": [
+                            {
+                                "id": "VA-COUNTER",
+                                "path": "state/benchmarks/todo_counter/workspace/tests/test_counter.py",
+                                "runner": "python",
+                                "covers": ["REQ-COUNTER"],
+                                "assertion_targets": {
+                                    "REQ-COUNTER": [
+                                        "counter returns the expected result for representative input"
+                                    ]
+                                },
+                                "repair_policy": "infra_only",
+                            }
                         ],
                         "verification_commands": ["python -c \"assert True\""],
                     }
@@ -765,6 +1336,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             generated_exists = (root / "state" / "benchmarks" / "todo_counter" / "generated_tasks.json").exists()
 
+        self.assertTrue(requirements_observation.ok)
         self.assertFalse(observation.ok)
         self.assertIn("initializer_validation_errors", observation.data)
         self.assertIn("eval/benchmarks/todo_counter/workspace", " ".join(observation.data["initializer_validation_errors"]))
@@ -965,19 +1537,64 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("alpha.txt", result.data["content"])
 
-    def test_read_default_window_is_50_lines(self) -> None:
+    def test_read_default_window_is_500_lines(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "large.txt").write_text("\n".join(f"line {index}" for index in range(1, 81)), encoding="utf-8")
+            (root / "large.txt").write_text("\n".join(f"line {index}" for index in range(1, 581)), encoding="utf-8")
 
             result = ReadTool(root).run({"action": "read", "target": "large.txt", "args": {}})
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["start"], 1)
-        self.assertEqual(result.data["end"], 50)
+        self.assertEqual(result.data["end"], 500)
         self.assertTrue(result.data["has_more"])
-        self.assertEqual(result.data["next_read"]["args"], {"start": 51, "end": 100})
-        self.assertIn("Read 50 line(s)", result.summary)
+        self.assertEqual(result.data["next_read"]["args"], {"start": 501, "end": 1000})
+        self.assertIn("Read 500 line(s)", result.summary)
+
+    def test_read_caps_explicit_range_at_500_lines(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "large.txt").write_text("\n".join(f"line {index}" for index in range(1, 701)), encoding="utf-8")
+
+            result = ReadTool(root).run({"action": "read", "target": "large.txt", "args": {"start": 25, "end": 700}})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["start"], 25)
+        self.assertEqual(result.data["end"], 524)
+        self.assertEqual(len(result.data["content"].splitlines()), 500)
+
+    def test_read_reports_actual_end_for_short_file(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "single_line.json").write_text('{"tasks":[]}', encoding="utf-8")
+
+            result = ReadTool(root).run({"action": "read", "target": "single_line.json", "args": {}})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["start"], 1)
+        self.assertEqual(result.data["end"], 1)
+        self.assertEqual(result.data["line_count"], 1)
+        self.assertFalse(result.data["has_more"])
+        self.assertNotIn("lines 1-500", result.summary)
+        self.assertIn("lines 1-1", result.summary)
+
+    def test_read_past_end_reports_file_line_count(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "single_line.json").write_text('{"tasks":[]}', encoding="utf-8")
+
+            result = ReadTool(root).run(
+                {"action": "read", "target": "single_line.json", "args": {"start": 500, "end": 1000}}
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["start"], 500)
+        self.assertIsNone(result.data["end"])
+        self.assertEqual(result.data["line_count"], 1)
+        self.assertEqual(result.data["requested_end"], 1000)
+        self.assertFalse(result.data["has_more"])
+        self.assertEqual(result.data["content"], "")
+        self.assertIn("starting at line 500; file has 1 line(s)", result.summary)
 
     def test_read_query_returns_matching_code_instead_of_file_head(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2226,6 +2843,71 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual([task["id"] for task in data["tasks"]], ["T1"])
         self.assertEqual(state.task_id, "T1")
 
+    def test_finish_rejects_completed_tasks_without_must_requirement_evidence(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "input_tasks.json"
+            requirement = {
+                "id": "REQ-CLI",
+                "source": "task.md:1",
+                "text": "CLI works.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify CLI behavior.",
+                    "assertion_targets": ["CLI returns the expected output"],
+                },
+            }
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implement CLI",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "completed",
+                                "requirement_ids": ["REQ-CLI"],
+                                "requirements": [requirement],
+                                "acceptance_criteria": ["CLI works."],
+                                "criterion_command_map": {"CLI works.": ["python -c \"assert True\""]},
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "verification_commands": ["python -c \"assert True\""],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark project",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+            )
+            loop._ensure_state_files()
+            loop.requirements_path.write_text(
+                json.dumps({"requirements": [requirement]}),
+                encoding="utf-8",
+            )
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Implement CLI", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+
+        self.assertFalse(result.ok)
+        self.assertIn("must requirements do not have verified evidence", result.summary)
+        self.assertIn("REQ-CLI", " ".join(result.data["requirement_evidence_errors"]))
+
     def test_generated_task_graph_rejects_unknown_contract_task_id(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2699,6 +3381,51 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(hard_memory_exists)
         self.assertFalse(soft_memory_exists)
 
+    def test_save_memory_rejects_semantically_similar_memory(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Remember preference", max_steps=1)
+            loop._ensure_state_files()
+            state = create_initial_state("Remember preference")
+
+            first = loop._execute_action(
+                {
+                    "action": "save_memory",
+                    "target": "real-db-integration-tests",
+                    "args": {
+                        "name": "real-db-integration-tests",
+                        "description": "Integration tests must use a real database",
+                        "type": "feedback",
+                        "content": "Integration tests must use a real database, not mocks.",
+                        "why": "Mock-backed tests passed while production migrations failed.",
+                        "how_to_apply": "Connect integration tests to the real test database.",
+                    },
+                },
+                state,
+            )
+            semantic_duplicate = loop._execute_action(
+                {
+                    "action": "save_memory",
+                    "target": "actual-db-tests",
+                    "args": {
+                        "name": "actual-db-tests",
+                        "description": "Integration tests should exercise the actual database",
+                        "type": "feedback",
+                        "content": "Run integration tests against the real database instead of mocked storage.",
+                        "why": "Mock tests can miss migration failures.",
+                        "how_to_apply": "Point integration test setup at the real test database.",
+                    },
+                },
+                state,
+            )
+            duplicate_file_exists = (root / "state" / "memories" / "actual-db-tests.md").exists()
+
+        self.assertTrue(first.ok)
+        self.assertFalse(semantic_duplicate.ok)
+        self.assertIn("semantically similar", semantic_duplicate.summary)
+        self.assertEqual(semantic_duplicate.data["duplicate"]["name"], "real-db-integration-tests")
+        self.assertFalse(duplicate_file_exists)
+
     def test_save_memory_rejects_invalid_type_feedback_without_why_and_project_relative_dates(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3124,6 +3851,63 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(payload["session_budget"]["handoff_ready"])
         self.assertEqual([item["task_id"] for item in payload["acceptance_contracts"]], ["T2"])
 
+    def test_initializer_handoff_includes_artifact_status(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            benchmark_dir = root / "state" / "benchmarks" / "sample"
+            benchmark_dir.mkdir(parents=True)
+            (benchmark_dir / "traces").mkdir()
+            project_spec = root / "eval" / "benchmarks" / "sample" / "task.md"
+            project_spec.parent.mkdir(parents=True)
+            project_spec.write_text("# Spec\n", encoding="utf-8")
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark INIT",
+                max_steps=1,
+                benchmark_id="sample",
+                project_spec_path=project_spec,
+            )
+            state = create_initializer_state(
+                "Benchmark INIT",
+                project_spec_artifact="eval/benchmarks/sample/task.md",
+                requirements_artifact="state/benchmarks/sample/requirements.json",
+                generated_tasks_artifact="state/benchmarks/sample/generated_tasks.json",
+                init_artifact="state/benchmarks/sample/init.sh",
+            )
+            state.handoff_ready = True
+            state.session_used_tokens = 80000
+            (benchmark_dir / "requirements.json").write_text(
+                json.dumps(
+                    {
+                        "requirements": [
+                            {
+                                "id": "REQ-1",
+                                "priority": "must",
+                                "type": "service_logic",
+                                "frozen_acceptance": {"assertion_targets": ["observable behavior"]},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loop._write_handoff(state)
+            handoff = (benchmark_dir / "handoff.md").read_text(encoding="utf-8")
+            payload = json.loads((benchmark_dir / "handoff_payload.json").read_text(encoding="utf-8"))
+
+        self.assertIn("### Artifact Status", handoff)
+        self.assertIn("state/benchmarks/sample/requirements.json: present", handoff)
+        self.assertIn("state/benchmarks/sample/generated_tasks.json: missing_or_empty", handoff)
+        self.assertIn("state/benchmarks/sample/init.sh: missing_or_empty", handoff)
+        self.assertIn("state/benchmarks/sample/requirements.json", payload["artifact_status"]["present"])
+        self.assertIn("state/benchmarks/sample/generated_tasks.json", payload["artifact_status"]["missing_or_empty"])
+        self.assertIn("### Requirement Summary", handoff)
+        self.assertIn("REQ-1", handoff)
+        self.assertIn("use this list for generated_tasks.json coverage", handoff)
+        self.assertEqual(payload["requirement_summary"]["count"], 1)
+        self.assertEqual(payload["requirement_summary"]["must_requirement_ids"], ["REQ-1"])
+
     def test_handoff_includes_command_only_pending_repair(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3326,15 +4110,14 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state, include_handoff=True)
 
-        self.assertIn("## Critical Context", context)
-        self.assertIn("### Pending Repair", context)
         self.assertIn("## Resume Guidance", context)
         self.assertIn("### Suggested Next Action", context)
         self.assertIn("Resume T9 with a small evidence-backed action.", context)
+        self.assertNotIn("### Pending Repair", context)
         self.assertNotIn("## 10a. Pending Repair", context)
         self.assertNotIn("## 15. Suggested Next Action", context)
 
-    def test_context_builder_omits_working_context_evidence_sources(self) -> None:
+    def test_context_builder_omits_duplicate_working_context_from_handoff_focus(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             state_dir = root / "state"
@@ -3358,8 +4141,9 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             context = ContextBuilder(root).build(state, include_handoff=True)
 
-        self.assertIn("### Active Acceptance Contract", context)
-        self.assertIn("### Active Verification Commands", context)
+        handoff_focus = context.split("## state/handoff.md focus", 1)[1].split("## git log", 1)[0]
+        self.assertNotIn("### Active Acceptance Contract", handoff_focus)
+        self.assertNotIn("### Active Verification Commands", handoff_focus)
         self.assertNotIn("# Evidence Sources", context)
         self.assertNotIn("CURRENT_CONTEXT_EVIDENCE", context)
         self.assertNotIn("OLD_HANDOFF_EVIDENCE", context)
@@ -3645,6 +4429,189 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("tool_return=", context)
         self.assertEqual(context.count("### Tool Observation "), 11)
 
+    def test_context_prunes_old_read_observation_for_same_target_after_step_gap(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_dir = root / "state" / "traces"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "run_20260714_000000.jsonl"
+            events = [
+                {
+                    "step": 1,
+                    "action": {"action": "read", "target": "src/app.py", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read old app.",
+                        "data": {"start": 1, "end": 20, "content": "OLD_APP_CONTENT"},
+                    },
+                },
+                {
+                    "step": 2,
+                    "action": {"action": "read", "target": "tests/test_app.py", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read tests.",
+                        "data": {"start": 1, "end": 20, "content": "TEST_CONTENT"},
+                    },
+                },
+                {
+                    "step": 7,
+                    "action": {"action": "read", "target": "src/app.py", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read current app.",
+                        "data": {"start": 1, "end": 20, "content": "NEW_APP_CONTENT"},
+                    },
+                },
+            ]
+            trace.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+            state = create_initial_state("Refresh implementation context")
+            builder = ContextBuilder(root)
+            builder.current_trace_path = trace
+
+            context = builder.build(state)
+
+        self.assertNotIn("OLD_APP_CONTENT", context)
+        self.assertIn("TEST_CONTENT", context)
+        self.assertIn("NEW_APP_CONTENT", context)
+        self.assertEqual(context.count("### Tool Observation "), 2)
+
+    def test_context_prunes_repeated_read_observations_older_than_current_step_gap(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_dir = root / "state" / "traces"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "run_20260714_000000.jsonl"
+            events = [
+                {
+                    "step": 17,
+                    "action": {"action": "read", "target": "state/requirements.json", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read stale requirements.",
+                        "data": {"start": 1, "end": 500, "content": "STALE_REQUIREMENTS_CONTENT"},
+                    },
+                },
+                {
+                    "step": 21,
+                    "action": {"action": "read", "target": "state/requirements.json", "args": {"start": 200, "end": 380}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read newer but still stale requirements.",
+                        "data": {"start": 200, "end": 380, "content": "NEWER_STALE_REQUIREMENTS_CONTENT"},
+                    },
+                },
+                {
+                    "step": 22,
+                    "action": {"action": "write", "target": "state/requirements.json", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Wrote requirements.",
+                        "data": {"target": "state/requirements.json"},
+                    },
+                },
+                {
+                    "step": 27,
+                    "action": {"action": "search", "target": "REQ-CONFLICT-MANUAL", "args": {}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Found 50 match(es).",
+                        "data": {"matches": [{"path": "state/requirements.json", "line": 372, "text": "REQ-CONFLICT-MANUAL"}]},
+                    },
+                },
+            ]
+            trace.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+            state = create_initial_state("Refresh stale repeated read context")
+            builder = ContextBuilder(root)
+            builder.current_trace_path = trace
+
+            context = builder.build(state)
+
+        self.assertNotIn("STALE_REQUIREMENTS_CONTENT", context)
+        self.assertNotIn("NEWER_STALE_REQUIREMENTS_CONTENT", context)
+        self.assertIn("Wrote requirements.", context)
+        self.assertIn("Found 50 match(es).", context)
+        self.assertEqual(context.count("### Tool Observation "), 2)
+
+    def test_context_includes_requirement_matrix_summary_for_initializer_task_generation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            (state_dir / "requirements.json").write_text(
+                json.dumps(
+                    {
+                        "requirements": [
+                            {
+                                "id": "REQ-EMP-ADD",
+                                "priority": "must",
+                                "type": "gui_workflow",
+                                "frozen_acceptance": {"assertion_targets": ["employee count increases", "fields match"]},
+                            },
+                            {
+                                "id": "REQ-PROJ-FILTER",
+                                "priority": "should",
+                                "type": "gui_workflow",
+                                "frozen_acceptance": {"assertion_targets": ["filters by status", "sorts by priority"]},
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = create_initializer_state(
+                "Benchmark INIT",
+                project_spec_artifact="eval/benchmarks/sample/task.md",
+                requirements_artifact="state/benchmarks/sample/requirements.json",
+                generated_tasks_artifact="state/benchmarks/sample/generated_tasks.json",
+                init_artifact="state/benchmarks/sample/init.sh",
+            )
+
+            context = ContextBuilder(root, state_dir=state_dir).build(state)
+
+        self.assertIn("# Requirement Matrix Summary", context)
+        self.assertIn("do not search/read requirements.json just to recover ids", context)
+        self.assertIn("REQ-EMP-ADD | priority=must | type=gui_workflow | assertion_targets=2", context)
+        self.assertIn("REQ-PROJ-FILTER | priority=should | type=gui_workflow | assertion_targets=2", context)
+        self.assertIn("must_requirement_ids: REQ-EMP-ADD", context)
+
+    def test_context_keeps_nearby_repeated_read_observations_for_pagination(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_dir = root / "state" / "traces"
+            trace_dir.mkdir(parents=True)
+            trace = trace_dir / "run_20260714_000000.jsonl"
+            events = [
+                {
+                    "step": 1,
+                    "action": {"action": "read", "target": "src/app.py", "args": {"start": 1, "end": 500}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read first page.",
+                        "data": {"start": 1, "end": 500, "content": "FIRST_PAGE_CONTENT", "has_more": True},
+                    },
+                },
+                {
+                    "step": 2,
+                    "action": {"action": "read", "target": "src/app.py", "args": {"start": 501, "end": 1000}},
+                    "observation": {
+                        "ok": True,
+                        "summary": "Read second page.",
+                        "data": {"start": 501, "end": 900, "content": "SECOND_PAGE_CONTENT", "has_more": False},
+                    },
+                },
+            ]
+            trace.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+            state = create_initial_state("Read paginated file")
+            builder = ContextBuilder(root)
+            builder.current_trace_path = trace
+
+            context = builder.build(state)
+
+        self.assertIn("FIRST_PAGE_CONTENT", context)
+        self.assertIn("SECOND_PAGE_CONTENT", context)
+        self.assertEqual(context.count("### Tool Observation "), 2)
+
     def test_context_builder_preserves_last_action_when_reference_context_is_large(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3906,6 +4873,100 @@ class HarnessBehaviorTests(unittest.TestCase):
             any(item.get("evidence_type") == "verification_command_passed" for item in state.evidence_sources)
         )
         self.assertNotIn("has_evidence", result.data["checks"])
+
+    def test_verifier_writes_requirement_evidence_for_frozen_acceptance_closeout(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir(parents=True)
+            (workspace / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (tests_dir / "test_feature.py").write_text(
+                "import unittest\n"
+                "from feature import VALUE\n\n"
+                "class FeatureTests(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(VALUE, 2)\n",
+                encoding="utf-8",
+            )
+            criterion = "Feature value is verified."
+            target = "feature value equals 2"
+            command = "python -m unittest discover -s eval/benchmarks/sample/workspace/tests"
+            requirement = {
+                "id": "REQ-FEATURE",
+                "source": "task.md:1",
+                "text": "Feature value equals 2.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify feature value.",
+                    "assertion_targets": [target],
+                },
+            }
+            state = create_initial_state("Benchmark feature")
+            state.task_id = "T1"
+            state.acceptance_criteria = [criterion]
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Feature",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "requirement_ids": ["REQ-FEATURE"],
+                    "requirements": [requirement],
+                    "acceptance_criteria": [criterion],
+                    "criterion_command_map": {criterion: [command]},
+                    "expected_artifacts": [
+                        "eval/benchmarks/sample/workspace/feature.py",
+                        "eval/benchmarks/sample/workspace/tests/test_feature.py",
+                    ],
+                    "verification_assets": [
+                        {
+                            "id": "VA-FEATURE",
+                            "path": "eval/benchmarks/sample/workspace/tests/test_feature.py",
+                            "runner": "unittest",
+                            "covers": ["REQ-FEATURE"],
+                            "assertion_targets": {"REQ-FEATURE": [target]},
+                            "repair_policy": "infra_only",
+                        }
+                    ],
+                    "verification_commands": [
+                        {
+                            "id": "VC-FEATURE",
+                            "command": command,
+                            "covers": ["REQ-FEATURE"],
+                            "asset_ids": ["VA-FEATURE"],
+                        }
+                    ],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Feature",
+                    "scope": state.nodes[0]["expected_artifacts"],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {"command": command},
+                    "checks": [command],
+                    "criterion_command_map": {criterion: [command]},
+                    "required_evidence": [criterion],
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+            evidence = json.loads((state_dir / "task_evidence" / "T1.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["checks"]["requirement_closeout"])
+        self.assertEqual(evidence["requirements"][0]["id"], "REQ-FEATURE")
+        self.assertEqual(evidence["requirements"][0]["status"], "verified")
+        self.assertEqual(evidence["requirements"][0]["evidence"][0]["assertion_targets"], [target])
 
     def test_verifier_preserves_full_command_output(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

@@ -10,6 +10,10 @@ from typing import Any
 
 from agent.output_capture import capture_command_output
 from agent.planner import TaskState, verification_command_portability_error
+from agent.requirement_verifier import (
+    validate_task_requirement_closeout,
+    write_task_requirement_evidence,
+)
 from agent.tools import ToolResult
 
 
@@ -46,6 +50,21 @@ class Verifier:
         if procedures or active_node.get("contract_managed") or state.task_id == "INIT":
             checks.append(("verification_commands", verification_ok and bool(procedures)))
         self._record_verification_evidence(state, command_results)
+        requirement_evidence = write_task_requirement_evidence(
+            root=self.root,
+            state_dir=self.state_dir,
+            task=active_node,
+            command_results=command_results,
+        )
+        closeout_errors: list[str] = []
+        if state.task_id != "INIT" and active_node.get("requirement_ids"):
+            closeout_errors = validate_task_requirement_closeout(
+                root=self.root,
+                task=active_node,
+                evidence=requirement_evidence,
+                command_results=command_results,
+            )
+            checks.append(("requirement_closeout", not closeout_errors))
         compile_ok, compile_error = self._compile_agent()
         checks.append(("python_compile", compile_ok))
         tests_ok, tests_output = self._run_tests()
@@ -56,6 +75,12 @@ class Verifier:
             data["contract_validation"] = contract_validation
         if procedures or active_node.get("contract_managed") or state.task_id == "INIT":
             data["verification"] = {"commands": command_results}
+        if requirement_evidence is not None or closeout_errors:
+            data["requirement_closeout"] = {
+                "ok": not closeout_errors,
+                "errors": closeout_errors,
+                "evidence": requirement_evidence,
+            }
         if compile_error:
             data["compile_error"] = compile_error
         if tests_output:
@@ -84,7 +109,17 @@ class Verifier:
     @staticmethod
     def _node_verification_commands(node: dict[str, Any]) -> list[str]:
         commands = node.get("verification_commands", [])
-        return [str(item) for item in commands] if isinstance(commands, list) else []
+        if not isinstance(commands, list):
+            return []
+        normalized: list[str] = []
+        for item in commands:
+            if isinstance(item, dict):
+                command = str(item.get("command", "")).strip()
+            else:
+                command = str(item).strip()
+            if command:
+                normalized.append(command)
+        return normalized
 
     def _contract_verification_procedures(self, contract: dict[str, Any]) -> list[dict[str, Any]]:
         procedure = contract.get("verification_procedure")
@@ -93,9 +128,14 @@ class Verifier:
             commands = procedure.get("commands")
             if isinstance(commands, list):
                 return [
-                    self._normalize_procedure({"command": str(command), "working_directory": working_directory})
+                    self._normalize_procedure(
+                        {
+                            "command": str(command.get("command", "") if isinstance(command, dict) else command),
+                            "working_directory": working_directory,
+                        }
+                    )
                     for command in commands
-                    if str(command).strip()
+                    if str(command.get("command", "") if isinstance(command, dict) else command).strip()
                 ]
             command = str(procedure.get("command", "")).strip()
             if command:
@@ -105,7 +145,11 @@ class Verifier:
     def _procedures_from_commands(self, commands: object) -> list[dict[str, Any]]:
         if not isinstance(commands, list):
             return []
-        return [self._normalize_procedure({"command": str(command)}) for command in commands if str(command).strip()]
+        return [
+            self._normalize_procedure({"command": str(command.get("command", "") if isinstance(command, dict) else command)})
+            for command in commands
+            if str(command.get("command", "") if isinstance(command, dict) else command).strip()
+        ]
 
     def _normalize_procedure(self, procedure: dict[str, Any]) -> dict[str, Any]:
         normalized = {"command": str(procedure.get("command", "")).strip()}

@@ -6,10 +6,10 @@ from agent.tools.base import WorkspaceTool
 
 
 class ReadTool(WorkspaceTool):
-    DEFAULT_RANGE_LINES = 50
+    DEFAULT_RANGE_LINES = 500
     DEFAULT_MATCH_CONTEXT = 20
     DEFAULT_MATCH_LINES = 120
-    MAX_LINES = 400
+    MAX_LINES = 500
 
     def run(self, action: dict[str, Any]):
         from agent.tools import ToolResult
@@ -40,22 +40,29 @@ class ReadTool(WorkspaceTool):
             return self._read_match(target, lines, query, args)
 
         start = max(int(args.get("start", 1)), 1)
-        end = max(int(args.get("end", start + self.DEFAULT_RANGE_LINES - 1)), start)
-        end = min(end, start + self.MAX_LINES - 1)
-        selected = lines[start - 1 : end]
-        has_more = end < len(lines)
+        requested_end = max(int(args.get("end", start + self.DEFAULT_RANGE_LINES - 1)), start)
+        capped_end = min(requested_end, start + self.MAX_LINES - 1)
+        selected = lines[start - 1 : capped_end]
+        actual_end = self._actual_end(start, len(selected), len(lines))
+        has_more = actual_end is not None and actual_end < len(lines)
         data = {
             "target": target,
             "start": start,
-            "end": end,
+            "end": actual_end,
             "content": "\n".join(selected),
             "has_more": has_more,
+            "line_count": len(lines),
         }
+        if capped_end != actual_end:
+            data["requested_end"] = requested_end
         if has_more:
-            data["next_read"] = {"target": target, "args": {"start": end + 1, "end": end + self.DEFAULT_RANGE_LINES}}
+            data["next_read"] = {
+                "target": target,
+                "args": {"start": actual_end + 1, "end": actual_end + self.DEFAULT_RANGE_LINES},
+            }
         return ToolResult(
             True,
-            self._summary("Read", len(selected), target, start, end, has_more),
+            self._summary("Read", len(selected), target, start, actual_end, has_more, len(lines)),
             data,
         )
 
@@ -83,25 +90,29 @@ class ReadTool(WorkspaceTool):
                 )
             start = max(match_line - context, 1)
 
-        end = min(start + max_lines - 1, len(lines))
-        selected = lines[start - 1 : end]
-        has_more = end < len(lines)
+        capped_end = min(start + max_lines - 1, len(lines))
+        selected = lines[start - 1 : capped_end]
+        actual_end = self._actual_end(start, len(selected), len(lines))
+        has_more = actual_end is not None and actual_end < len(lines)
         data: dict[str, Any] = {
             "target": target,
             "query": query,
             "match_line": match_line,
             "start": start,
-            "end": end,
+            "end": actual_end,
             "content": "\n".join(selected),
             "has_more": has_more,
             "truncated": has_more,
+            "line_count": len(lines),
         }
+        if capped_end != actual_end:
+            data["requested_end"] = start + max_lines - 1
         if has_more:
             data["next_read"] = {
                 "target": target,
-                "args": {"query": query, "continue_from": end + 1, "max_lines": max_lines},
+                "args": {"query": query, "continue_from": actual_end + 1, "max_lines": max_lines},
             }
-        summary = self._summary(f"Read match for {query!r}", len(selected), target, start, end, has_more)
+        summary = self._summary(f"Read match for {query!r}", len(selected), target, start, actual_end, has_more, len(lines))
         return ToolResult(True, summary, data)
 
     def _query(self, args: dict[str, Any]) -> str:
@@ -111,8 +122,25 @@ class ReadTool(WorkspaceTool):
                 return value
         return ""
 
-    def _summary(self, prefix: str, count: int, target: str, start: int, end: int, has_more: bool) -> str:
-        summary = f"{prefix} {count} line(s) from {target} lines {start}-{end}."
+    def _actual_end(self, start: int, count: int, line_count: int) -> int | None:
+        if count:
+            return start + count - 1
+        return None
+
+    def _summary(
+        self,
+        prefix: str,
+        count: int,
+        target: str,
+        start: int,
+        end: int | None,
+        has_more: bool,
+        line_count: int,
+    ) -> str:
+        if count:
+            summary = f"{prefix} {count} line(s) from {target} lines {start}-{end}."
+        else:
+            summary = f"{prefix} 0 line(s) from {target} starting at line {start}; file has {line_count} line(s)."
         if has_more:
             summary += (
                 " More lines exist after this window. Continue with data.next_read.args only if the needed "

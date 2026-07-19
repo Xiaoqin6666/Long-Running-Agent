@@ -15,7 +15,6 @@ ALLOWED_ACTIONS = {
     "answer",
     "bash",
     "contract",
-    "debug_context",
     "edit",
     "git",
     "list_files",

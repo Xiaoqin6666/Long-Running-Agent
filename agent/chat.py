@@ -17,7 +17,7 @@ from agent.skills import SkillDocument, parse_skill, render_skill
 
 
 UI_WIDTH = 72
-TOOL_ACTIONS = {"bash", "debug_context", "edit", "git", "list_files", "read", "search", "write"}
+TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /chat      Switch to read-only chat mode; messages can be answered but do not start project work
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work

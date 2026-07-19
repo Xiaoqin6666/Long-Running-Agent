@@ -6,6 +6,9 @@ from typing import Any
 from agent.tools.base import WorkspaceTool
 
 
+MAX_MATCHES = 10
+
+
 class SearchTool(WorkspaceTool):
     def run(self, action: dict[str, Any]):
         from agent.tools import ToolResult
@@ -29,7 +32,7 @@ class SearchTool(WorkspaceTool):
                 for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                     if pattern in line:
                         matches.append({"path": str(path.relative_to(self.root)), "line": idx, "text": line})
-                        if len(matches) >= 50:
+                        if len(matches) >= MAX_MATCHES:
                             raise StopIteration
             except UnicodeDecodeError:
                 continue
