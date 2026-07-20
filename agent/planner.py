@@ -22,6 +22,14 @@ GENERATED_TASK_REQUIRED_FIELDS = {
     "expected_artifacts",
     "verification_commands",
 }
+GENERATED_TASK_LAZY_REQUIRED_FIELDS = {
+    "id",
+    "title",
+    "priority",
+    "depends_on",
+    "status",
+    "expected_artifacts",
+}
 GENERATED_TASK_ARTIFACT_FIELDS = {
     "expected_artifacts",
     "implementation_artifacts",
@@ -175,8 +183,8 @@ def create_initializer_state(
         f"A Requirement Coverage Matrix is generated at {requirements_artifact}.",
         f"A structured task graph is generated at {generated_tasks_artifact}.",
         "The task graph contains a requirements coverage matrix and every must requirement is assigned to one or more tasks.",
-        "The task graph contains executable tasks with ids, dependencies, priorities, statuses, acceptance criteria, expected artifacts, and verification commands.",
-        "The generated task graph passes deterministic schema, dependency, hidden-test, and project workspace-boundary validation.",
+        "The task graph contains executable tasks with ids, dependencies, priorities, statuses, requirement assignments, and owned artifacts.",
+        "The generated task graph passes deterministic schema, dependency, requirement coverage, and project workspace-boundary validation.",
         f"A run-local POSIX shell init script is generated at {init_artifact} with repeatable setup or smoke-test commands.",
     ]
     verification_command = (
@@ -234,6 +242,7 @@ def validate_generated_task_graph(
     standard_library_only: bool = False,
     require_requirement_coverage: bool = False,
     requirements_data: object | None = None,
+    require_verification_plan: bool = True,
 ) -> list[str]:
     """Return deterministic validation errors for an Initializer-produced task graph."""
     if not isinstance(data, dict):
@@ -265,7 +274,12 @@ def validate_generated_task_graph(
         if not isinstance(task, dict):
             errors.append(f"{label} must be an object.")
             continue
-        missing = sorted(GENERATED_TASK_REQUIRED_FIELDS - set(task))
+        required_fields = (
+            GENERATED_TASK_REQUIRED_FIELDS
+            if require_verification_plan
+            else GENERATED_TASK_LAZY_REQUIRED_FIELDS
+        )
+        missing = sorted(required_fields - set(task))
         if missing:
             errors.append(f"{label} is missing required fields: {', '.join(missing)}.")
         task_id = str(task.get("id", "")).strip()
@@ -282,12 +296,15 @@ def validate_generated_task_graph(
             errors.append(f"{label}.priority must be an integer.")
         if task.get("status") != "pending":
             errors.append(f"{label}.status must initially be pending.")
-        for field in ("depends_on", "acceptance_criteria", "expected_artifacts", "verification_commands"):
+        required_list_fields = ["depends_on", "expected_artifacts"]
+        if require_verification_plan:
+            required_list_fields.extend(["acceptance_criteria", "verification_commands"])
+        for field in required_list_fields:
             if not isinstance(task.get(field), list):
                 errors.append(f"{label}.{field} must be a list.")
-        if isinstance(task.get("acceptance_criteria"), list) and not task["acceptance_criteria"]:
+        if require_verification_plan and isinstance(task.get("acceptance_criteria"), list) and not task["acceptance_criteria"]:
             errors.append(f"{label}.acceptance_criteria must not be empty.")
-        if isinstance(task.get("verification_commands"), list) and not task["verification_commands"]:
+        if require_verification_plan and isinstance(task.get("verification_commands"), list) and not task["verification_commands"]:
             errors.append(f"{label}.verification_commands must not be empty.")
         task_requirement_ids = task.get("requirement_ids", [])
         normalized_task_requirement_ids: list[str] = []
@@ -300,29 +317,32 @@ def validate_generated_task_graph(
                 unknown = [item for item in normalized_task_requirement_ids if item not in requirement_ids]
                 if unknown:
                     errors.append(f"{label}.requirement_ids references unknown requirements: " + ", ".join(unknown) + ".")
-                errors.extend(
-                    _task_requirement_snapshot_errors(
-                        task,
-                        label,
-                        normalized_task_requirement_ids,
-                        requirements_by_id,
+                if require_verification_plan:
+                    errors.extend(
+                        _task_requirement_snapshot_errors(
+                            task,
+                            label,
+                            normalized_task_requirement_ids,
+                            requirements_by_id,
+                        )
                     )
-                )
-                errors.extend(
-                    _task_verification_coverage_errors(
-                        task,
-                        label,
-                        normalized_task_requirement_ids,
-                        requirements_by_id,
+                    errors.extend(
+                        _task_verification_coverage_errors(
+                            task,
+                            label,
+                            normalized_task_requirement_ids,
+                            requirements_by_id,
+                        )
                     )
-                )
 
         criteria = task.get("acceptance_criteria", [])
         criterion_command_map = task.get("criterion_command_map")
         commands = task.get("verification_commands", [])
-        if not isinstance(criterion_command_map, dict):
+        if not require_verification_plan and criterion_command_map is None:
+            criterion_command_map = {}
+        if require_verification_plan and not isinstance(criterion_command_map, dict):
             errors.append(f"{label}.criterion_command_map must be an object.")
-        elif isinstance(criteria, list) and isinstance(commands, list):
+        elif require_verification_plan and isinstance(criteria, list) and isinstance(commands, list):
             criterion_texts = [str(item) for item in criteria]
             missing_criteria = [criterion for criterion in criterion_texts if criterion not in criterion_command_map]
             extra_criteria = [str(criterion) for criterion in criterion_command_map if str(criterion) not in criterion_texts]
@@ -402,7 +422,7 @@ def validate_generated_task_graph(
                     )
 
         commands = task.get("verification_commands", [])
-        if isinstance(commands, list):
+        if require_verification_plan and isinstance(commands, list):
             for command in _verification_command_texts(commands):
                 command_text = command.replace("\\", "/")
                 if require_requirement_coverage:
@@ -529,7 +549,8 @@ def _requirement_matrix_errors(requirements: object) -> tuple[
             must_requirement_ids.add(requirement_id)
         requirement_types[requirement_id] = str(requirement.get("type", "")).strip().lower()
         frozen_acceptance = requirement.get("frozen_acceptance")
-        errors.extend(_frozen_acceptance_errors(frozen_acceptance, f"{label}.frozen_acceptance", requirement))
+        if frozen_acceptance is not None:
+            errors.extend(_frozen_acceptance_errors(frozen_acceptance, f"{label}.frozen_acceptance"))
         requirements_by_id[requirement_id] = {
             "id": requirement_id,
             "source": str(requirement.get("source", "")).strip(),
@@ -580,7 +601,6 @@ def _task_requirement_snapshot_errors(
 def _frozen_acceptance_errors(
     frozen_acceptance: object,
     label: str,
-    requirement: dict[str, Any],
 ) -> list[str]:
     errors: list[str] = []
     if not isinstance(frozen_acceptance, dict):
@@ -591,11 +611,6 @@ def _frozen_acceptance_errors(
     targets = frozen_acceptance.get("assertion_targets")
     if not isinstance(targets, list) or not [str(item).strip() for item in targets if str(item).strip()]:
         errors.append(f"{label}.assertion_targets must be a non-empty list.")
-    else:
-        requirement_type = str(requirement.get("type", "")).strip().lower()
-        target_count = len([item for item in targets if str(item).strip()])
-        if _requirement_type_needs_test_asset(requirement_type) and target_count < 2:
-            errors.append(f"{label}.assertion_targets must include at least two observable targets for {requirement_type}.")
     forbidden = frozen_acceptance.get("forbidden_weak_assertions", [])
     if forbidden is not None and not isinstance(forbidden, list):
         errors.append(f"{label}.forbidden_weak_assertions must be a list when present.")
@@ -618,6 +633,7 @@ def _task_verification_coverage_errors(
     asset_ids: set[str] = set()
     asset_covered: set[str] = set()
     asset_coverage_by_id: dict[str, set[str]] = {}
+    asset_path_by_id: dict[str, str] = {}
     for asset_index, asset in enumerate(assets):
         asset_label = f"{label}.verification_assets[{asset_index}]"
         if not isinstance(asset, dict):
@@ -633,6 +649,8 @@ def _task_verification_coverage_errors(
         path = _normalize_artifact_path(asset.get("path", ""))
         if not path:
             errors.append(f"{asset_label}.path must be non-empty.")
+        elif asset_id:
+            asset_path_by_id[asset_id] = path
         runner = str(asset.get("runner", "")).strip().lower()
         if runner not in {"pytest", "unittest", "python"}:
             errors.append(f"{asset_label}.runner must be pytest, unittest, or python.")
@@ -689,7 +707,8 @@ def _task_verification_coverage_errors(
             )
         command_covered.update(covers)
         if any(_requirement_type_needs_test_asset(str(requirements_by_id.get(req_id, {}).get("type", "")).lower()) for req_id in covers):
-            if not _is_test_runner_command(command_text):
+            linked_asset_paths = [asset_path_by_id[asset_id] for asset_id in asset_refs if asset_id in asset_path_by_id]
+            if not _runs_test_evidence_command(command_text, linked_asset_paths):
                 errors.append(f"{command_label}.command must run a test file for GUI/workflow/persistence/report requirements.")
 
     missing_command_coverage = sorted(requirement_id_set - command_covered)
@@ -762,6 +781,31 @@ def _is_test_runner_command(command: str) -> bool:
     return "python -m pytest" in lower or "pytest" in lower or "python -m unittest" in lower or "unittest discover" in lower
 
 
+def _runs_test_evidence_command(command: str, linked_asset_paths: list[str]) -> bool:
+    """Return True when a command clearly executes its linked test evidence.
+
+    Generated INIT plans often use portable `python -c` snippets to configure
+    sys.path before loading a unittest module. Treat those as valid when they
+    reference the linked test asset by path, filename, or module stem.
+    """
+    if _is_test_runner_command(command):
+        return True
+    lower = command.lower().replace("\\", "/")
+    if not any(marker in lower for marker in ("unittest", "pytest", "runpy.run_path", "subprocess.run")):
+        return False
+    for asset_path in linked_asset_paths:
+        normalized = _normalize_artifact_path(asset_path).lower()
+        if not normalized:
+            continue
+        filename = normalized.rsplit("/", 1)[-1]
+        stem = filename[:-3] if filename.endswith(".py") else filename
+        module_path = normalized[:-3].replace("/", ".") if normalized.endswith(".py") else normalized.replace("/", ".")
+        candidates = {normalized, filename, stem, module_path}
+        if any(candidate and candidate in lower for candidate in candidates):
+            return True
+    return False
+
+
 def _weak_verification_command_reason(
     command_text: str,
     task: dict[str, Any],
@@ -793,7 +837,12 @@ def _weak_verification_command_reason(
     )
     if any(pattern in lower for pattern in weak_patterns):
         return "command only checks imports, instantiation, callability, or container type"
-    if "python -m unittest" in lower or "unittest discover" in lower or "pytest" in lower:
+    if (
+        "python -m unittest" in lower
+        or "unittest discover" in lower
+        or "pytest" in lower
+        or ("unittest" in lower and "test_" in lower and "wassuccessful" in lower)
+    ):
         return ""
     if gui_like and not any(marker in lower for marker in ("invoke(", ".invoke", "command", "event_generate", "assert len(", "assert getattr(")):
         return "GUI workflow requirements need a command that exercises a handler or observable state change"

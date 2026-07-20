@@ -11,7 +11,7 @@ from agent.skills import parse_skill, skill_catalog
 
 
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
-READ_OBSERVATION_SUPERSEDE_STEP_GAP = 5
+READ_OBSERVATION_SUPERSEDE_STEP_GAP = 20
 
 
 class ContextBuilder:
@@ -109,6 +109,7 @@ class ContextBuilder:
             "Use action='answer' when enough evidence has been collected for an inspection, explanation, recommendation, or next-step request.",
             "For action='answer', put the final response in args.answer and cite evidence from observations.",
             "Generated-task acceptance contracts freeze semantic frozen_requirements; do not weaken them. If the execution command is wrong, action='contract' may update only verification_procedure for the same frozen_requirements.",
+            "If the generated-task contract is pending a verification_procedure, write worker_test_artifacts first, then submit action='contract' with the command that runs those tests, then write implementation_artifacts.",
             "For ad-hoc tasks without a generated task graph, action='contract' args must include task_id, summary, frozen_requirements, and verification_procedure or checks.",
             "On resume, handoff.md is authoritative operational context. Read its Resume Instructions, Known Risks And Failed Attempts, and Suggested Next Action before choosing an action.",
             "If handoff.md has a Suggested Next Action and it is a low-risk write, read, bash, contract, or verify step, execute that action first. If you do not execute it, thought_summary must name the concrete blocker.",
@@ -240,7 +241,7 @@ class ContextBuilder:
             "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
-            "- edit: exact text replacement; target='<path>'; args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false.",
+            "- edit: exact text replacement or line-range replacement; target='<path>'; use args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false, or use args.start=<line>, args.end=<line>, args.content='<replacement text>'.",
             "- bash: run a needed command from repository root; target='<command>'; args.timeout=30.",
             "- git: status/diff/log/show/branch/add/commit only; target='<git args or git command>'; args.timeout=30.",
             "- verify: ask harness verifier to evaluate current task; target='default'; args={}.",
@@ -916,23 +917,18 @@ class ContextBuilder:
             f"- {self._rel(self.state_dir / 'requirements.json')} must contain a JSON object with a non-empty requirements list.",
             f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list whose tasks reference requirements.json.",
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
-            "First extract a Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance:{intent, assertion_targets, forbidden_weak_assertions?}}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. frozen_acceptance is immutable: Worker may repair test syntax, paths, imports, or platform issues, but must not weaken the requirement intent or assertion_targets.",
+            "First extract a lightweight Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance?}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. Do not invent detailed test files, verification commands, GUI handler assertions, or exhaustive assertion_targets during INIT; those belong to the selected Worker task.",
             "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
             "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
-            "Each generated task must include both requirement_ids and requirements. requirement_ids is the machine-readable id list; requirements is the exact snapshot of the matching requirement objects from requirements.json, including frozen_acceptance.",
-            "Each generated task should include: id, title, priority, depends_on, status, requirement_ids, requirements, acceptance_criteria, criterion_command_map, expected_artifacts, implementation_artifacts when applicable, worker_test_artifacts when applicable, acceptance_artifacts when applicable, frozen_acceptance_artifacts when applicable, test_policy when tests are involved, verification_assets, and verification_commands.",
-            "verification_assets declares test files or verification files. One asset may cover one or more current-task requirements, but all current-task requirement_ids must be covered. For each covered requirement, assertion_targets must include the frozen_acceptance assertion_targets for that requirement. repair_policy must be infra_only.",
-            "verification_commands may also cover one or more current-task requirements, but all current-task requirement_ids must be covered by commands. Prefer structured command objects {id, command, covers, asset_ids}; asset_ids must point to verification_assets that cover the same requirements.",
-            "criterion_command_map must map every exact acceptance criterion string to one or more exact command strings from verification_commands, and every command string must be mapped.",
-            "Verification commands run from the repository root and must be direct, portable Python commands without Unix-only shell setup. Commands that import or invoke project modules under the workspace must explicitly configure sys.path, PYTHONPATH, or subprocess cwd, including nested subprocess calls. Do not mix os.chdir('<workspace>') with subprocess cwd='<workspace>'; for contract repairs prefer verification_procedure.working_directory.",
-            "Verification commands must prove behavior, not just imports or shallow construction. Avoid weak checks such as assert callable(main), assert app is not None, assert isinstance(result, dict), or assert isinstance(conflicts, list). GUI workflow requirements must use test-file evidence that exercises handlers or observable state changes.",
+            "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', requirement_ids, expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
+            "When a generated task is later selected, the harness derives frozen acceptance criteria from requirements.json using frozen_acceptance when present, otherwise acceptance_intent or text. The Worker must write the selected task's worker_test_artifacts first, putting GUI handler and observable state-change assertions in those test files, then use action='contract' to provide the verification_procedure that runs those tests. Only after that may the Worker write implementation_artifacts.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal requirements.json example:",
-            '{\n  "requirements": [\n    {\n      "id": "REQ-FEATURE-BEHAVIOR",\n      "source": "task.md:1",\n      "text": "The feature produces the requested observable behavior.",\n      "type": "service_logic",\n      "priority": "must",\n      "acceptance_intent": "A user-visible or test-visible output changes as specified.",\n      "frozen_acceptance": {\n        "intent": "Verify the feature changes observable output as specified.",\n        "assertion_targets": [\n          "given representative input, output equals the requested value"\n        ],\n        "forbidden_weak_assertions": [\n          "do not only import the module",\n          "do not only check callable"\n        ]\n      }\n    }\n  ]\n}',
+            '{\n  "requirements": [\n    {\n      "id": "REQ-FEATURE-BEHAVIOR",\n      "source": "task.md:1",\n      "text": "The feature produces the requested observable behavior.",\n      "type": "service_logic",\n      "priority": "must",\n      "acceptance_intent": "A user-visible or test-visible output changes as specified."\n    }\n  ]\n}',
             "Minimal generated_tasks.json task example:",
-            '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","requirement_ids":["REQ-FEATURE-BEHAVIOR"],"requirements":[{"id":"REQ-FEATURE-BEHAVIOR","source":"task.md:1","text":"The feature produces the requested observable behavior.","type":"service_logic","priority":"must","acceptance_intent":"A user-visible or test-visible output changes as specified.","frozen_acceptance":{"intent":"Verify the feature changes observable output as specified.","assertion_targets":["given representative input, output equals the requested value"],"forbidden_weak_assertions":["do not only import the module","do not only check callable"]}}],"acceptance_criteria":["Behavior is verified with observable output."],"criterion_command_map":{"Behavior is verified with observable output.":["python -m unittest discover -s <workspace>/tests"]},"expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"acceptance_tests_mutable_by_worker":true,"acceptance_test_repair_requires_verifier_approval":true},"verification_assets":[{"id":"VA-FEATURE-BEHAVIOR","path":"<workspace>/tests/test_feature.py","runner":"unittest","covers":["REQ-FEATURE-BEHAVIOR"],"assertion_targets":{"REQ-FEATURE-BEHAVIOR":["given representative input, output equals the requested value"]},"repair_policy":"infra_only"}],"verification_commands":[{"id":"VC-FEATURE-BEHAVIOR","command":"python -m unittest discover -s <workspace>/tests","covers":["REQ-FEATURE-BEHAVIOR"],"asset_ids":["VA-FEATURE-BEHAVIOR"]}]}]}',
+            '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","requirement_ids":["REQ-FEATURE-BEHAVIOR"],"expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_by_worker":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true}}]}',
             "Implementation tasks must declare non-empty implementation_artifacts, and every owned implementation/test/acceptance artifact must also appear in expected_artifacts.",
-            "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation). Verification commands must be substantive and must not be placeholders such as bare echo, TODO, or 'not implemented'.",
+            "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation).",
             "INIT does not require an acceptance contract.",
             "During INIT, write or edit only the writable initializer outputs listed above. Do not create application code, tests, skeleton files, workspace files, or a regenerated project spec.",
             "The repository-root init.sh belongs to the Long-Running Agent harness and must not be modified by a benchmark INIT.",
@@ -976,6 +972,24 @@ class ContextBuilder:
                 f"Repair the saved INIT candidate at '{candidate}' instead of regenerating the task graph. "
                 "Use read once if its exact content is needed, then use edit or write on that candidate. "
                 f"Validation errors: {error_text[:1200]}"
+            )
+        pending_contract = self._pending_generated_task_contract(state)
+        if pending_contract:
+            missing_tests = [
+                artifact
+                for artifact in self._active_task_worker_test_artifacts(state)
+                if not (self.root / artifact).exists()
+            ]
+            if missing_tests:
+                return (
+                    "The generated-task contract is waiting for a verification_procedure. "
+                    f"Next action must be write target='{missing_tests[0]}' with worker test content that covers the frozen requirements. "
+                    "Write worker_test_artifacts before implementation_artifacts."
+                )
+            return (
+                "The generated-task contract is waiting for a verification_procedure. "
+                "Next action must be contract with the same frozen_requirements and a portable command that runs the worker tests. "
+                "Do not write implementation_artifacts until this contract is agreed."
             )
         target = self._incomplete_expected_code_artifact(state)
         if target:
@@ -1233,6 +1247,18 @@ class ContextBuilder:
             for artifact in self._format_artifacts(node.get("expected_artifacts", []))
             if self._looks_like_test_artifact(artifact)
         ]
+
+    def _pending_generated_task_contract(self, state: TaskState) -> dict[str, object] | None:
+        active = self._active_task_id(state)
+        matches = [
+            contract
+            for contract in state.acceptance_contracts
+            if isinstance(contract, dict)
+            and contract.get("task_id") in {active, "current"}
+            and contract.get("source") == "task_graph"
+            and contract.get("status") == "pending_verification_procedure"
+        ]
+        return matches[-1] if matches else None
 
     def _active_task_acceptance_artifacts(self, state: TaskState) -> list[str]:
         if self._active_task_has_key(state, "acceptance_artifacts"):

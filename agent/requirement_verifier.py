@@ -29,6 +29,7 @@ def write_task_requirement_evidence(
     state_dir: Path,
     task: dict[str, Any],
     command_results: list[dict[str, Any]],
+    contract: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     task_id = str(task.get("id", "")).strip()
     requirement_ids = _normalized_list(task.get("requirement_ids"))
@@ -39,6 +40,11 @@ def write_task_requirement_evidence(
         return None
     assets = _verification_assets(task)
     commands = _verification_command_records(task.get("verification_commands", []))
+    contract_entries = _contract_evidence_entries_by_requirement(
+        task=task,
+        contract=contract,
+        passed_commands=passed_commands,
+    )
     requirements: list[dict[str, Any]] = []
     for requirement_id in requirement_ids:
         entries: list[dict[str, Any]] = []
@@ -65,6 +71,13 @@ def write_task_requirement_evidence(
                     "assertion_targets": assertion_targets,
                 }
             )
+        for entry in contract_entries.get(requirement_id, []):
+            if not any(
+                existing.get("command") == entry.get("command")
+                and existing.get("assertion_targets") == entry.get("assertion_targets")
+                for existing in entries
+            ):
+                entries.append(entry)
         requirements.append(
             {
                 "id": requirement_id,
@@ -244,6 +257,80 @@ def _assertion_targets_for_requirement(assets: list[dict[str, Any]], requirement
             if text and text not in targets:
                 targets.append(text)
     return targets
+
+
+def _contract_evidence_entries_by_requirement(
+    *,
+    task: dict[str, Any],
+    contract: dict[str, Any] | None,
+    passed_commands: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(contract, dict):
+        return {}
+    mapping = contract.get("criterion_command_map")
+    if not isinstance(mapping, dict):
+        return {}
+    requirement_ids = _normalized_list(task.get("requirement_ids"))
+    frozen_targets = _frozen_targets_by_requirement(task)
+    test_files = _normalized_list(task.get("worker_test_artifacts"))
+    if not test_files:
+        test_files = [
+            artifact
+            for artifact in _normalized_list(task.get("expected_artifacts"))
+            if "/tests/" in artifact.replace("\\", "/") or Path(artifact.replace("\\", "/")).name.startswith("test_")
+        ]
+    entries_by_requirement: dict[str, list[dict[str, Any]]] = {requirement_id: [] for requirement_id in requirement_ids}
+    for criterion, raw_commands in mapping.items():
+        commands = _normalized_list(raw_commands)
+        matched_requirement_ids = _requirement_ids_for_criterion(str(criterion), requirement_ids, frozen_targets)
+        for command in commands:
+            if command not in passed_commands:
+                continue
+            for requirement_id in matched_requirement_ids:
+                targets = _assertion_targets_for_criterion(str(criterion), requirement_id, frozen_targets)
+                entries_by_requirement.setdefault(requirement_id, []).append(
+                    {
+                        "type": "automated_test",
+                        "command": command,
+                        "test_files": test_files,
+                        "result": "passed",
+                        "assertion_targets": targets,
+                    }
+                )
+    return entries_by_requirement
+
+
+def _requirement_ids_for_criterion(
+    criterion: str,
+    requirement_ids: list[str],
+    frozen_targets: dict[str, list[str]],
+) -> list[str]:
+    explicit = [requirement_id for requirement_id in requirement_ids if criterion.startswith(requirement_id + ":")]
+    if explicit:
+        return explicit
+    by_target = [
+        requirement_id
+        for requirement_id, targets in frozen_targets.items()
+        if criterion in targets or any(target and target in criterion for target in targets)
+    ]
+    if by_target:
+        return by_target
+    return list(requirement_ids) if len(requirement_ids) == 1 else []
+
+
+def _assertion_targets_for_criterion(
+    criterion: str,
+    requirement_id: str,
+    frozen_targets: dict[str, list[str]],
+) -> list[str]:
+    prefix = requirement_id + ":"
+    if criterion.startswith(prefix):
+        criterion = criterion[len(prefix):].strip()
+    targets = frozen_targets.get(requirement_id, [])
+    if criterion in targets:
+        return [criterion]
+    contained = [target for target in targets if target and target in criterion]
+    return contained or targets
 
 
 def _frozen_targets_by_requirement(task: dict[str, Any]) -> dict[str, list[str]]:

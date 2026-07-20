@@ -18,7 +18,13 @@ from agent.memory_retrieval import (
     truncate_entrypoint_content,
 )
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
-from agent.planner import create_initial_state, create_initializer_state, validate_generated_task_graph, validate_initializer_script
+from agent.planner import (
+    create_initial_state,
+    create_initializer_state,
+    validate_generated_task_graph,
+    validate_initializer_script,
+    validate_requirements_matrix,
+)
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
@@ -123,15 +129,46 @@ class HarnessBehaviorTests(unittest.TestCase):
 
     def test_initializer_prompt_requires_integer_priority_with_complete_example(self) -> None:
         self.assertIn("priority MUST be an integer", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("Keep requirements.json lightweight", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"priority":1', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"requirements"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"requirement_ids"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn('"implementation_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn('"verification_commands"', MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("commands run from the repository root", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('"worker_test_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("verification_procedure", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("write the task's worker_test_artifacts first", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Read narrowly instead of preloading the repository", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("continue read has_more pages", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Avoid Unix-only commands", MAIN_AGENT_SYSTEM_PROMPT)
+
+    def test_initializer_requirements_accept_lightweight_acceptance_intent(self) -> None:
+        errors = validate_requirements_matrix(
+            {
+                "requirements": [
+                    {
+                        "id": "REQ-GUI-FLOW",
+                        "source": "task.md:3.1",
+                        "text": "User can complete the workflow from the GUI.",
+                        "type": "gui_workflow",
+                        "priority": "must",
+                        "acceptance_intent": "The GUI workflow produces an observable state change.",
+                    },
+                    {
+                        "id": "REQ-GUI-SINGLE-TARGET",
+                        "source": "task.md:3.2",
+                        "text": "User can update a value through the GUI.",
+                        "type": "gui_workflow",
+                        "priority": "must",
+                        "frozen_acceptance": {
+                            "intent": "Verify the GUI update changes stored state.",
+                            "assertion_targets": ["stored value changes after the handler runs"],
+                        },
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(errors, [])
 
     def test_initializer_task_graph_requires_requirement_coverage_matrix(self) -> None:
         workspace = "eval/benchmarks/todo_counter/workspace"
@@ -207,6 +244,127 @@ class HarnessBehaviorTests(unittest.TestCase):
         )
 
         self.assertIn("too weak", " ".join(errors))
+
+    def test_task_graph_reviewer_accepts_python_c_unittest_module_for_gui_asset(self) -> None:
+        workspace = "eval/benchmarks/employee_system/workspace"
+        requirement = {
+            "id": "REQ-GUI-AUTO-ALLOCATE",
+            "source": "task.md:3.3",
+            "text": "The automatic allocation button updates the allocation view.",
+            "type": "gui_workflow",
+            "priority": "must",
+            "acceptance_intent": "The GUI action changes allocation state.",
+            "frozen_acceptance": {
+                "intent": "Verify the GUI action updates observable allocation state.",
+                "assertion_targets": [
+                    "invoking the allocation handler creates allocation rows",
+                    "the status label reports successful allocation",
+                ],
+            },
+        }
+        command = (
+            "python -c \"import sys, unittest; "
+            f"sys.path.insert(0, '{workspace}'); "
+            "from tests import test_ui; "
+            "suite = unittest.TestLoader().loadTestsFromModule(test_ui); "
+            "result = unittest.TextTestRunner(verbosity=2).run(suite); "
+            "assert result.wasSuccessful(), 'GUI tests failed'\""
+        )
+
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Main GUI workflow",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-GUI-AUTO-ALLOCATE"],
+                        "requirements": [requirement],
+                        "acceptance_criteria": ["Automatic allocation updates GUI state."],
+                        "criterion_command_map": {"Automatic allocation updates GUI state.": [command]},
+                        "expected_artifacts": [
+                            f"{workspace}/mprs/ui/main_window.py",
+                            f"{workspace}/tests/test_ui.py",
+                        ],
+                        "implementation_artifacts": [f"{workspace}/mprs/ui/main_window.py"],
+                        "worker_test_artifacts": [f"{workspace}/tests/test_ui.py"],
+                        "acceptance_artifacts": [],
+                        "frozen_acceptance_artifacts": [],
+                        "verification_assets": [
+                            {
+                                "id": "VA-GUI",
+                                "path": f"{workspace}/tests/test_ui.py",
+                                "runner": "unittest",
+                                "covers": ["REQ-GUI-AUTO-ALLOCATE"],
+                                "assertion_targets": {
+                                    "REQ-GUI-AUTO-ALLOCATE": [
+                                        "invoking the allocation handler creates allocation rows",
+                                        "the status label reports successful allocation",
+                                    ]
+                                },
+                                "repair_policy": "infra_only",
+                            }
+                        ],
+                        "verification_commands": [
+                            {
+                                "id": "VC-GUI",
+                                "command": command,
+                                "covers": ["REQ-GUI-AUTO-ALLOCATE"],
+                                "asset_ids": ["VA-GUI"],
+                            }
+                        ],
+                    }
+                ]
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": [requirement]},
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_initializer_task_graph_accepts_lightweight_requirement_assignment(self) -> None:
+        workspace = "eval/benchmarks/todo_counter/workspace"
+        requirement = {
+            "id": "REQ-COUNT",
+            "source": "task.md:1",
+            "text": "The counter returns the number of todo lines.",
+            "type": "service_logic",
+            "priority": "must",
+            "frozen_acceptance": {
+                "intent": "Verify todo counting.",
+                "assertion_targets": ["todo count equals number of todo lines"],
+            },
+        }
+
+        errors = validate_generated_task_graph(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-COUNT"],
+                        "expected_artifacts": [
+                            f"{workspace}/todo_counter/core.py",
+                            f"{workspace}/tests/test_counter.py",
+                        ],
+                        "implementation_artifacts": [f"{workspace}/todo_counter/core.py"],
+                        "worker_test_artifacts": [f"{workspace}/tests/test_counter.py"],
+                    }
+                ]
+            },
+            expected_workspace_root=workspace,
+            require_requirement_coverage=True,
+            requirements_data={"requirements": [requirement]},
+            require_verification_plan=False,
+        )
+
+        self.assertEqual(errors, [])
 
     def test_task_graph_reviewer_accepts_separate_requirements_with_task_snapshots(self) -> None:
         workspace = "eval/benchmarks/todo_counter/workspace"
@@ -1022,6 +1180,77 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertTrue(state.acceptance_contracts[-1]["frozen"])
             self.assertEqual(state.acceptance_contracts[-1]["source"], "task_graph")
 
+    def test_lightweight_generated_task_starts_with_pending_verification_contract(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text("# Todo Counter\n", encoding="utf-8")
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            state_dir.mkdir(parents=True)
+            requirement = {
+                "id": "REQ-COUNT",
+                "source": "project_spec.md:1",
+                "text": "The counter returns the number of todo lines.",
+                "type": "service_logic",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify todo counting.",
+                    "assertion_targets": ["todo count equals number of todo lines"],
+                },
+            }
+            (state_dir / "requirements.json").write_text(
+                json.dumps({"requirements": [requirement]}),
+                encoding="utf-8",
+            )
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "TC1",
+                                "title": "Implement counter",
+                                "status": "pending",
+                                "priority": 1,
+                                "depends_on": [],
+                                "requirement_ids": ["REQ-COUNT"],
+                                "expected_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/todo_counter/core.py",
+                                    "eval/benchmarks/todo_counter/workspace/tests/test_counter.py",
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                                ],
+                                "worker_test_artifacts": [
+                                    "eval/benchmarks/todo_counter/workspace/tests/test_counter.py"
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "init.sh").write_text(
+                "#!/usr/bin/env sh\nset -eu\npython -c \"import sys; assert sys.version_info >= (3, 8)\"\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+
+            state = loop._load_or_create_state()
+
+            self.assertEqual(state.task_id, "TC1")
+            self.assertEqual(state.acceptance_criteria, ["REQ-COUNT: todo count equals number of todo lines"])
+            self.assertEqual(state.acceptance_contracts[-1]["status"], "pending_verification_procedure")
+            self.assertEqual(state.acceptance_contracts[-1]["frozen_requirements"], state.acceptance_criteria)
+
     def test_initializer_remains_active_until_init_script_exists(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1684,6 +1913,45 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(content, "hi world\n")
         self.assertEqual(result.data["replacements"], 1)
 
+    def test_edit_replaces_line_range(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "alpha.txt"
+            path.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+            result = EditTool(root).run(
+                {
+                    "action": "edit",
+                    "target": "alpha.txt",
+                    "args": {"start": 2, "end": 3, "content": "TWO\nTHREE"},
+                }
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(content, "one\nTWO\nTHREE\nfour\n")
+        self.assertEqual(result.data["start"], 2)
+        self.assertEqual(result.data["end"], 3)
+
+    def test_edit_rejects_line_range_outside_file(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "alpha.txt"
+            path.write_text("one\ntwo\n", encoding="utf-8")
+
+            result = EditTool(root).run(
+                {
+                    "action": "edit",
+                    "target": "alpha.txt",
+                    "args": {"start": 2, "end": 5, "content": "replacement"},
+                }
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(content, "one\ntwo\n")
+        self.assertEqual(result.data["line_count"], 2)
+
     def test_git_rejects_network_or_destructive_commands(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             result = GitTool(Path(tmp)).run({"action": "git", "target": "push", "args": {}})
@@ -1941,6 +2209,98 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(contract.ok)
         self.assertTrue(observation.ok)
+
+    def test_managed_task_requires_tests_and_contract_before_implementation_write(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement generated task", max_steps=1)
+            criterion = "REQ-COUNT: todo count equals number of todo lines"
+            test_path = "workspace/tests/test_counter.py"
+            implementation_path = "workspace/todo_counter/core.py"
+            state = create_initial_state("Implement generated task")
+            state.task_id = "T1"
+            state.acceptance_criteria = [criterion]
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "Todo counter",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "acceptance_criteria": [criterion],
+                    "expected_artifacts": [implementation_path, test_path],
+                    "implementation_artifacts": [implementation_path],
+                    "worker_test_artifacts": [test_path],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: Todo counter",
+                    "scope": [implementation_path, test_path],
+                    "frozen_requirements": [criterion],
+                    "verification_procedure": {"commands": []},
+                    "checks": [],
+                    "criterion_command_map": {},
+                    "required_evidence": [criterion],
+                    "status": "pending_verification_procedure",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            implementation_before_tests = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": implementation_path,
+                    "args": {"content": "def count(text):\n    return 0\n"},
+                },
+                state,
+            )
+            test_write = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": test_path,
+                    "args": {
+                        "content": (
+                            "import unittest\n\n"
+                            "class CounterTests(unittest.TestCase):\n"
+                            "    def test_count(self):\n"
+                            "        self.assertEqual(1, 1)\n"
+                        )
+                    },
+                },
+                state,
+            )
+            contract = loop._execute_action(
+                {
+                    "action": "contract",
+                    "target": "T1",
+                    "args": {
+                        "task_id": "T1",
+                        "summary": "Frozen task-graph acceptance contract for T1: Todo counter",
+                        "frozen_requirements": [criterion],
+                        "verification_procedure": {"command": "python -m unittest discover -s workspace/tests"},
+                    },
+                },
+                state,
+            )
+            implementation_after_contract = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": implementation_path,
+                    "args": {"content": "def count(text):\n    return text.count('- [ ]')\n"},
+                },
+                state,
+            )
+
+        self.assertFalse(implementation_before_tests.ok)
+        self.assertTrue(implementation_before_tests.data["missing_contract"])
+        self.assertTrue(test_write.ok)
+        self.assertTrue(contract.ok)
+        self.assertTrue(implementation_after_contract.ok)
 
     def test_contract_update_deduplicates_same_task_contract(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -4455,7 +4815,7 @@ class HarnessBehaviorTests(unittest.TestCase):
                     },
                 },
                 {
-                    "step": 7,
+                    "step": 25,
                     "action": {"action": "read", "target": "src/app.py", "args": {}},
                     "observation": {
                         "ok": True,
@@ -4484,7 +4844,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             trace = trace_dir / "run_20260714_000000.jsonl"
             events = [
                 {
-                    "step": 17,
+                    "step": 1,
                     "action": {"action": "read", "target": "state/requirements.json", "args": {}},
                     "observation": {
                         "ok": True,
@@ -4493,7 +4853,7 @@ class HarnessBehaviorTests(unittest.TestCase):
                     },
                 },
                 {
-                    "step": 21,
+                    "step": 5,
                     "action": {"action": "read", "target": "state/requirements.json", "args": {"start": 200, "end": 380}},
                     "observation": {
                         "ok": True,
@@ -4967,6 +5327,104 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(evidence["requirements"][0]["id"], "REQ-FEATURE")
         self.assertEqual(evidence["requirements"][0]["status"], "verified")
         self.assertEqual(evidence["requirements"][0]["evidence"][0]["assertion_targets"], [target])
+
+    def test_verifier_uses_contract_mapping_for_lazy_requirement_closeout(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            (state_dir / "traces").mkdir(parents=True)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir(parents=True)
+            (tests_dir / "test_gui.py").write_text(
+                "import unittest\n\n"
+                "class GuiTests(unittest.TestCase):\n"
+                "    def test_left_panel(self):\n"
+                "        self.assertTrue(True)\n"
+                "    def test_toolbar(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            requirement = {
+                "id": "REQ-UI-LAYOUT",
+                "source": "task.md:4.1",
+                "text": "Main window layout exists.",
+                "type": "gui_workflow",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify GUI layout.",
+                    "assertion_targets": ["left panel exists", "toolbar buttons exist"],
+                },
+            }
+            criteria = [
+                "REQ-UI-LAYOUT: left panel exists",
+                "REQ-UI-LAYOUT: toolbar buttons exist",
+            ]
+            commands = [
+                "python -m unittest tests.test_gui.GuiTests.test_left_panel",
+                "python -m unittest tests.test_gui.GuiTests.test_toolbar",
+            ]
+            state = create_initial_state("Benchmark GUI")
+            state.task_id = "T1"
+            state.acceptance_criteria = criteria
+            state.nodes = [
+                {
+                    "id": "T1",
+                    "title": "GUI",
+                    "status": "in_progress",
+                    "evidence": [],
+                    "requirement_ids": ["REQ-UI-LAYOUT"],
+                    "requirements": [requirement],
+                    "acceptance_criteria": criteria,
+                    "expected_artifacts": [
+                        "eval/benchmarks/sample/workspace/gui.py",
+                        "eval/benchmarks/sample/workspace/tests/test_gui.py",
+                    ],
+                    "implementation_artifacts": ["eval/benchmarks/sample/workspace/gui.py"],
+                    "worker_test_artifacts": ["eval/benchmarks/sample/workspace/tests/test_gui.py"],
+                    "verification_commands": [],
+                    "verification_assets": [],
+                    "contract_managed": True,
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "T1",
+                    "summary": "Frozen task-graph acceptance contract for T1: GUI",
+                    "scope": state.nodes[0]["expected_artifacts"],
+                    "frozen_requirements": criteria,
+                    "verification_procedure": {
+                        "working_directory": "eval/benchmarks/sample/workspace",
+                        "commands": commands,
+                    },
+                    "checks": commands,
+                    "criterion_command_map": {
+                        criteria[0]: [commands[0]],
+                        criteria[1]: [commands[1]],
+                    },
+                    "required_evidence": criteria,
+                    "status": "agreed",
+                    "source": "task_graph",
+                    "frozen": True,
+                }
+            ]
+
+            result = Verifier(root, state_dir=state_dir).run("default", state)
+            evidence = json.loads((state_dir / "task_evidence" / "T1.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["checks"]["requirement_closeout"])
+        self.assertEqual(evidence["requirements"][0]["status"], "verified")
+        targets = {
+            target
+            for entry in evidence["requirements"][0]["evidence"]
+            for target in entry["assertion_targets"]
+        }
+        self.assertEqual(targets, {"left panel exists", "toolbar buttons exist"})
+        self.assertEqual(
+            evidence["requirements"][0]["evidence"][0]["test_files"],
+            ["eval/benchmarks/sample/workspace/tests/test_gui.py"],
+        )
 
     def test_verifier_preserves_full_command_output(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

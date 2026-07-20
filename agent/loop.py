@@ -404,16 +404,19 @@ class AgentLoop:
         state.task_id = task_id
         if not state.user_goal.startswith(f"{task_id}:"):
             state.user_goal = f"{task_id}: {task.get('title', state.user_goal)}"
-        acceptance = task.get("acceptance_criteria")
-        if isinstance(acceptance, list) and acceptance:
-            state.acceptance_criteria = [str(item) for item in acceptance]
+        acceptance = self._task_acceptance_criteria(task)
+        if acceptance:
+            state.acceptance_criteria = acceptance
+        requirements = task.get("requirements", [])
+        if not isinstance(requirements, list) or not requirements:
+            requirements = self._task_requirement_snapshots(task)
         state.nodes = [
             {
                 "id": task_id,
                 "title": str(task.get("title", task_id)),
                 "status": str(task.get("status", "pending")),
                 "evidence": task.get("evidence", []),
-                "acceptance_criteria": task.get("acceptance_criteria", []),
+                "acceptance_criteria": acceptance,
                 "depends_on": task.get("depends_on", []),
                 "priority": task.get("priority", 1000),
                 "expected_artifacts": task.get("expected_artifacts", []),
@@ -425,7 +428,7 @@ class AgentLoop:
                 "verification_commands": task.get("verification_commands", []),
                 "verification_assets": task.get("verification_assets", []),
                 "requirement_ids": task.get("requirement_ids", []),
-                "requirements": task.get("requirements", []),
+                "requirements": requirements,
                 "criterion_command_map": task.get("criterion_command_map", {}),
                 "contract_managed": True,
             }
@@ -447,7 +450,7 @@ class AgentLoop:
 
     def _ensure_frozen_acceptance_contract(self, state: TaskState, task: dict[str, Any]) -> None:
         task_id = str(task.get("id", state.task_id))
-        criteria = [str(item) for item in task.get("acceptance_criteria", [])]
+        criteria = self._task_acceptance_criteria(task)
         commands = self._verification_command_texts(task.get("verification_commands", []))
         raw_mapping = task.get("criterion_command_map")
         if isinstance(raw_mapping, dict):
@@ -475,11 +478,12 @@ class AgentLoop:
             "verification_assets": task.get("verification_assets", []),
             "forbidden_shortcuts": [
                 "Do not weaken frozen requirements after task activation.",
+                "Write worker tests and agree a verification procedure before implementation artifacts.",
                 "Verification procedure may be corrected only to prove the same frozen requirements.",
             ],
             "source": "task_graph",
             "frozen": True,
-            "status": "proposed",
+            "status": "proposed" if commands else "pending_verification_procedure",
         }
         existing = next(
             (
@@ -496,6 +500,14 @@ class AgentLoop:
             existing.setdefault("frozen_requirements", list(criteria))
             existing.setdefault("verification_procedure", {"commands": list(existing.get("checks", commands))})
             return
+        if not commands:
+            state.acceptance_contracts = [
+                item
+                for item in state.acceptance_contracts
+                if not (item.get("task_id") == task_id and item.get("source") == "task_graph")
+            ]
+            state.acceptance_contracts.append(contract)
+            return
         result = self.verifier.validate_contract(contract, task)
         contract["status"] = "agreed" if result.ok else "rejected"
         contract["validation"] = result.data.get("checks", {})
@@ -505,6 +517,46 @@ class AgentLoop:
             if not (item.get("task_id") == task_id and item.get("source") == "task_graph")
         ]
         state.acceptance_contracts.append(contract)
+
+    def _task_requirement_snapshots(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        requirement_ids = [str(item).strip() for item in task.get("requirement_ids", []) if str(item).strip()] if isinstance(task.get("requirement_ids"), list) else []
+        if not requirement_ids:
+            return []
+        try:
+            data = json.loads(self.requirements_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        requirements = data.get("requirements", []) if isinstance(data, dict) else []
+        if not isinstance(requirements, list):
+            return []
+        by_id = {
+            str(item.get("id", "")).strip(): item
+            for item in requirements
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+        return [by_id[item] for item in requirement_ids if item in by_id]
+
+    def _task_acceptance_criteria(self, task: dict[str, Any]) -> list[str]:
+        acceptance = task.get("acceptance_criteria")
+        if isinstance(acceptance, list) and [str(item).strip() for item in acceptance if str(item).strip()]:
+            return [str(item).strip() for item in acceptance if str(item).strip()]
+        criteria: list[str] = []
+        for requirement in self._task_requirement_snapshots(task):
+            requirement_id = str(requirement.get("id", "")).strip()
+            frozen = requirement.get("frozen_acceptance", {})
+            targets = frozen.get("assertion_targets", []) if isinstance(frozen, dict) else []
+            added = False
+            if isinstance(targets, list):
+                for target in targets:
+                    text = str(target).strip()
+                    if text:
+                        criteria.append(f"{requirement_id}: {text}" if requirement_id else text)
+                        added = True
+            if not added:
+                text = str(requirement.get("acceptance_intent") or requirement.get("text") or "").strip()
+                if text:
+                    criteria.append(f"{requirement_id}: {text}" if requirement_id else text)
+        return list(dict.fromkeys(criteria))
 
     def _record_context_snapshot(self, step: int, state: TaskState, context: str) -> dict[str, Any]:
         session_dir = self.debug_context_dir / self.trace_path.stem
@@ -662,11 +714,16 @@ class AgentLoop:
                 {"no_active_task": True, "required_action": "finish_or_verify"},
             )
         elif name in {"edit", "write"} and not self._has_contract_for_active_task(state):
-            return ToolResult(
-                False,
-                "Write rejected: create an acceptance contract with the verifier before generating code.",
-                {"missing_contract": True},
-            )
+            if not self._can_write_pre_contract_test_artifact(action, state):
+                return ToolResult(
+                    False,
+                    "Write rejected: write the active task's test artifacts, then create a verification procedure contract before implementation code.",
+                    {"missing_contract": True, "pre_contract_test_artifacts": self._active_task_worker_test_artifacts(state)},
+                )
+        elif name in {"edit", "write"}:
+            test_gate = self._implementation_write_test_gate(action, state)
+            if test_gate is not None:
+                return test_gate
         if name == "bash" and self._is_initializer_task(state):
             allowed_commands = set(self._active_verification_commands(state))
             if str(action.get("target", "")) not in allowed_commands:
@@ -2392,6 +2449,7 @@ class AgentLoop:
             standard_library_only=self._project_requires_standard_library(),
             require_requirement_coverage=True,
             requirements_data=requirements_data,
+            require_verification_plan=False,
         )
 
     def _initializer_script_errors(self, content: object) -> list[str]:
@@ -2893,6 +2951,50 @@ class AgentLoop:
         }
         self._write_json_atomic(path, payload)
         return {"report_id": report_id, "archived_verifier_report": self._rel(path)}
+
+    def _can_write_pre_contract_test_artifact(self, action: dict[str, Any], state: TaskState) -> bool:
+        active = self._active_node(state)
+        if not active or active.get("contract_managed") is not True:
+            return False
+        if not self._pending_managed_contract_for_active_task(state):
+            return False
+        target = self._normalize_target(action.get("target", ""))
+        return target in {
+            self._normalize_target(item)
+            for item in self._active_task_worker_test_artifacts(state)
+        }
+
+    def _implementation_write_test_gate(self, action: dict[str, Any], state: TaskState) -> ToolResult | None:
+        target = self._normalize_target(action.get("target", ""))
+        implementation_artifacts = {
+            self._normalize_target(item)
+            for item in self._active_task_implementation_artifacts(state)
+        }
+        if target not in implementation_artifacts:
+            return None
+        missing_tests = [
+            item
+            for item in self._active_task_worker_test_artifacts(state)
+            if not (self.root / item).exists()
+        ]
+        if not missing_tests:
+            return None
+        return ToolResult(
+            False,
+            "Write rejected: create the active task's worker test artifacts before implementation code.",
+            {"missing_worker_test_artifacts": missing_tests},
+        )
+
+    def _pending_managed_contract_for_active_task(self, state: TaskState) -> dict[str, Any] | None:
+        active = self._active_task_id(state)
+        matches = [
+            item
+            for item in state.acceptance_contracts
+            if item.get("task_id") in {active, "current"}
+            and item.get("source") == "task_graph"
+            and item.get("status") == "pending_verification_procedure"
+        ]
+        return matches[-1] if matches else None
 
     def _has_contract_for_active_task(self, state: TaskState) -> bool:
         active = self._active_task_id(state)

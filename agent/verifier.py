@@ -55,6 +55,7 @@ class Verifier:
             state_dir=self.state_dir,
             task=active_node,
             command_results=command_results,
+            contract=contract,
         )
         closeout_errors: list[str] = []
         if state.task_id != "INIT" and active_node.get("requirement_ids"):
