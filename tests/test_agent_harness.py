@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -26,6 +27,8 @@ from agent.planner import (
     validate_requirements_matrix,
 )
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
+from agent.requirement_verifier import validate_task_requirement_closeout
+from agent.system_validation import main as system_validation_main
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
 from agent.tools.bash import BashTool
@@ -34,6 +37,7 @@ from agent.tools.git import GitTool
 from agent.tools.list_files import ListFilesTool
 from agent.tools.read import ReadTool
 from agent.tools.search import SearchTool
+from agent.ui_contract import OpenAICompatibleUIContractBuilder, build_ui_contract, validate_ui_contract
 from agent.verifier import Verifier
 from eval.metrics import load_events, summarize
 
@@ -915,6 +919,16 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(args.auto_resume)
         self.assertEqual(args.max_sessions, 3)
 
+    def test_cli_can_disable_system_validation(self) -> None:
+        parser = build_parser()
+        default_args = parser.parse_args(["Task"])
+        disabled_args = parser.parse_args(["Task", "--no-system-validation"])
+        enabled_args = parser.parse_args(["Task", "--system-validation"])
+
+        self.assertTrue(default_args.system_validation)
+        self.assertFalse(disabled_args.system_validation)
+        self.assertTrue(enabled_args.system_validation)
+
     def test_cli_defaults_to_unlimited_steps_per_session(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["Task"])
@@ -1629,6 +1643,7 @@ class HarnessBehaviorTests(unittest.TestCase):
     def test_termination_succeeds_only_when_all_project_checks_pass(self) -> None:
         checks = {
             "tasks": {"ok": True, "all_remaining_blocked": False},
+            "final_validation": {"ok": True},
             "regression": {"ok": True},
             "git_clean": {"ok": True},
             "budget": {"ok": True, "exhausted": False},
@@ -1640,9 +1655,69 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
 
+    def test_termination_requires_final_validation_when_enabled(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            tasks_path = state_dir / "generated_tasks.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "priority": 1, "depends_on": []},
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            terminator = ProjectTerminator(
+                root,
+                tasks_path=tasks_path,
+                benchmark_id="sample",
+                state_dir=state_dir,
+                final_validation_required=True,
+            )
+
+            result = terminator.evaluate()
+
+            ui_results = state_dir / "system_validation" / "ui_check_results.json"
+            ui_results.parent.mkdir(parents=True)
+            ui_results.write_text(
+                json.dumps({"kind": "ui_check_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "priority": 1, "depends_on": []},
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "status": "completed",
+                                "priority": 2,
+                                "depends_on": ["T1"],
+                            },
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            completed = terminator.evaluate()
+
+        self.assertEqual(result.status, "continue_running")
+        self.assertIn("final_validation_not_passing", result.reasons)
+        self.assertEqual(result.checks["final_validation"]["reason"], "final_acceptance_not_scheduled")
+        self.assertEqual(completed.status, "completed")
+
     def test_termination_reports_failure_instead_of_fake_completion(self) -> None:
         checks = {
             "tasks": {"ok": False, "all_remaining_blocked": False},
+            "final_validation": {"ok": True},
             "regression": {"ok": True},
             "git_clean": {"ok": True},
             "budget": {"ok": False, "exhausted": True},
@@ -1658,6 +1733,7 @@ class HarnessBehaviorTests(unittest.TestCase):
     def test_termination_can_pause_for_human_intervention(self) -> None:
         checks = {
             "tasks": {"ok": False, "all_remaining_blocked": False},
+            "final_validation": {"ok": True},
             "regression": {"ok": True},
             "git_clean": {"ok": True},
             "budget": {"ok": True, "exhausted": False},
@@ -2018,6 +2094,23 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("Python", result.data["output"])
+
+    def test_bash_timeout_returns_and_marks_timeout(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            started = time.monotonic()
+            result = BashTool(Path(tmp)).run(
+                {
+                    "action": "bash",
+                    "target": "python -c \"import time; print('started'); time.sleep(5)\"",
+                    "args": {"timeout": 1},
+                }
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["timed_out"])
+        self.assertLess(elapsed, 4)
+        self.assertIn("timed out", result.summary)
 
     def test_bash_preserves_full_output(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2599,17 +2692,19 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "ImportError: cannot import name 'IssueStore' from 'issue_tracker.store'\n"
             )
 
+            wrapped_command = f"cd {root} && python -m unittest discover -s workspace/tests"
             loop._update_state(
                 state,
-                {"action": "bash", "target": "python -m unittest discover -s workspace/tests", "args": {}},
+                {"action": "bash", "target": wrapped_command, "args": {}},
                 ToolResult(
                     False,
                     "Command exited with code 1.",
-                    {"command": "python -m unittest discover -s workspace/tests", "output": output},
+                    {"command": wrapped_command, "output": output},
                 ),
             )
 
         self.assertEqual(state.pending_repair["reason"], "failed_acceptance_command")
+        self.assertEqual(state.pending_repair["command"], "python -m unittest discover -s workspace/tests")
         self.assertEqual(state.pending_repair["targets"][0], "workspace/issue_tracker/store.py")
         self.assertIn("workspace/tests/test_store.py", state.pending_repair["targets"])
         self.assertEqual(state.pending_repair["repair_targets"], ["workspace/issue_tracker/store.py"])
@@ -3134,7 +3229,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(data["tasks"][0]["status"], "completed")
         self.assertEqual(data["tasks"][1]["status"], "in_progress")
 
-    def test_finish_does_not_run_manual_hidden_acceptance_or_create_repair_tasks(self) -> None:
+    def test_finish_creates_final_acceptance_without_running_hidden_acceptance(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             source_tasks = root / "input_tasks.json"
@@ -3195,13 +3290,796 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
             data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+            current_task_data = json.loads(loop.state_path.read_text(encoding="utf-8"))
+            ui_contract_path = root / "state" / "benchmarks" / "sample" / "system_validation" / "ui_contract.json"
+            ui_contract_exists = ui_contract_path.exists()
+
+        self.assertFalse(result.ok)
+        self.assertIn("final acceptance task was created", result.summary)
+        self.assertTrue(result.data["final_acceptance_task_created"])
+        self.assertEqual(result.data["task_id"], "FINAL_ACCEPTANCE")
+        self.assertFalse((root / "hidden-was-run.txt").exists())
+        self.assertEqual([task["id"] for task in data["tasks"]], ["T1", "FINAL_ACCEPTANCE"])
+        final_task = data["tasks"][1]
+        self.assertEqual(final_task["depends_on"], ["T1"])
+        self.assertEqual(final_task["worker_test_artifacts"], [])
+        self.assertEqual(final_task["acceptance_artifacts"], final_task["frozen_acceptance_artifacts"])
+        self.assertEqual(final_task["test_policy"]["worker_tests_mutable_by_worker"], False)
+        self.assertEqual(final_task["test_policy"]["acceptance_tests_mutable_by_worker"], False)
+        self.assertTrue(final_task["system_owned_validation"])
+        self.assertTrue(final_task["verification_commands"])
+        self.assertEqual(result.data["validation_artifacts"], final_task["frozen_acceptance_artifacts"])
+        self.assertIn("state/benchmarks/sample/system_validation/final_acceptance_manifest.json", final_task["frozen_acceptance_artifacts"])
+        self.assertIn("state/benchmarks/sample/system_validation/ui_contract.json", final_task["frozen_acceptance_artifacts"])
+        self.assertTrue(ui_contract_exists)
+        self.assertEqual(state.task_id, "FINAL_ACCEPTANCE")
+        self.assertEqual(state.nodes[0]["id"], "FINAL_ACCEPTANCE")
+        self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertEqual(data["tasks"][1]["status"], "in_progress")
+        self.assertEqual(current_task_data["task_id"], "FINAL_ACCEPTANCE")
+        self.assertEqual(current_task_data["nodes"][0]["id"], "FINAL_ACCEPTANCE")
+        self.assertEqual(current_task_data["nodes"][0]["status"], "in_progress")
+
+    def test_ui_contract_generated_for_gui_requirement_shape(self) -> None:
+        requirement = {
+            "id": "REQ-EMP-ADD",
+            "source": "task.md:3.1",
+            "text": "添加员工：录入姓名、技能集（多选）、每周工时容量（默认40h）",
+            "type": "gui_workflow",
+            "priority": "must",
+        }
+
+        contract = build_ui_contract({"requirements": [requirement]}.get("requirements", []))
+        errors = validate_ui_contract({"requirements": [requirement]}, contract)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(contract["contracts"][0]["ui_applicability"], "required")
+        self.assertEqual(contract["contracts"][0]["ui_surface"], "widget")
+        entry = contract["contracts"][0]["ui_contract"]
+        self.assertIn("Add", entry["buttons"])
+        self.assertIn("Employee name input", entry["inputs"])
+        self.assertIn("Skills selector", entry["inputs"])
+        self.assertIn("Weekly capacity input", entry["inputs"])
+        self.assertTrue(entry["dialogs"])
+        self.assertTrue(entry["data_display"])
+        self.assertTrue(entry["empty_state"])
+        self.assertTrue(entry["success_refresh"])
+
+    def test_system_validation_requires_per_requirement_ui_checks(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            requirement = {
+                "id": "REQ-EMP-ADD",
+                "source": "task.md:3.1",
+                "text": "Add employee from the GUI.",
+                "type": "gui_workflow",
+                "priority": "must",
+            }
+            command = "python -c \"assert True\""
+            tasks_path = state_dir / "generated_tasks.json"
+            requirements_path = state_dir / "requirements.json"
+            manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
+            ui_contract_path = state_dir / "system_validation" / "ui_contract.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_payload = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Employee GUI",
+                        "status": "completed",
+                        "depends_on": [],
+                        "requirement_ids": ["REQ-EMP-ADD"],
+                        "expected_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                        "verification_commands": [command],
+                    },
+                    {
+                        "id": "FINAL_ACCEPTANCE",
+                        "title": "Run project-level final acceptance",
+                        "status": "in_progress",
+                        "depends_on": ["T1"],
+                        "requirements": [requirement],
+                        "final_acceptance": True,
+                    },
+                ]
+            }
+            tasks_path.write_text(json.dumps(tasks_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            requirements_path.write_text(
+                json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_final_acceptance",
+                        "validator": "agent.system_validation",
+                        "tasks_path": "state/benchmarks/sample/generated_tasks.json",
+                        "requirements_path": "state/benchmarks/sample/requirements.json",
+                        "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ui_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "ui_contract",
+                        "version": 1,
+                        "generated_by": "test",
+                        "contracts": [
+                            {
+                                "requirement_id": "REQ-EMP-ADD",
+                                "source": "task.md:3.1",
+                                "priority": "must",
+                                "type": "gui_workflow",
+                                "requirement_text": "Add employee from the GUI.",
+                                "ui_applicability": "required",
+                                "ui_surface": "widget",
+                                "ui_contract": {
+                                    "entry_points": ["Employee panel"],
+                                    "buttons": ["Add"],
+                                    "inputs": ["Name field"],
+                                    "dialogs": ["Inline success message"],
+                                    "data_display": ["Employee list"],
+                                    "empty_state": "Show empty employee list.",
+                                    "success_refresh": "Refresh employee list.",
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            failed = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+            failed_results = json.loads((state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8"))
+            (state_dir / "task_evidence").mkdir()
+            (state_dir / "task_evidence" / "T1.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T1",
+                        "requirements": [
+                            {
+                                "id": "REQ-EMP-ADD",
+                                "status": "verified",
+                                "evidence": [
+                                    {
+                                        "type": "automated_test",
+                                        "command": command,
+                                        "test_files": ["eval/benchmarks/sample/workspace/tests/test_employee.py"],
+                                        "result": "passed",
+                                        "assertion_targets": ["employee list refreshes"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verified_but_no_ui = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+            verified_but_no_ui_results = json.loads(
+                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+            )
+            (workspace / "app.py").write_text(
+                "import tkinter as tk\n"
+                "from tkinter import ttk, messagebox\n\n"
+                "class EmployeeApp(tk.Frame):\n"
+                "    def __init__(self, master=None):\n"
+                "        super().__init__(master)\n"
+                "        self.name_entry = tk.Entry(self)\n"
+                "        self.name_entry.pack()\n"
+                "        self.add_button = tk.Button(self, text='Add', command=self.add_employee)\n"
+                "        self.add_button.pack()\n"
+                "        self.employee_table = ttk.Treeview(self)\n"
+                "        self.employee_table.pack()\n"
+                "        self.status_label = tk.Label(self, text='No employees yet')\n"
+                "        self.status_label.pack()\n"
+                "    def add_employee(self):\n"
+                "        self.employee_table.insert('', tk.END, values=(self.name_entry.get(),))\n"
+                "        self.status_label.config(text='Employee added')\n"
+                "        messagebox.showinfo('Saved', 'Employee added')\n",
+                encoding="utf-8",
+            )
+
+            passed = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+            passed_results = json.loads((state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(failed, 1)
+        self.assertFalse(failed_results["results"][0]["passed"])
+        self.assertFalse(failed_results["results"][0]["checks"]["entry_points"])
+        self.assertEqual(failed_results["results"][0]["source_files"], ["eval/benchmarks/sample/workspace/app.py"])
+        self.assertEqual(failed_results["results"][0]["repair_targets"], ["eval/benchmarks/sample/workspace/app.py"])
+        self.assertEqual(failed_results["results"][0]["required_action"], "inspect_and_repair_generated_code")
+        self.assertEqual(verified_but_no_ui, 1)
+        self.assertFalse(verified_but_no_ui_results["results"][0]["passed"])
+        self.assertFalse(verified_but_no_ui_results["results"][0]["checks"]["buttons"])
+        self.assertEqual(
+            verified_but_no_ui_results["results"][0]["repair_targets"],
+            ["eval/benchmarks/sample/workspace/app.py"],
+        )
+        self.assertEqual(passed, 0)
+        self.assertTrue(passed_results["passed"])
+        self.assertTrue(all(passed_results["results"][0]["checks"].values()))
+        self.assertEqual(passed_results["results"][0]["required_action"], "")
+
+    def test_system_validation_skips_non_ui_requirement_widget_checks(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            scheduler = workspace / "mprs" / "services" / "scheduler.py"
+            scheduler.parent.mkdir(parents=True)
+            scheduler.write_text(
+                "class Scheduler:\n"
+                "    def allocate(self):\n"
+                "        return []\n",
+                encoding="utf-8",
+            )
+            requirement = {
+                "id": "REQ-RULE-SKILL",
+                "source": "task.md:4.1",
+                "text": "Scheduling must respect skill matching.",
+                "type": "service_logic",
+                "priority": "must",
+            }
+            command = "python -c \"assert True\""
+            tasks_path = state_dir / "generated_tasks.json"
+            requirements_path = state_dir / "requirements.json"
+            manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
+            ui_contract_path = state_dir / "system_validation" / "ui_contract.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Scheduler rules",
+                                "status": "completed",
+                                "depends_on": [],
+                                "requirement_ids": ["REQ-RULE-SKILL"],
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/mprs/services/scheduler.py"
+                                ],
+                                "verification_commands": [command],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "title": "Run project-level final acceptance",
+                                "status": "in_progress",
+                                "depends_on": ["T1"],
+                                "requirements": [requirement],
+                                "final_acceptance": True,
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            requirements_path.write_text(
+                json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_final_acceptance",
+                        "validator": "agent.system_validation",
+                        "tasks_path": "state/benchmarks/sample/generated_tasks.json",
+                        "requirements_path": "state/benchmarks/sample/requirements.json",
+                        "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ui_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "ui_contract",
+                        "version": 1,
+                        "generated_by": "test",
+                        "contracts": [
+                            {
+                                "requirement_id": "REQ-RULE-SKILL",
+                                "source": "task.md:4.1",
+                                "priority": "must",
+                                "type": "service_logic",
+                                "requirement_text": "Scheduling must respect skill matching.",
+                                "ui_applicability": "not_applicable",
+                                "ui_surface": "none",
+                                "ui_contract": {
+                                    "entry_points": ["Auto scheduling button"],
+                                    "buttons": ["Auto schedule"],
+                                    "inputs": ["Selected project"],
+                                    "dialogs": ["Warning dialog"],
+                                    "data_display": ["Allocation table"],
+                                    "empty_state": "Show no allocation.",
+                                    "success_refresh": "Refresh allocation table.",
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (state_dir / "task_evidence").mkdir()
+            (state_dir / "task_evidence" / "T1.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T1",
+                        "requirements": [
+                            {
+                                "id": "REQ-RULE-SKILL",
+                                "status": "verified",
+                                "evidence": [
+                                    {
+                                        "type": "automated_test",
+                                        "command": command,
+                                        "test_files": ["eval/benchmarks/sample/workspace/tests/test_scheduler.py"],
+                                        "result": "passed",
+                                        "assertion_targets": ["skill matching enforced"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+            check_results = json.loads(
+                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+            )
+            contract_data = json.loads(ui_contract_path.read_text(encoding="utf-8"))
+            contract_data["contracts"][0]["ui_applicability"] = "required"
+            contract_data["contracts"][0]["ui_surface"] = "widget"
+            ui_contract_path.write_text(json.dumps(contract_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            required_result = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+            required_check_results = json.loads(
+                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result, 0)
+        entry = check_results["results"][0]
+        self.assertTrue(entry["passed"])
+        self.assertEqual(entry["ui_applicability"], "not_applicable")
+        self.assertEqual(entry["ui_surface"], "none")
+        self.assertFalse(entry["ui_check_applicable"])
+        self.assertEqual(entry["repair_targets"], [])
+        self.assertTrue(all(entry["checks"].values()))
+        self.assertEqual(required_result, 1)
+        required_entry = required_check_results["results"][0]
+        self.assertFalse(required_entry["passed"])
+        self.assertEqual(required_entry["ui_applicability"], "required")
+        self.assertTrue(required_entry["ui_check_applicable"])
+        self.assertEqual(
+            required_entry["repair_targets"],
+            ["eval/benchmarks/sample/workspace/mprs/services/scheduler.py"],
+        )
+
+    def test_ui_contract_openai_provider_uses_schema_prompt(self) -> None:
+        requirement = {
+            "id": "REQ-EMP-ADD",
+            "source": "task.md:3.1",
+            "text": "添加员工：录入姓名、技能集（多选）、每周工时容量（默认40h）",
+            "type": "gui_workflow",
+            "priority": "must",
+        }
+        builder = OpenAICompatibleUIContractBuilder(api_key="test", base_url="https://example.invalid/v1", model="test")
+        captured_payload = {}
+
+        def fake_post(payload: dict) -> dict:
+            captured_payload.update(payload)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "kind": "ui_contract",
+                                    "version": 1,
+                                    "generated_by": "llm",
+                                    "contracts": [
+                                        {
+                                            "requirement_id": "REQ-EMP-ADD",
+                                            "ui_applicability": "required",
+                                            "ui_surface": "widget",
+                                            "ui_contract": {
+                                                "entry_points": ["Employee management panel"],
+                                                "buttons": ["Add employee"],
+                                                "inputs": ["Name field", "Skills multi-select", "Weekly capacity field"],
+                                                "dialogs": ["No modal required; inline feedback is acceptable"],
+                                                "data_display": ["Employee table"],
+                                                "empty_state": "Show an empty employee table message.",
+                                                "success_refresh": "Refresh the employee table after save.",
+                                            },
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+        builder._post_chat_completions = fake_post
+        contract = builder.build([requirement])
+        errors = validate_ui_contract({"requirements": [requirement]}, contract)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(contract["generated_by"], "llm")
+        self.assertEqual(contract["contracts"][0]["ui_applicability"], "required")
+        self.assertEqual(contract["contracts"][0]["ui_surface"], "widget")
+        self.assertIn("Required top-level shape", captured_payload["messages"][0]["content"])
+        self.assertIn("REQ-EMP-ADD", captured_payload["messages"][1]["content"])
+
+    def test_final_acceptance_rejects_writing_system_validation_artifact(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Benchmark project", max_steps=1)
+            target = "state/system_validation/final_acceptance_manifest.json"
+            state = create_initial_state("Benchmark project")
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "title": "Run project-level final acceptance",
+                    "status": "in_progress",
+                    "final_acceptance": True,
+                    "expected_artifacts": [target],
+                    "implementation_artifacts": [],
+                    "worker_test_artifacts": [],
+                    "acceptance_artifacts": [target],
+                    "frozen_acceptance_artifacts": [target],
+                    "test_policy": {
+                        "worker_tests_mutable_by_worker": False,
+                        "acceptance_tests_mutable_by_worker": False,
+                    },
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "FINAL_ACCEPTANCE",
+                    "summary": "System validation.",
+                    "checks": ["python -m agent.system_validation --help"],
+                    "status": "agreed",
+                }
+            ]
+
+            result = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": target,
+                    "args": {"content": "{}", "mode": "overwrite"},
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["final_acceptance_read_only"])
+
+    def test_final_acceptance_allows_inferred_source_repair_only(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "eval" / "benchmarks" / "sample" / "workspace" / "app.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            loop = AgentLoop(root=root, task="Benchmark project", max_steps=1)
+            command = "python -m agent.system_validation --state-dir state --tasks-path state/runtime_tasks.json --requirements-path state/requirements.json"
+            source_target = "eval/benchmarks/sample/workspace/app.py"
+            state = create_initial_state("Benchmark project")
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "title": "Run project-level final acceptance",
+                    "status": "in_progress",
+                    "final_acceptance": True,
+                    "expected_artifacts": ["state/system_validation/final_acceptance_manifest.json"],
+                    "implementation_artifacts": [],
+                    "worker_test_artifacts": [],
+                    "acceptance_artifacts": ["state/system_validation/final_acceptance_manifest.json"],
+                    "frozen_acceptance_artifacts": ["state/system_validation/final_acceptance_manifest.json"],
+                    "test_policy": {
+                        "worker_tests_mutable_by_worker": False,
+                        "acceptance_tests_mutable_by_worker": False,
+                    },
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "FINAL_ACCEPTANCE",
+                    "summary": "System validation.",
+                    "checks": [command],
+                    "status": "agreed",
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": command,
+                "summary": "Command exited with code 1.",
+                "output": f'File "{source_target}", line 1, in <module>\nAssertionError',
+                "targets": [source_target],
+                "repair_targets": [source_target],
+            }
+
+            result = loop._execute_action(
+                {
+                    "action": "edit",
+                    "target": source_target,
+                    "args": {"old": "VALUE = 1", "new": "VALUE = 2"},
+                },
+                state,
+            )
+            source_content = source.read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(source_content, "VALUE = 2\n")
+
+    def test_adjust_mode_allows_workspace_repair_after_completed_final_acceptance(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_target = "eval/benchmarks/sample/workspace/app.py"
+            source = root / source_target
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            tasks_path = state_dir / "generated_tasks.json"
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "depends_on": []},
+                            {"id": "FINAL_ACCEPTANCE", "status": "completed", "depends_on": ["T1"]},
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Fix user-reported generated UI bug",
+                max_steps=1,
+                benchmark_id="sample",
+                interaction_mode="adjust",
+            )
+            loop.tasks_path = tasks_path
+            state = create_initial_state("Fix user-reported generated UI bug")
+            state.interaction_mode = "adjust"
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "title": "Run project-level final acceptance",
+                    "status": "completed",
+                    "final_acceptance": True,
+                    "evidence": ["Previous final validation passed."],
+                }
+            ]
+            action = {
+                "action": "edit",
+                "target": source_target,
+                "args": {"old": "VALUE = 1", "new": "VALUE = 2"},
+            }
+
+            result = loop._execute_action(action, state)
+            loop._update_state(state, action, result)
+            source_content = source.read_text(encoding="utf-8")
+            graph = json.loads(tasks_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.ok)
+        self.assertEqual(source_content, "VALUE = 2\n")
+        self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertEqual(state.pending_repair["reason"], "adjust_mode_user_reported_defect")
+        self.assertEqual(graph["tasks"][1]["status"], "pending")
+
+    def test_adjust_mode_completed_final_acceptance_still_rejects_state_artifact_write(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = "state/benchmarks/sample/system_validation/ui_check_results.json"
+            loop = AgentLoop(
+                root=root,
+                task="Fix user-reported generated UI bug",
+                max_steps=1,
+                benchmark_id="sample",
+                interaction_mode="adjust",
+            )
+            state = create_initial_state("Fix user-reported generated UI bug")
+            state.interaction_mode = "adjust"
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "status": "completed",
+                    "final_acceptance": True,
+                }
+            ]
+
+            result = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": target,
+                    "args": {"content": "{}", "mode": "overwrite"},
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["no_active_task"])
+
+    def test_adjust_mode_answer_waits_for_reopened_final_validation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Fix generated UI", max_steps=1, interaction_mode="adjust")
+            state = create_initial_state("Fix generated UI")
+            state.interaction_mode = "adjust"
+            state.pending_repair = {
+                "reason": "adjust_mode_user_reported_defect",
+                "repair_targets": ["eval/benchmarks/sample/workspace/app.py"],
+            }
+
+            result = loop._execute_action(
+                {
+                    "action": "answer",
+                    "target": "",
+                    "args": {"answer": "Done."},
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["adjust_repair_pending_validation"])
+
+    def test_finish_can_skip_final_acceptance_when_system_validation_disabled(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implement CLI",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "completed",
+                                "acceptance_criteria": ["CLI works."],
+                                "criterion_command_map": {
+                                    "CLI works.": ["python -c \"assert True\""],
+                                },
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
+                                ],
+                                "worker_test_artifacts": [],
+                                "acceptance_artifacts": [],
+                                "frozen_acceptance_artifacts": [],
+                                "test_policy": {
+                                    "acceptance_tests_mutable_by_worker": False,
+                                    "acceptance_test_repair_requires_verifier_approval": True,
+                                },
+                                "verification_commands": ["python -c \"assert True\""],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark project",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+                system_validation=False,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Implement CLI", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
 
         self.assertTrue(result.ok)
         self.assertEqual(result.summary, "Project completed.")
-        self.assertNotIn("hidden_acceptance", result.data["checks"])
-        self.assertFalse((root / "hidden-was-run.txt").exists())
         self.assertEqual([task["id"] for task in data["tasks"]], ["T1"])
-        self.assertEqual(state.task_id, "T1")
 
     def test_finish_rejects_completed_tasks_without_must_requirement_evidence(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -3239,6 +4117,23 @@ class HarnessBehaviorTests(unittest.TestCase):
                                     "eval/benchmarks/sample/workspace/issue_tracker/cli.py",
                                 ],
                                 "verification_commands": ["python -c \"assert True\""],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "title": "Run project-level final acceptance",
+                                "priority": 2,
+                                "depends_on": ["T1"],
+                                "status": "completed",
+                                "requirement_ids": [],
+                                "acceptance_criteria": ["Project acceptance passed."],
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/tests/test_project_acceptance.py",
+                                ],
+                                "implementation_artifacts": [],
+                                "worker_test_artifacts": [
+                                    "eval/benchmarks/sample/workspace/tests/test_project_acceptance.py",
+                                ],
+                                "verification_commands": [],
                             }
                         ]
                     }
@@ -3258,6 +4153,12 @@ class HarnessBehaviorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loop._prepare_runtime_task_graph()
+            ui_results = loop.state_dir / "system_validation" / "ui_check_results.json"
+            ui_results.parent.mkdir(parents=True)
+            ui_results.write_text(
+                json.dumps({"kind": "ui_check_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
             state = create_initial_state("Benchmark project")
             state.task_id = "T1"
             state.nodes = [{"id": "T1", "title": "Implement CLI", "status": "completed", "evidence": []}]
@@ -3267,6 +4168,76 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("must requirements do not have verified evidence", result.summary)
         self.assertIn("REQ-CLI", " ".join(result.data["requirement_evidence_errors"]))
+
+    def test_final_acceptance_rejects_weak_gui_test_file(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_file = root / "eval" / "benchmarks" / "sample" / "workspace" / "tests" / "test_project_acceptance.py"
+            test_file.parent.mkdir(parents=True)
+            test_file.write_text(
+                "def test_window_shell(app):\n"
+                "    assert hasattr(app, 'employee_panel')\n",
+                encoding="utf-8",
+            )
+            requirement = {
+                "id": "REQ-GUI",
+                "source": "task.md:1",
+                "text": "The employee workflow is available from the GUI.",
+                "type": "gui_workflow",
+                "priority": "must",
+                "frozen_acceptance": {
+                    "intent": "Verify GUI behavior.",
+                    "assertion_targets": ["GUI employee workflow changes visible state"],
+                },
+            }
+            task = {
+                "id": "FINAL_ACCEPTANCE",
+                "title": "Run project-level final acceptance",
+                "final_acceptance": True,
+                "requirement_ids": ["REQ-GUI"],
+                "requirements": [requirement],
+                "acceptance_criteria": [
+                    "REQ-GUI: Project acceptance test demonstrates Verify GUI behavior."
+                ],
+                "worker_test_artifacts": [
+                    "eval/benchmarks/sample/workspace/tests/test_project_acceptance.py"
+                ],
+            }
+            evidence = {
+                "task_id": "FINAL_ACCEPTANCE",
+                "requirements": [
+                    {
+                        "id": "REQ-GUI",
+                        "status": "verified",
+                        "evidence": [
+                            {
+                                "type": "automated_test",
+                                "command": "python -m unittest tests.test_project_acceptance",
+                                "test_files": [
+                                    "eval/benchmarks/sample/workspace/tests/test_project_acceptance.py"
+                                ],
+                                "result": "passed",
+                                "assertion_targets": ["GUI employee workflow changes visible state"],
+                            }
+                        ],
+                    }
+                ],
+            }
+            errors = validate_task_requirement_closeout(
+                root=root,
+                task=task,
+                evidence=evidence,
+                command_results=[
+                    {
+                        "command": "python -m unittest tests.test_project_acceptance",
+                        "ok": True,
+                    }
+                ],
+            )
+
+        combined = " ".join(errors)
+        self.assertIn("forbidden weak test marker", combined)
+        self.assertIn("visible widgets, GUI events, or observable widget state", combined)
 
     def test_generated_task_graph_rejects_unknown_contract_task_id(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -4388,6 +5359,94 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("active contract", context)
         self.assertNotIn("old contract", context)
         self.assertNotIn("future contract", context)
+
+    def test_context_builder_includes_active_ui_contract_for_final_acceptance(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            contract_path = state_dir / "system_validation" / "ui_contract.json"
+            contract_path.parent.mkdir(parents=True)
+            contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "ui_contract",
+                        "version": 1,
+                        "generated_by": "llm",
+                        "contracts": [
+                            {
+                                "requirement_id": "REQ-EMP-ADD",
+                                "requirement_text": "添加员工：录入姓名、技能集（多选）、每周工时容量（默认40h）",
+                                "ui_applicability": "required",
+                                "ui_surface": "widget",
+                                "ui_contract": {
+                                    "entry_points": ["Employee management panel"],
+                                    "buttons": ["Add employee"],
+                                    "inputs": ["Name field", "Skills multi-select", "Weekly capacity field"],
+                                    "dialogs": ["No modal required; inline feedback is acceptable"],
+                                    "data_display": ["Employee table"],
+                                    "empty_state": "Show an empty employee table message.",
+                                    "success_refresh": "Refresh the employee table after save.",
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Run final acceptance")
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "status": "in_progress",
+                    "validation_requirement_ids": ["REQ-EMP-ADD"],
+                    "frozen_acceptance_artifacts": [
+                        "state/benchmarks/sample/system_validation/ui_contract.json"
+                    ],
+                }
+            ]
+
+            context = ContextBuilder(root, state_dir=state_dir).build(state)
+
+        self.assertIn("# Active UI Contract", context)
+        self.assertIn("Verifier-owned read-only artifact", context)
+        self.assertIn("REQ-EMP-ADD", context)
+        self.assertIn("ui_applicability: required", context)
+        self.assertIn("ui_surface: widget", context)
+        self.assertIn("Add employee", context)
+        self.assertIn("Skills multi-select", context)
+        self.assertIn("Refresh the employee table after save.", context)
+
+    def test_context_forces_finish_to_schedule_final_validation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": f"T{index}", "status": "completed", "priority": index, "depends_on": []}
+                            for index in range(1, 10)
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T9"
+            state.nodes = [{"id": "T9", "status": "completed", "title": "Final ordinary task"}]
+
+            context = ContextBuilder(root, state_dir=state_dir).build(state)
+
+        self.assertIn("required_next_action:", context)
+        self.assertIn("FINAL_ACCEPTANCE is not scheduled", context)
+        self.assertIn("Next action must be finish target='current_task'", context)
 
     def test_context_builder_keeps_startup_reference_without_later_handoff(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

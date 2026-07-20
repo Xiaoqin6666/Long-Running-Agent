@@ -45,12 +45,15 @@ from agent.skills import (
 )
 from agent.termination import ProjectTerminator
 from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, SearchTool, ToolResult, WriteTool
+from agent.ui_contract import write_ui_contract
 from agent.verifier import Verifier
 
 
 LOGGER = logging.getLogger("long_agent")
 SKILL_REFLECTION_SESSION_THRESHOLD = 5
 SKILL_REFLECTION_ERROR_THRESHOLD = 3
+FINAL_ACCEPTANCE_TASK_ID = "FINAL_ACCEPTANCE"
+FINAL_ACCEPTANCE_VALIDATOR_MODULE = "agent.system_validation"
 
 
 @dataclass
@@ -86,6 +89,7 @@ class AgentLoop:
         benchmark_id: str | None = None,
         auto_resume: bool = False,
         max_sessions: int = 1,
+        system_validation: bool = True,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
         conversation_messages: list[dict[str, str]] | None = None,
         interaction_mode: str = "",
@@ -97,9 +101,10 @@ class AgentLoop:
         self.resume = resume
         self.auto_resume = auto_resume
         self.max_sessions = max(1, max_sessions)
+        self.system_validation = system_validation
         self.event_handler = event_handler
         self.conversation_messages = self._normalize_conversation_messages(conversation_messages or [])
-        self.interaction_mode = interaction_mode if interaction_mode in {"question", "work"} else ""
+        self.interaction_mode = interaction_mode if interaction_mode in {"question", "work", "adjust"} else ""
         self.project_spec_path = project_spec_path
         self.materialize_project_spec = materialize_project_spec
         self.source_tasks_path = tasks_path
@@ -137,7 +142,13 @@ class AgentLoop:
         )
         self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
-        self.terminator = ProjectTerminator(root, tasks_path=self.tasks_path, benchmark_id=self.benchmark_id)
+        self.terminator = ProjectTerminator(
+            root,
+            tasks_path=self.tasks_path,
+            benchmark_id=self.benchmark_id,
+            state_dir=self.state_dir,
+            final_validation_required=self.system_validation,
+        )
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
@@ -248,6 +259,13 @@ class AgentLoop:
             context_snapshot = self._record_context_snapshot(step, state, context)
             try:
                 action = self.decision_maker.next_action(context, state)
+                LOGGER.info(
+                    "Step %s action=%s target=%s starting task_id=%s",
+                    step,
+                    action.get("action", "unknown"),
+                    action.get("target", ""),
+                    state.task_id,
+                )
                 self._emit_event(
                     {
                         "type": "tool_start",
@@ -656,6 +674,9 @@ class AgentLoop:
         if name == "dismiss_skill":
             return self._handle_dismiss_skill_action(action, state)
         if name == "answer":
+            adjust_answer_gate = self._adjust_mode_answer_gate(state)
+            if adjust_answer_gate is not None:
+                return adjust_answer_gate
             if self._is_initializer_task(state) and state.interaction_mode != "question":
                 outputs = self._validate_initializer_outputs()
                 data = dict(outputs.data)
@@ -697,6 +718,9 @@ class AgentLoop:
             repeated_bash = self._reject_repeated_failed_bash(action, state)
             if repeated_bash is not None:
                 return repeated_bash
+        adjust_workspace_write = name in {"edit", "write"} and self._is_adjust_final_workspace_write_allowed(
+            action, state
+        )
         if name in {"edit", "write"} and state.handoff_ready:
             return ToolResult(
                 False,
@@ -707,6 +731,8 @@ class AgentLoop:
             initializer_check = self._validate_initializer_write_action(action, state)
             if initializer_check is not None:
                 return initializer_check
+        elif name in {"edit", "write"} and adjust_workspace_write:
+            pass
         elif name in {"edit", "write"} and not self._active_node(state):
             return ToolResult(
                 False,
@@ -773,6 +799,13 @@ class AgentLoop:
                     "INIT finish rejected: only Verifier PASS may complete initialization.",
                     {"initializer_requires_verification": True, "counts_as_progress": False},
                 )
+            if self.system_validation:
+                final_acceptance = self._ensure_final_acceptance_task_before_finish()
+                if final_acceptance is not None:
+                    if final_acceptance.data.get("task_id") == FINAL_ACCEPTANCE_TASK_ID:
+                        self._apply_orchestrator_selection(state)
+                        self._write_state(state)
+                    return final_acceptance
             termination = self.terminator.evaluate()
             if termination.status == "completed":
                 evidence_errors = self._project_requirement_evidence_errors()
@@ -790,6 +823,9 @@ class AgentLoop:
         if not tool:
             return ToolResult(False, f"Unknown action: {name}", {})
         result = tool.run(action)
+        if result.ok and adjust_workspace_write:
+            result.data["adjust_workspace_write"] = True
+            result.data["final_acceptance_requires_rerun"] = True
         if result.ok and name in {"edit", "write"} and self._is_initializer_task(state):
             post_write_check = self._validate_initializer_artifact_after_write(action, state)
             if post_write_check is not None:
@@ -1277,7 +1313,21 @@ class AgentLoop:
         text = str(command or "").strip()
         text = re.sub(r"\s+2>\s*&\s*1\s*$", "", text)
         text = re.sub(r"\s+", " ", text)
+        text = self._strip_command_directory_prefix(text)
         return text.strip()
+
+    def _strip_command_directory_prefix(self, command: str) -> str:
+        text = command.strip()
+        for _ in range(3):
+            match = re.match(
+                r"^(?:cd|Set-Location)\s+(?:\"[^\"]+\"|'[^']+'|[^;&|]+)\s*(?:&&|;)\s*(.+)$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                break
+            text = match.group(1).strip()
+        return text
 
     def _dedupe_contracts(self, state: TaskState) -> None:
         deduped: dict[tuple[object, object], dict[str, Any]] = {}
@@ -1362,6 +1412,9 @@ class AgentLoop:
 
     def _test_repair_explicitly_allowed(self, target: str, state: TaskState) -> bool:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        failure_type = str(repair.get("command_failure_type", ""))
+        if failure_type not in {"command_syntax_error", "command_environment_error"}:
+            return False
         allowed = repair.get("allow_test_repair")
         if allowed is True:
             return True
@@ -1373,10 +1426,10 @@ class AgentLoop:
     def _is_test_repair_allowed(self, target: str, state: TaskState) -> bool:
         if not self._looks_like_test_artifact(target):
             return True
+        if self._is_frozen_acceptance_artifact(target, state):
+            return self._test_repair_explicitly_allowed(target, state)
         if self._test_repair_explicitly_allowed(target, state):
             return True
-        if self._is_frozen_acceptance_artifact(target, state):
-            return False
         normalized = self._normalize_target(target)
         policy = self._active_task_test_policy(state)
         acceptance_tests = {self._normalize_target(item) for item in self._active_task_acceptance_artifacts(state)}
@@ -1577,6 +1630,8 @@ class AgentLoop:
                 evidence_type="verifier_passed",
             )
             self._maybe_create_pending_skill_review(state, active_task_id, observation)
+        if name in {"write", "edit"} and observation.ok and observation.data.get("adjust_workspace_write") is True:
+            self._mark_final_acceptance_stale_after_adjust_write(state, action)
         self._record_failure_pattern(state, active_task_id, action, observation)
         self._update_pending_repair(state, action, observation)
 
@@ -1843,6 +1898,57 @@ class AgentLoop:
                     self._normalize_target(item) for item in repaired_targets
                 }:
                     repaired_targets.append(target)
+
+    def _mark_final_acceptance_stale_after_adjust_write(self, state: TaskState, action: dict[str, Any]) -> None:
+        target = self._normalize_target(action.get("target", ""))
+        summary = (
+            "Adjust-mode workspace repair changed generated project code after FINAL_ACCEPTANCE; "
+            "final validation must be rerun."
+        )
+        for node in state.nodes:
+            if str(node.get("id", "")) != FINAL_ACCEPTANCE_TASK_ID:
+                continue
+            if str(node.get("status", "")).lower() in {"completed", "done", "pending"}:
+                node["status"] = "in_progress"
+            evidence = node.setdefault("evidence", [])
+            if isinstance(evidence, list) and summary not in evidence:
+                evidence.append(summary)
+        if not state.pending_repair:
+            state.pending_repair = {
+                "reason": "adjust_mode_user_reported_defect",
+                "summary": summary,
+                "targets": [target],
+                "repair_targets": [target],
+                "required_reads": [],
+                "read_targets": [],
+                "repaired_targets": [],
+                "created_at": utc_now(),
+            }
+        self._mark_task_graph_final_acceptance_pending(summary)
+
+    def _mark_task_graph_final_acceptance_pending(self, summary: str) -> None:
+        if not self.tasks_path or not self.tasks_path.exists():
+            return
+        try:
+            data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        if not isinstance(tasks, list):
+            return
+        changed = False
+        for task in tasks:
+            if not isinstance(task, dict) or str(task.get("id", "")) != FINAL_ACCEPTANCE_TASK_ID:
+                continue
+            if str(task.get("status", "")).lower() in {"completed", "done"}:
+                task["status"] = "pending"
+                changed = True
+            evidence = task.setdefault("evidence", [])
+            if isinstance(evidence, list) and summary not in evidence:
+                evidence.append(summary)
+                changed = True
+        if changed:
+            self.tasks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _preserve_pending_repair_reads(self, state: TaskState, required_reads: list[str]) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
@@ -2476,6 +2582,199 @@ class AgentLoop:
             state_dir=self.state_dir,
         )
 
+    def _ensure_final_acceptance_task_before_finish(self) -> ToolResult | None:
+        if not self.tasks_path or not self.tasks_path.exists():
+            return None
+        try:
+            data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return ToolResult(
+                False,
+                f"Finish rejected: task graph could not be loaded before final acceptance: {exc}.",
+                {"final_acceptance_error": str(exc)},
+            )
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        if not isinstance(tasks, list):
+            return None
+        task_items = [task for task in tasks if isinstance(task, dict)]
+        final_task = next((task for task in task_items if str(task.get("id", "")) == FINAL_ACCEPTANCE_TASK_ID), None)
+        if final_task is not None:
+            if self._task_status(final_task) in {"completed", "done"}:
+                return None
+            return ToolResult(
+                False,
+                "Finish rejected: project-level final acceptance must pass before project completion.",
+                {
+                    "final_acceptance_required": True,
+                    "task_id": FINAL_ACCEPTANCE_TASK_ID,
+                    "status": self._task_status(final_task),
+                },
+            )
+        required = [
+            task
+            for task in task_items
+            if task.get("optional") is not True
+            and str(task.get("id", "")) != FINAL_ACCEPTANCE_TASK_ID
+        ]
+        if not required:
+            return None
+        incomplete = [
+            str(task.get("id", ""))
+            for task in required
+            if self._task_status(task) not in {"completed", "done"}
+        ]
+        if incomplete:
+            return None
+        created = self._build_final_acceptance_task(task_items)
+        tasks.append(created)
+        self.tasks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return ToolResult(
+            False,
+            "Finish rejected: project-level final acceptance task was created and must pass before finish.",
+            {
+                "final_acceptance_task_created": True,
+                "task_id": FINAL_ACCEPTANCE_TASK_ID,
+                "validation_artifacts": created.get("frozen_acceptance_artifacts", []),
+                "depends_on": created["depends_on"],
+                "requirement_ids": created.get("validation_requirement_ids", created.get("requirement_ids", [])),
+            },
+        )
+
+    def _build_final_acceptance_task(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        requirements = self._must_requirement_snapshots()
+        requirement_ids = [str(item.get("id", "")).strip() for item in requirements if str(item.get("id", "")).strip()]
+        if requirements:
+            criteria = [
+                f"{item['id']}: Project acceptance test demonstrates {self._requirement_acceptance_text(item)}"
+                for item in requirements
+                if str(item.get("id", "")).strip()
+            ]
+        else:
+            criteria = [
+                "Project acceptance test starts the application and exercises the primary user-visible workflows before finish."
+            ]
+        validation_artifacts = self._ensure_final_acceptance_artifacts(criteria, requirements)
+        validation_command = self._final_acceptance_validation_command()
+        dependency_ids = [
+            str(task.get("id", "")).strip()
+            for task in tasks
+            if task.get("optional") is not True
+            and str(task.get("id", "")).strip()
+            and str(task.get("id", "")).strip() != FINAL_ACCEPTANCE_TASK_ID
+        ]
+        priorities = []
+        for task in tasks:
+            try:
+                priorities.append(int(task.get("priority", 1000)))
+            except (TypeError, ValueError):
+                priorities.append(1000)
+        return {
+            "id": FINAL_ACCEPTANCE_TASK_ID,
+            "title": "Run project-level final acceptance",
+            "priority": (max(priorities) + 1) if priorities else 1000,
+            "depends_on": dependency_ids,
+            "status": "pending",
+            "requirement_ids": [],
+            "validation_requirement_ids": requirement_ids,
+            "requirements": requirements,
+            "acceptance_criteria": criteria,
+            "expected_artifacts": validation_artifacts,
+            "implementation_artifacts": [],
+            "worker_test_artifacts": [],
+            "acceptance_artifacts": validation_artifacts,
+            "frozen_acceptance_artifacts": validation_artifacts,
+            "test_policy": {
+                "worker_tests_mutable_by_worker": False,
+                "acceptance_tests_mutable_by_worker": False,
+                "acceptance_test_repair_requires_verifier_approval": True,
+            },
+            "verification_commands": [validation_command],
+            "verification_assets": [],
+            "criterion_command_map": {criterion: [validation_command] for criterion in criteria},
+            "final_acceptance": True,
+            "system_owned_validation": True,
+        }
+
+    def _ensure_final_acceptance_artifacts(
+        self,
+        criteria: list[str],
+        requirements: list[dict[str, Any]],
+    ) -> list[str]:
+        manifest = self.state_dir / "system_validation" / "final_acceptance_manifest.json"
+        ui_contract_path = self.state_dir / "system_validation" / "ui_contract.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        write_ui_contract(ui_contract_path, requirements, provider=self.provider)
+        payload = {
+            "kind": "system_owned_final_acceptance",
+            "validator": FINAL_ACCEPTANCE_VALIDATOR_MODULE,
+            "criteria": criteria,
+            "requirements": requirements,
+            "tasks_path": self._rel(self.tasks_path) if self.tasks_path else "",
+            "requirements_path": self._rel(self.requirements_path),
+            "ui_contract_path": self._rel(ui_contract_path),
+            "created_by": "harness",
+        }
+        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return [
+            self._normalize_target(self._rel(manifest)),
+            self._normalize_target(self._rel(ui_contract_path)),
+        ]
+
+    def _final_acceptance_validation_command(self) -> str:
+        argv = [
+            "--root",
+            self._normalize_target(str(self.root.resolve())),
+            "--state-dir",
+            self._normalize_target(self._rel(self.state_dir)),
+            "--requirements-path",
+            self._normalize_target(self._rel(self.requirements_path)),
+        ]
+        if self.tasks_path:
+            argv.extend(["--tasks-path", self._normalize_target(self._rel(self.tasks_path))])
+        if self.benchmark_id:
+            argv.extend(["--benchmark-id", self.benchmark_id])
+        root_literal = repr(self._normalize_target(str(self.root.resolve())))
+        argv_literal = repr(argv)
+        return (
+            'python -c "import sys; '
+            f"sys.path.insert(0, {root_literal}); "
+            f"from {FINAL_ACCEPTANCE_VALIDATOR_MODULE} import main; "
+            f"raise SystemExit(main({argv_literal}))\""
+        )
+
+    def _must_requirement_snapshots(self) -> list[dict[str, Any]]:
+        if not self.requirements_path.exists():
+            return []
+        try:
+            data = json.loads(self.requirements_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        requirements = data.get("requirements", []) if isinstance(data, dict) else []
+        if not isinstance(requirements, list):
+            return []
+        return [
+            dict(item)
+            for item in requirements
+            if isinstance(item, dict)
+            and str(item.get("priority", "")).strip().lower() == "must"
+            and str(item.get("id", "")).strip()
+        ]
+
+    @staticmethod
+    def _requirement_acceptance_text(requirement: dict[str, Any]) -> str:
+        frozen = requirement.get("frozen_acceptance")
+        if isinstance(frozen, dict) and str(frozen.get("intent", "")).strip():
+            return str(frozen["intent"]).strip()
+        for key in ("acceptance_intent", "text"):
+            text = str(requirement.get(key, "")).strip()
+            if text:
+                return text
+        return str(requirement.get("id", "the requirement")).strip()
+
+    @staticmethod
+    def _task_status(task: dict[str, Any]) -> str:
+        return str(task.get("status", "pending") or "pending").strip().lower()
+
     def _active_verification_commands(self, state: TaskState) -> list[str]:
         active = self._active_node(state)
         if not active and self._is_initializer_task(state):
@@ -2966,6 +3265,31 @@ class AgentLoop:
 
     def _implementation_write_test_gate(self, action: dict[str, Any], state: TaskState) -> ToolResult | None:
         target = self._normalize_target(action.get("target", ""))
+        active = self._active_task_metadata(state)
+        if active.get("final_acceptance") is True:
+            repair_targets = {self._normalize_target(item) for item in self._pending_repair_write_targets(state)}
+            if target in repair_targets and not self._looks_like_test_artifact(target):
+                return None
+            return ToolResult(
+                False,
+                (
+                    "Write rejected: FINAL_ACCEPTANCE uses system-owned validation artifacts. "
+                    "Only implementation repair targets inferred from a failed validation run are writable."
+                ),
+                {
+                    "final_acceptance_read_only": True,
+                    "repair_targets": sorted(repair_targets),
+                },
+            )
+        if self._looks_like_test_artifact(target) and not self._is_test_repair_allowed(target, state):
+            return ToolResult(
+                False,
+                "Write rejected: frozen or acceptance-owned test artifacts are read-only for this task.",
+                {
+                    "test_artifact_read_only": True,
+                    "target": target,
+                },
+            )
         implementation_artifacts = {
             self._normalize_target(item)
             for item in self._active_task_implementation_artifacts(state)
@@ -2983,6 +3307,61 @@ class AgentLoop:
             False,
             "Write rejected: create the active task's worker test artifacts before implementation code.",
             {"missing_worker_test_artifacts": missing_tests},
+        )
+
+    def _is_adjust_final_workspace_write_allowed(self, action: dict[str, Any], state: TaskState) -> bool:
+        if state.interaction_mode != "adjust":
+            return False
+        if not self._has_final_acceptance_scope(state):
+            return False
+        workspace_root = self._expected_initializer_workspace_root()
+        if not workspace_root:
+            return False
+        target = self._normalize_target(action.get("target", ""))
+        if not target:
+            return False
+        try:
+            workspace_path = (self.root / workspace_root).resolve()
+            target_path = (self.root / target).resolve()
+            target_path.relative_to(workspace_path)
+        except (OSError, ValueError):
+            return False
+        return target_path != workspace_path
+
+    def _has_final_acceptance_scope(self, state: TaskState) -> bool:
+        if state.task_id == FINAL_ACCEPTANCE_TASK_ID:
+            return True
+        if any(str(node.get("id", "")) == FINAL_ACCEPTANCE_TASK_ID for node in state.nodes):
+            return True
+        if not self.tasks_path or not self.tasks_path.exists():
+            return False
+        try:
+            data = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        return any(
+            isinstance(task, dict) and str(task.get("id", "")) == FINAL_ACCEPTANCE_TASK_ID
+            for task in tasks
+        )
+
+    def _adjust_mode_answer_gate(self, state: TaskState) -> ToolResult | None:
+        if state.interaction_mode != "adjust":
+            return None
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        if repair.get("reason") != "adjust_mode_user_reported_defect":
+            return None
+        return ToolResult(
+            False,
+            (
+                "Answer rejected: adjust-mode workspace repair invalidated the previous FINAL_ACCEPTANCE. "
+                "Run verifier or the final validation command before answering."
+            ),
+            {
+                "adjust_repair_pending_validation": True,
+                "repair_targets": self._pending_repair_write_targets(state),
+                "required_action": "verify_or_final_validation",
+            },
         )
 
     def _pending_managed_contract_for_active_task(self, state: TaskState) -> dict[str, Any] | None:

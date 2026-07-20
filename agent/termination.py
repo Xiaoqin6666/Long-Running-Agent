@@ -39,16 +39,21 @@ class ProjectTerminator:
         root: Path,
         tasks_path: Path | None = None,
         benchmark_id: str | None = None,
+        state_dir: Path | None = None,
+        final_validation_required: bool = False,
     ) -> None:
         self.root = root
         self.tasks_path = tasks_path or root / "tasks.json"
         self.benchmark_id = benchmark_id
+        self.state_dir = state_dir or root / "state"
+        self.final_validation_required = final_validation_required
 
     def evaluate(self, signals: dict[str, Any] | None = None) -> TerminationResult:
         signals = signals or {}
         tasks = self._load_tasks()
         checks = {
             "tasks": evaluate_task_graph(tasks),
+            "final_validation": self._final_validation(tasks),
             "regression": self._run_regression(),
             "git_clean": self._git_clean(),
             "budget": evaluate_budget(signals),
@@ -66,6 +71,74 @@ class ProjectTerminator:
         if not isinstance(tasks, list):
             return []
         return [task for task in tasks if isinstance(task, dict)]
+
+    def _final_validation(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self.final_validation_required:
+            return {"ok": True, "skipped": True, "summary": "Final system validation is not required."}
+        required = [
+            task
+            for task in tasks
+            if task.get("optional") is not True and str(task.get("id", "")).strip() != "FINAL_ACCEPTANCE"
+        ]
+        if not required:
+            return {"ok": True, "skipped": True, "summary": "No required generated tasks need final validation."}
+        incomplete = [
+            str(task.get("id", "")).strip()
+            for task in required
+            if normalize_status(task.get("status")) not in COMPLETED_STATUSES
+        ]
+        if incomplete:
+            return {
+                "ok": False,
+                "reason": "ordinary_tasks_incomplete",
+                "remaining_task_ids": incomplete,
+                "summary": "Final system validation waits for all ordinary required tasks to complete.",
+            }
+        final_task = next((task for task in tasks if str(task.get("id", "")).strip() == "FINAL_ACCEPTANCE"), None)
+        if not final_task:
+            return {
+                "ok": False,
+                "reason": "final_acceptance_not_scheduled",
+                "summary": "FINAL_ACCEPTANCE is missing; run finish to schedule project-level UI/system validation.",
+            }
+        status = normalize_status(final_task.get("status"))
+        if status not in COMPLETED_STATUSES:
+            return {
+                "ok": False,
+                "reason": "final_acceptance_not_completed",
+                "status": status,
+                "summary": "FINAL_ACCEPTANCE must pass before project termination.",
+            }
+        ui_results_path = self.state_dir / "system_validation" / "ui_check_results.json"
+        if not ui_results_path.exists():
+            return {
+                "ok": False,
+                "reason": "ui_check_results_missing",
+                "path": str(ui_results_path),
+                "summary": "FINAL_ACCEPTANCE completed but ui_check_results.json is missing.",
+            }
+        try:
+            ui_results = json.loads(ui_results_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "ok": False,
+                "reason": "ui_check_results_unreadable",
+                "path": str(ui_results_path),
+                "summary": f"ui_check_results.json could not be loaded: {exc}",
+            }
+        if ui_results.get("passed") is not True:
+            return {
+                "ok": False,
+                "reason": "ui_check_results_failed",
+                "path": str(ui_results_path),
+                "summary": "ui_check_results.json shows UI/system validation has not passed.",
+            }
+        return {
+            "ok": True,
+            "task_id": "FINAL_ACCEPTANCE",
+            "ui_check_results_path": str(ui_results_path),
+            "summary": "FINAL_ACCEPTANCE and UI/system validation passed.",
+        }
 
     def _run_regression(self) -> dict[str, Any]:
         if self.benchmark_id:
@@ -180,6 +253,7 @@ def decide_termination(checks: dict[str, Any]) -> TerminationResult:
 
     success_checks = [
         checks["tasks"]["ok"],
+        checks.get("final_validation", {"ok": True})["ok"],
         checks["regression"]["ok"],
         checks["git_clean"]["ok"],
     ]
@@ -189,6 +263,8 @@ def decide_termination(checks: dict[str, Any]) -> TerminationResult:
     reasons = []
     if not checks["tasks"]["ok"]:
         reasons.append("required_tasks_not_completed")
+    if not checks.get("final_validation", {"ok": True})["ok"]:
+        reasons.append("final_validation_not_passing")
     if not checks["regression"]["ok"]:
         reasons.append("regression_not_passing")
     if not checks["git_clean"]["ok"]:

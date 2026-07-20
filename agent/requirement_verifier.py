@@ -11,11 +11,24 @@ WEAK_TEST_MARKERS = (
     "@pytest.mark.xfail",
     "unittest.skip(",
     "@unittest.skip",
+    "assert true",
+    "self.asserttrue(true",
+    "hasattr(",
     "assert app is not none",
     "assert callable(",
     "assert isinstance(result, dict)",
     "assert isinstance(report, dict)",
     "assert isinstance(conflicts, list)",
+)
+GUI_FINAL_ACCEPTANCE_MARKERS = (
+    ".invoke(",
+    "event_generate(",
+    "winfo_children(",
+    "tabs()",
+    "nametowidget(",
+    "assertgreater(",
+    "assert greater",
+    "assert len(",
 )
 
 
@@ -161,6 +174,8 @@ def validate_task_requirement_closeout(
                 + "."
             )
     errors.extend(validate_verification_asset_files(root=root, task=task))
+    if task.get("final_acceptance") is True:
+        errors.extend(validate_final_acceptance_test_files(root=root, task=task))
     return errors
 
 
@@ -183,6 +198,44 @@ def validate_verification_asset_files(*, root: Path, task: dict[str, Any]) -> li
             if marker in text:
                 errors.append(f"Verification asset {path_text} contains forbidden weak test marker: {marker}.")
     return errors
+
+
+def validate_final_acceptance_test_files(*, root: Path, task: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    test_files = _final_acceptance_artifacts(task)
+    if not test_files:
+        return ["Final acceptance task must declare a project-level frozen or acceptance validation artifact."]
+    gui_like = _task_is_gui_like(task)
+    for test_file in test_files:
+        path = (root / test_file).resolve()
+        try:
+            path.relative_to(root.resolve())
+        except (OSError, ValueError):
+            errors.append(f"Final acceptance test file is outside workspace: {test_file}.")
+            continue
+        if not path.is_file():
+            errors.append(f"Final acceptance test file does not exist: {test_file}.")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace").lower()
+        for marker in WEAK_TEST_MARKERS:
+            if marker in text:
+                errors.append(f"Final acceptance test {test_file} contains forbidden weak test marker: {marker}.")
+        if "assert" not in text:
+            errors.append(f"Final acceptance test {test_file} must contain concrete assertions.")
+        if gui_like and not any(marker in text for marker in GUI_FINAL_ACCEPTANCE_MARKERS):
+            errors.append(
+                f"Final acceptance GUI test {test_file} must exercise visible widgets, GUI events, or observable widget state."
+            )
+    return errors
+
+
+def _final_acceptance_artifacts(task: dict[str, Any]) -> list[str]:
+    artifacts: list[str] = []
+    for key in ("frozen_acceptance_artifacts", "acceptance_artifacts", "worker_test_artifacts"):
+        for item in _normalized_list(task.get(key)):
+            if item not in artifacts:
+                artifacts.append(item)
+    return artifacts
 
 
 def load_task_requirement_evidence(state_dir: Path, task_id: str) -> dict[str, Any] | None:
@@ -272,7 +325,7 @@ def _contract_evidence_entries_by_requirement(
         return {}
     requirement_ids = _normalized_list(task.get("requirement_ids"))
     frozen_targets = _frozen_targets_by_requirement(task)
-    test_files = _normalized_list(task.get("worker_test_artifacts"))
+    test_files = _final_acceptance_artifacts(task)
     if not test_files:
         test_files = [
             artifact
@@ -363,6 +416,24 @@ def _requirement_needs_test_asset(task: dict[str, Any], requirement_id: str) -> 
         requirement_type = str(snapshot.get("type", "")).strip().lower()
         return requirement_type in {"gui_workflow", "workflow", "persistence", "report", "scheduling"}
     return False
+
+
+def _task_is_gui_like(task: dict[str, Any]) -> bool:
+    parts: list[str] = [
+        str(task.get("title", "")),
+        " ".join(str(item) for item in _normalized_list(task.get("acceptance_criteria"))),
+    ]
+    snapshots = task.get("requirements", [])
+    if isinstance(snapshots, list):
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            parts.extend(
+                str(snapshot.get(key, ""))
+                for key in ("id", "text", "type", "acceptance_intent")
+            )
+    text = " ".join(parts).lower()
+    return any(marker in text for marker in ("gui", "ui", "tkinter", "window", "panel", "tab", "button", "图形界面"))
 
 
 def _normalized_list(value: object) -> list[str]:

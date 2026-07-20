@@ -418,6 +418,8 @@ The threshold is not the model provider's real context limit. It is an artificia
 
 Detailed machine-readable handoff data should be stored in `<active_state_dir>/handoff_payload.json`, not embedded wholesale into `<active_state_dir>/handoff.md`. This keeps the human handoff short while preserving full state for tooling.
 
+On the first call of a resumed Worker session, the context builder rebuilds Critical and Working Context from persisted state and task graphs. It extracts only Resume Guidance from `handoff.md` so duplicated active-task, contract, and last-step summaries are not repeated in the model context.
+
 This structure is intentionally more detailed than a summary. It is designed to test whether a fresh Worker can continue the task without access to the previous conversation.
 
 ## 8. Self-Verification

@@ -45,6 +45,7 @@ class ContextBuilder:
             "# Critical Context",
             "This section contains immediate operational state and the benchmark safety boundary.",
             f"- current_task_id: {self._active_task_id(state)}",
+            f"- required_next_action: {self._required_next_action(state)}",
             "",
             "## Last Step Summary",
             self._last_step_summary(state),
@@ -199,6 +200,8 @@ class ContextBuilder:
             "",
             f"# Interaction Mode\n{state.interaction_mode or 'non-interactive'}",
             "",
+            *self._interaction_mode_instruction_lines(state),
+            "",
             "# Acceptance Criteria",
             *[f"- {item}" for item in state.acceptance_criteria],
             "",
@@ -212,6 +215,8 @@ class ContextBuilder:
             "",
             "# Active Task Artifact Policy",
             *self._artifact_policy_lines(state),
+            "",
+            self._active_ui_contract_context(state),
             "",
             "# Active Acceptance Contract",
             *([self._format_contract(item) for item in self._active_acceptance_contracts(state)] or ["- none"]),
@@ -229,6 +234,20 @@ class ContextBuilder:
             self._recent_step_trace_context(state),
         ]
         return "\n".join(lines)
+
+    def _interaction_mode_instruction_lines(self, state: TaskState) -> list[str]:
+        if state.interaction_mode != "adjust":
+            return []
+        return [
+            "# Adjust Mode Instructions",
+            "- Treat the latest user message as change guidance for the existing run.",
+            "- Do not restart INIT, regenerate the project spec, clear current state, or rebuild the whole task graph from scratch.",
+            "- Preserve completed work, verifier evidence, handoff context, and frozen generated-task requirements.",
+            "- Make targeted implementation, test, or plan updates that satisfy the requested adjustment.",
+            "- If FINAL_ACCEPTANCE is already completed and the user reports a real generated-app defect, inspect and repair the generated workspace files directly; the harness will reopen FINAL_ACCEPTANCE for rerun.",
+            "- After any adjust-mode code edit, run verifier or the project final validation command before answering.",
+            "- If the adjustment conflicts with frozen requirements or verified evidence, use answer or update_plan to explain the conflict instead of weakening prior requirements.",
+        ]
 
     def _tool_use_reference_context(self) -> str:
         lines = [
@@ -251,7 +270,7 @@ class ContextBuilder:
             "- save_skill: submit a reusable procedure candidate; args.name, description, instruction, optional examples, evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Prefer immutable report_id references. Free-text evidence is rejected.",
             "- dismiss_skill: decline the current Pending Skill Reflection; target='<report_id>'; args.reason='<why this is not reusable>'.",
             "- save_memory: store durable cross-session memory; args.name, description, type='user|feedback|project|reference', content. Feedback must include why and how_to_apply or explicit Why/How sections. Project dates must be absolute, not relative.",
-            "- finish: project-level termination only after verifier/project completion evidence; target='current_task'; args={}.",
+            "- finish: project-level termination only after verifier/project completion evidence, including harness-created FINAL_ACCEPTANCE when scheduled; target='current_task'; args={}.",
         ]
         return "\n".join(lines)
 
@@ -963,6 +982,13 @@ class ContextBuilder:
                 "Next action must be save_skill with the archived verifier report evidence, or dismiss_skill with a concrete reason. "
                 "Do not continue ordinary task work until this review is resolved."
             )
+        final_gate = self._final_validation_gate_status()
+        if final_gate.get("required_action") == "finish":
+            return (
+                "All ordinary required tasks are complete, but FINAL_ACCEPTANCE is not scheduled. "
+                "Next action must be finish target='current_task' to let the harness create the project-level UI/system validation task. "
+                "Do not use read, verify, update_plan, or answer as a substitute for scheduling final validation."
+            )
         initializer_repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
         if initializer_repair:
             candidate = str(initializer_repair.get("candidate_path", ""))
@@ -1011,7 +1037,7 @@ class ContextBuilder:
                 "The harness rejected the previous action because the last acceptance command failed. "
                 f"Next action must be write or edit one of these implementation artifacts: {target_text}. "
                 "Do not list directories, reread files, or rerun tests before making a repair. "
-                "Frozen acceptance tests are read-only unless allow_test_repair is explicitly set."
+                "Frozen acceptance tests are read-only unless the harness explicitly allows syntax/import/environment repair."
             )
         diagnostic_targets = self._pending_repair_targets(state)
         if diagnostic_targets:
@@ -1058,7 +1084,7 @@ class ContextBuilder:
                 "The last acceptance or verification command failed. "
                 f"Next action must be write or edit one of these implementation artifacts: {', '.join(repair_targets)}. "
                 f"Start with {repair_targets[0]}. "
-                "Worker-owned tests may be edited before contract freeze, but frozen acceptance tests must not be modified unless the harness explicitly marks allow_test_repair=true. "
+                "Worker-owned tests may be edited before contract freeze, but frozen acceptance tests must not be modified unless the harness explicitly allows syntax/import/environment repair. "
                 "Do not list directories, reread files, or rerun tests before making a repair. "
                 f"Failure excerpt: {excerpt}"
             )
@@ -1081,6 +1107,48 @@ class ContextBuilder:
             "Next action should be write with args.mode='overwrite' and a complete implementation for that file. "
             "Do not list directories, rerun tests, or reread the same empty file before writing it."
         )
+
+    def _final_validation_gate_status(self) -> dict[str, object]:
+        tasks_path = self._active_task_graph_path()
+        if not tasks_path:
+            return {"ok": True}
+        try:
+            data = json.loads(tasks_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return {"ok": True}
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list):
+            return {"ok": True}
+        task_items = [task for task in tasks if isinstance(task, dict)]
+        required = [
+            task
+            for task in task_items
+            if task.get("optional") is not True and str(task.get("id", "")).strip() != "FINAL_ACCEPTANCE"
+        ]
+        if not required:
+            return {"ok": True}
+        incomplete = [
+            task
+            for task in required
+            if str(task.get("status", "pending")).strip().lower() not in {"completed", "done"}
+        ]
+        if incomplete:
+            return {"ok": True}
+        final_task = next((task for task in task_items if str(task.get("id", "")).strip() == "FINAL_ACCEPTANCE"), None)
+        if final_task is None:
+            return {"ok": False, "required_action": "finish", "reason": "final_acceptance_not_scheduled"}
+        status = str(final_task.get("status", "pending")).strip().lower()
+        if status not in {"completed", "done"}:
+            return {"ok": False, "required_action": "run_final_validation", "reason": "final_acceptance_not_completed"}
+        return {"ok": True}
+
+    def _active_task_graph_path(self) -> Path | None:
+        for name in ("runtime_tasks.json", "generated_tasks.json"):
+            path = self.state_dir / name
+            if path.exists():
+                return path
+        path = self.root / "tasks.json"
+        return path if path.exists() else None
 
     def _skill_reflection_context(self, state: TaskState) -> str:
         review = state.pending_skill_review if isinstance(state.pending_skill_review, dict) else {}
@@ -1206,6 +1274,93 @@ class ContextBuilder:
             "- Rule: frozen or contract acceptance tests are not repair targets by default; worker tests are repair targets only when test_policy.worker_tests_mutable_by_worker is true.",
         ]
 
+    def _active_ui_contract_context(self, state: TaskState) -> str:
+        path = self._active_ui_contract_path(state)
+        if path is None:
+            return "# Active UI Contract\n\nNo active UI Contract artifact."
+        rel_path = self._rel(path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"# Active UI Contract\n\n- {rel_path}: unreadable ({exc})"
+        contracts = data.get("contracts") if isinstance(data, dict) else None
+        if not isinstance(contracts, list):
+            return f"# Active UI Contract\n\n- {rel_path}: contracts list missing."
+        wanted_ids = self._active_ui_contract_requirement_ids(state)
+        lines = [
+            "# Active UI Contract",
+            f"Verifier-owned read-only artifact: {rel_path}. Use it as the UI implementation/repair checklist; do not edit it.",
+        ]
+        rendered = 0
+        render_limit = None if self._active_task_id(state) == "FINAL_ACCEPTANCE" else 12
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            requirement_id = str(contract.get("requirement_id", "")).strip()
+            if wanted_ids and requirement_id not in wanted_ids:
+                continue
+            ui_contract = contract.get("ui_contract", {})
+            if not isinstance(ui_contract, dict):
+                continue
+            rendered += 1
+            lines.extend(
+                [
+                    f"- {requirement_id or 'UNKNOWN'}: {str(contract.get('requirement_text', '')).strip()[:180]}",
+                    f"  ui_applicability: {str(contract.get('ui_applicability', 'required')).strip() or 'required'}",
+                    f"  ui_surface: {str(contract.get('ui_surface', 'widget')).strip() or 'widget'}",
+                    f"  entry_points: {self._format_ui_contract_value(ui_contract.get('entry_points'))}",
+                    f"  buttons: {self._format_ui_contract_value(ui_contract.get('buttons'))}",
+                    f"  inputs: {self._format_ui_contract_value(ui_contract.get('inputs'))}",
+                    f"  dialogs: {self._format_ui_contract_value(ui_contract.get('dialogs'))}",
+                    f"  data_display: {self._format_ui_contract_value(ui_contract.get('data_display'))}",
+                    f"  empty_state: {self._format_ui_contract_value(ui_contract.get('empty_state'))}",
+                    f"  success_refresh: {self._format_ui_contract_value(ui_contract.get('success_refresh'))}",
+                ]
+            )
+            if render_limit is not None and rendered >= render_limit:
+                lines.append(f"- UI Contract truncated after {render_limit} requirement entries.")
+                break
+        if rendered == 0:
+            lines.append("- No contract entries matched the active task requirements.")
+        return "\n".join(lines)
+
+    def _active_ui_contract_path(self, state: TaskState) -> Path | None:
+        for artifact in self._active_task_frozen_acceptance_artifacts(state):
+            normalized = artifact.replace("\\", "/").strip()
+            if normalized.endswith("ui_contract.json"):
+                return Path(artifact) if Path(artifact).is_absolute() else self.root / artifact
+        if self._active_task_id(state) == "FINAL_ACCEPTANCE":
+            path = self.state_dir / "system_validation" / "ui_contract.json"
+            if path.exists():
+                return path
+        return None
+
+    def _active_ui_contract_requirement_ids(self, state: TaskState) -> set[str]:
+        ids: set[str] = set()
+        for node in state.nodes:
+            if node.get("status") not in {"in_progress", "pending"}:
+                continue
+            for key in ("validation_requirement_ids", "requirement_ids"):
+                values = node.get(key, [])
+                if isinstance(values, list):
+                    ids.update(str(item).strip() for item in values if str(item).strip())
+            requirements = node.get("requirements", [])
+            if isinstance(requirements, list):
+                ids.update(
+                    str(item.get("id", "")).strip()
+                    for item in requirements
+                    if isinstance(item, dict) and str(item.get("id", "")).strip()
+                )
+        return ids
+
+    def _format_ui_contract_value(self, value: object) -> str:
+        if isinstance(value, list):
+            text = ", ".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+        text = text.replace("\n", " ")
+        return text[:500] if text else "none"
+
     def _missing_active_owned_artifacts(self, state: TaskState) -> list[str]:
         owned: list[str] = []
         for artifact in [
@@ -1309,10 +1464,21 @@ class ContextBuilder:
         if not self._looks_like_test_artifact(target):
             return True
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        if repair.get("allow_test_repair") is True:
-            return True
+        explicit_test_repair = False
+        if str(repair.get("command_failure_type", "")) in {"command_syntax_error", "command_environment_error"}:
+            allowed = repair.get("allow_test_repair")
+            if allowed is True:
+                explicit_test_repair = True
+            elif isinstance(allowed, list):
+                normalized = target.replace("\\", "/").strip().rstrip("/")
+                explicit_test_repair = normalized in {
+                    item.replace("\\", "/").strip().rstrip("/")
+                    for item in allowed
+                }
         if self._is_frozen_acceptance_artifact(target, state):
-            return False
+            return explicit_test_repair
+        if explicit_test_repair:
+            return True
         normalized = target.replace("\\", "/").strip().rstrip("/")
         policy = self._active_task_test_policy(state)
         acceptance_tests = {

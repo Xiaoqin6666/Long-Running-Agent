@@ -46,7 +46,7 @@ You can also provide the first message directly:
 python -m agent.main "Inspect the current failure" --chat --provider openai-compatible
 ```
 
-Use `/ask <question>` for read-only questions, `/do <task>` for project work, `/skill` to directly add a trusted user-authored Skill, and `/memory` to add a typed Memory. Memory entries are Markdown files under `state/memories/` with one of four fixed types: `user`, `feedback`, `project`, or `reference`. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+Use `/chat <question>` for read-only questions, `/agent <task>` for new project work, and `/adjust <change>` to modify the existing agent run without rebuilding the initial plan. `/ask` and `/do` remain compatibility aliases. Use `/skill` to directly add a trusted user-authored Skill, and `/memory` to add a typed Memory. Memory entries are Markdown files under `state/memories/` with one of four fixed types: `user`, `feedback`, `project`, or `reference`. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
 
 The memory index at `state/memory.md` is always loaded with a 200-line / 25KB cap. Full memory files are loaded only after synchronous retrieval. Set `LONG_AGENT_MEMORY_MODEL` such as `deepseek-flash` to use a cheap selector model; if it is unset or fails, the harness falls back to local keyword matching.
 

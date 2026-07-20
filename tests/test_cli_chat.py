@@ -81,7 +81,7 @@ class ChatCLITests(unittest.TestCase):
         with patch.object(cli, "_run_agent_project_flow") as run_agent:
             self.assertEqual(cli.run(), 0)
         run_agent.assert_not_called()
-        self.assertIn("Choose /chat for conversation or /agent for autonomous project work.", outputs)
+        self.assertIn("Choose /chat for conversation, /agent for new project work, or /adjust to modify an existing run.", outputs)
 
     def test_plain_message_uses_active_mode(self) -> None:
         outputs: list[str] = []
@@ -204,14 +204,16 @@ class ChatCLITests(unittest.TestCase):
         )
         try:
             with patch("agent.chat.build_project_spec") as build_spec:
-                with patch.object(AgentLoop, "run", return_value=run_result) as run_loop:
-                    cli._handle_command(f"/agent requirements are described by this text: `{spec_path}`")
+                with patch.object(cli, "_make_loop", wraps=cli._make_loop) as make_loop:
+                    with patch.object(AgentLoop, "run", return_value=run_result) as run_loop:
+                        cli._handle_command(f"/agent requirements are described by this text: `{spec_path}`")
             build_spec.assert_not_called()
             run_loop.assert_called_once()
             self.assertEqual(cli.config.benchmark_id, "sample")
             self.assertEqual(cli.state_dir, root / "state" / "benchmarks" / "sample")
-            materialized = root / "state" / "benchmarks" / "sample" / "project_spec.md"
-            self.assertEqual(materialized.read_text(encoding="utf-8"), "Build sample app.")
+            self.assertEqual(make_loop.call_args.kwargs["project_spec_path"], spec_path.resolve())
+            self.assertFalse(make_loop.call_args.kwargs["materialize_project_spec"])
+            self.assertFalse((root / "state" / "benchmarks" / "sample" / "project_spec.md").exists())
             self.assertTrue(any("project spec source" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -236,10 +238,92 @@ class ChatCLITests(unittest.TestCase):
         )
         try:
             with patch("agent.chat.build_project_spec") as build_spec:
-                with patch.object(AgentLoop, "run", return_value=run_result):
-                    cli._handle_command(f"/agent {spec_path}")
+                with patch.object(cli, "_make_loop", wraps=cli._make_loop) as make_loop:
+                    with patch.object(AgentLoop, "run", return_value=run_result):
+                        cli._handle_command(f"/agent {spec_path}")
             build_spec.assert_not_called()
-            self.assertEqual((root / "state" / "project_spec.md").read_text(encoding="utf-8"), "# Direct Spec\n")
+            self.assertEqual(make_loop.call_args.kwargs["project_spec_path"], spec_path.resolve())
+            self.assertFalse(make_loop.call_args.kwargs["materialize_project_spec"])
+            self.assertFalse((root / "state" / "project_spec.md").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_adjust_command_resumes_existing_run_without_project_spec_reinit(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-adjust-{uuid4().hex}"
+        state_dir = root / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "project_spec.md").write_text("# Existing Spec\n", encoding="utf-8")
+        (state_dir / "current_task.json").write_text(
+            '{"task_id":"current","user_goal":"Build app","acceptance_criteria":[],"nodes":[]}',
+            encoding="utf-8",
+        )
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=state_dir / "traces" / "run.jsonl",
+            state_path=state_dir / "current_task.json",
+            message="adjusted",
+        )
+        try:
+            with patch("agent.chat.build_project_spec") as build_spec:
+                with patch.object(cli, "_reset_generated_project_state") as reset_state:
+                    with patch.object(cli, "_make_loop", wraps=cli._make_loop) as make_loop:
+                        with patch.object(AgentLoop, "run", return_value=run_result):
+                            cli._handle_command("/adjust make the dashboard denser")
+            build_spec.assert_not_called()
+            reset_state.assert_not_called()
+            self.assertEqual(cli.active_mode, "adjust")
+            self.assertTrue(any("adjusting existing run" in output for output in outputs))
+            self.assertTrue(make_loop.call_args.kwargs["resume"])
+            self.assertEqual(make_loop.call_args.kwargs["interaction_mode"], "adjust")
+            self.assertFalse(make_loop.call_args.kwargs["materialize_project_spec"])
+            self.assertEqual(make_loop.call_args.kwargs["project_spec_path"], state_dir / "project_spec.md")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_adjust_mode_collects_directions_until_send(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(["/adjust", "make it compact", "keep the filters visible", "/send", "/exit"])
+        root = Path.cwd() / ".tmp_tests" / f"chat-adjust-draft-{uuid4().hex}"
+        (root / "state").mkdir(parents=True)
+        (root / "state" / "current_task.json").write_text(
+            '{"task_id":"current","user_goal":"Build app","acceptance_criteria":[],"nodes":[]}',
+            encoding="utf-8",
+        )
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        try:
+            with patch.object(cli, "_run_adjustment_flow") as run_adjust:
+                self.assertEqual(cli.run(), 0)
+            run_adjust.assert_called_once_with("make it compact\nkeep the filters visible")
+            self.assertEqual(cli.agent_draft, [])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_adjust_requires_existing_run(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-adjust-missing-{uuid4().hex}"
+        root.mkdir(parents=True)
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        try:
+            with patch.object(AgentLoop, "run") as run_loop:
+                cli._handle_command("/adjust change the layout")
+            run_loop.assert_not_called()
+            self.assertTrue(any("No existing agent run is available to adjust" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -317,6 +401,43 @@ class ChatCLITests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_memory_command_rejects_semantically_similar_entry(self) -> None:
+        outputs: list[str] = []
+        inputs = iter(
+            [
+                "real-db-tests",
+                "Integration tests must use a real database",
+                "feedback",
+                "Integration tests must use a real database, not mocks.",
+                "Mock-backed tests passed while production migrations failed.",
+                "Connect integration tests to the real test database.",
+                "actual-db-tests",
+                "Integration tests should exercise the actual database",
+                "feedback",
+                "Run integration tests against the real database instead of mocked storage.",
+                "Mock tests can miss migration failures.",
+                "Point integration test setup at the real test database.",
+            ]
+        )
+        root = Path.cwd() / ".tmp_tests" / f"chat-memory-duplicate-{uuid4().hex}"
+        root.mkdir(parents=True)
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            input_fn=lambda prompt: next(inputs),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        try:
+            with patch.object(cli, "_run_agent_project_flow") as run_agent:
+                cli._handle_command("/memory")
+                cli._handle_command("/memory")
+            run_agent.assert_not_called()
+            self.assertTrue((root / "state" / "memories" / "real-db-tests.md").exists())
+            self.assertFalse((root / "state" / "memories" / "actual-db-tests.md").exists())
+            self.assertTrue(any("semantically similar" in output for output in outputs))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_context_keeps_active_task_and_conversation_separate(self) -> None:
         state = create_initial_state("Fix it and run the focused test")
         state.user_goal = "T3: Persistence layer"
@@ -335,6 +456,16 @@ class ChatCLITests(unittest.TestCase):
         self.assertIn("Latest User Message:\nFix it and run the focused test", context)
         restored = TaskState.from_dict(state.to_dict())
         self.assertEqual(restored.conversation_messages, state.conversation_messages)
+
+    def test_context_includes_adjust_mode_instructions(self) -> None:
+        state = create_initial_state("Build app")
+        state.interaction_mode = "adjust"
+        state.conversation_messages = [{"role": "user", "content": "Make the dashboard denser."}]
+        context = ContextBuilder(Path.cwd())._working_context(state)
+        self.assertIn("# Interaction Mode\nadjust", context)
+        self.assertIn("# Adjust Mode Instructions", context)
+        self.assertIn("Do not restart INIT", context)
+        self.assertIn("Make targeted implementation, test, or plan updates", context)
 
     def test_conversation_context_keeps_all_messages_without_truncation(self) -> None:
         state = create_initial_state("Explain everything")

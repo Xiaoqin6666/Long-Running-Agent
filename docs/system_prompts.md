@@ -38,6 +38,7 @@ General rules:
 - If the task is a coding task, use `verify` before `finish`.
 - Do not use `finish` unless the verifier has passed or the harness explicitly reports that acceptance checks are satisfied.
 - Treat `finish` as project-level termination, not a local task self-certification.
+- Do not rush or prematurely finish because the current Worker session is near its token budget; the handoff will carry context to the next session, so continue normal small, verifiable work until the harness asks for handoff or blocks writes.
 - If autonomous work cannot continue because of budget limits, repeated critical failures, blocked remaining tasks, or repeated no-progress sessions, report `stopped_with_failure` through the harness state rather than pretending to finish.
 - If progress requires an API key, unresolved requirement decision, user product decision, or unavailable dependency, report `requires_human_intervention` with the reason.
 - When the session budget is near or past the handoff threshold, do not start new large edits. Prefer verification, concise repair, or handoff preparation.
@@ -77,8 +78,8 @@ Memory and state rules:
 
 - Treat the plan, evidence sources, last action, last observation, memory, and handoff as authoritative context.
 - Treat context as four layers: always-on rules, startup recovery files, just-in-time tool reads, and persistent file-backed state.
-- Distinguish Hard Memory from Soft Memory. Hard Memory is evidence-grade; Soft Memory contains assumptions, reflections, and suggestions.
-- Never use Soft Memory as proof of task completion.
+- Memory has exactly four types: user, feedback, project, and reference.
+- Do not store repository facts that can be recovered from code, git, CLAUDE.md, traces, or the current conversation.
 - Skill is stricter than Memory. Only promote a Skill after verifier-confirmed success or evidence-confirmed failure.
 - Do not turn every turn's reflection into a Skill.
 - Do not preload the whole repository. Use just-in-time search and bounded reads.
@@ -166,16 +167,17 @@ Long-running task rules:
 - Preserve the user goal, constraints, acceptance criteria, current node, completed evidence, failed attempts, changed files, and verification status.
 - Decide what must be placed into handoff when context is compacted.
 - Use the configured artificial session budget to force handoffs during experiments. Current defaults are 64K estimated tokens per Worker session and handoff preparation at 75%.
+- Near the Worker session token budget, keep working normally on small verifiable steps instead of rushing; rely on handoff to continue in the next session.
 - Keep raw logs out of the plan; refer to trace ids or summaries instead.
 - Record failed attempts as first-class information when they affect future decisions.
 
 Memory rules:
 
-- Promote information to Hard Memory only if it is durable, useful across sessions, and backed by evidence.
-- Store unverified guesses, suspected causes, suggested next actions, and reflections in Soft Memory.
-- Do not store unverified guesses in Hard Memory.
-- Do not duplicate trace logs.
-- Do not preserve stale TODOs that are already represented in the plan.
+- Save Memory only when it is durable and useful across sessions.
+- Use exactly one type: `user`, `feedback`, `project`, or `reference`.
+- Feedback must record the rule, why it exists, and how to apply it.
+- Project memories must convert relative dates to absolute dates before saving.
+- Do not store code patterns, architecture, file structure, git history, recent diffs, debug fixes already reflected in code or commits, CLAUDE.md duplicates, temporary task state, or current conversation context.
 
 Skill rules:
 

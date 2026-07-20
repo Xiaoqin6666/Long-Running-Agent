@@ -62,6 +62,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Maximum sessions to run when --auto-resume is enabled.",
     )
+    validation_group = parser.add_mutually_exclusive_group()
+    validation_group.add_argument(
+        "--system-validation",
+        dest="system_validation",
+        action="store_true",
+        default=True,
+        help="Run the project-level final system validation task before finish. Enabled by default.",
+    )
+    validation_group.add_argument(
+        "--no-system-validation",
+        dest="system_validation",
+        action="store_false",
+        help="Disable the project-level final system validation task before finish.",
+    )
     parser.add_argument(
         "--log-file",
         type=Path,
@@ -158,13 +172,14 @@ def main() -> int:
     logger = configure_run_logger(log_path)
     print(f"Log: {log_path}", flush=True)
     logger.info(
-        "Starting provider=%s benchmark=%s max_steps=%s auto_resume=%s max_sessions=%s "
+        "Starting provider=%s benchmark=%s max_steps=%s auto_resume=%s max_sessions=%s system_validation=%s "
         "api_key_configured=%s base_url=%s model=%s",
         args.provider,
         benchmark_id or "none",
         args.max_steps,
         args.auto_resume,
         args.max_sessions,
+        args.system_validation,
         bool(os.environ.get("LONG_AGENT_API_KEY")),
         os.environ.get("LONG_AGENT_BASE_URL", "https://api.openai.com/v1"),
         os.environ.get("LONG_AGENT_MODEL", "gpt-4.1-mini"),
@@ -182,6 +197,7 @@ def main() -> int:
                     project_spec_path=args.project_spec.resolve() if args.project_spec else None,
                     auto_resume=args.auto_resume,
                     max_sessions=args.max_sessions,
+                    system_validation=args.system_validation,
                     initial_message=initial_message,
                 )
             ).run()
@@ -197,6 +213,7 @@ def main() -> int:
             benchmark_id=benchmark_id,
             auto_resume=args.auto_resume,
             max_sessions=args.max_sessions,
+            system_validation=args.system_validation,
         )
         result = loop.run()
         summary = result.to_human_summary()

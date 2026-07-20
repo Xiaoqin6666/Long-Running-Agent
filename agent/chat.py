@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Callable
 
 from agent.loop import AgentLoop, RunResult
-from agent.memory import MemoryDocument, normalize_memory_content, render_memory, render_memory_index, safe_memory_id, validate_memory
+from agent.memory import (
+    MemoryDocument,
+    find_semantic_duplicate,
+    normalize_memory_content,
+    render_memory,
+    render_memory_index,
+    safe_memory_id,
+    validate_memory,
+)
 from agent.spec_builder import build_project_spec
 from agent.skills import SkillDocument, parse_skill, render_skill
 
@@ -21,8 +29,9 @@ TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /chat      Switch to read-only chat mode; messages can be answered but do not start project work
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
-  /send      Start agent work from the collected /agent requirements
-  /clear     Clear collected /agent requirements
+  /adjust    Switch to adjust mode; provide changes for the existing agent run without reinitializing
+  /send      Start work from the collected /agent requirements or /adjust directions
+  /clear     Clear collected /agent requirements or /adjust directions
   /mode      Show the current input mode
   /skill     Add a user-authored Skill with a guided form
   /memory    Add a typed Memory with a guided form
@@ -45,6 +54,7 @@ class ChatConfig:
     project_spec_path: Path | None = None
     auto_resume: bool = False
     max_sessions: int = 1
+    system_validation: bool = True
     initial_message: str | None = None
 
 
@@ -134,13 +144,25 @@ class InteractiveCLI:
                 self.output("Agent mode active. Paste or type project requirements, or say where the project spec file is. Use Shift+Enter/new lines as needed, then /send to start. Use /chat to switch to chat-only mode.")
             else:
                 self._run_agent_project_flow(content)
+        elif command == "/adjust":
+            self.active_mode = "adjust"
+            if not content:
+                self.output("Adjust mode active. Describe the change you want to make to the existing agent run, then /send. This keeps the current plan/state instead of reinitializing it.")
+            else:
+                self._run_adjustment_flow(content)
         elif command == "/send":
             if content:
                 self._append_agent_draft(content)
-            self._send_agent_draft()
+            if self.active_mode == "adjust":
+                self._send_adjustment_draft()
+            else:
+                self._send_agent_draft()
         elif command == "/clear":
             self.agent_draft.clear()
-            self.output("Cleared collected agent requirements.")
+            if self.active_mode == "adjust":
+                self.output("Cleared collected adjustment directions.")
+            else:
+                self.output("Cleared collected agent requirements.")
         elif command == "/mode":
             self.output(f"Current mode: {self.active_mode}.")
         elif command in {"/ask", "/do"}:
@@ -294,6 +316,13 @@ class InteractiveCLI:
         if errors:
             self.output("Memory validation failed: " + "; ".join(errors))
             return
+        semantic_duplicate = find_semantic_duplicate(memory, memory_dir, exclude_name=memory_id)
+        if semantic_duplicate:
+            self.output(
+                "Memory validation failed: semantically similar to existing Memory "
+                f"'{semantic_duplicate['name']}' ({semantic_duplicate['similarity']})."
+            )
+            return
 
         memory_dir.mkdir(parents=True, exist_ok=True)
         temporary_path = memory_path.with_suffix(".md.tmp")
@@ -374,7 +403,7 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /chat for conversation, /agent for autonomous project work, /help for commands.", "dim"))
+        self.output(self._paint("  Use /agent for new project work, /adjust for changes, /resume for continue in next session, /help for commands.", "dim"))
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:
@@ -396,11 +425,11 @@ class InteractiveCLI:
         return f"\033[{prefix}m{value}\033[0m"
 
     def _handle_plain_message(self, message: str) -> None:
-        if self.active_mode == "agent":
+        if self.active_mode in {"agent", "adjust"}:
             self._append_agent_draft(message)
             return
         if self.active_mode != "chat":
-            self.output("Choose /chat for conversation or /agent for autonomous project work.")
+            self.output("Choose /chat for conversation, /agent for new project work, or /adjust to modify an existing run.")
             return
         self._run_chat_turn(message)
 
@@ -410,7 +439,10 @@ class InteractiveCLI:
     def _append_agent_draft(self, message: str) -> None:
         self.agent_draft.append(message)
         line_count = sum(max(1, len(item.splitlines())) for item in self.agent_draft)
-        self.output(f"Added to agent requirements draft ({line_count} line(s)). Use /send to start or /clear to reset.")
+        if self.active_mode == "adjust":
+            self.output(f"Added to adjustment directions draft ({line_count} line(s)). Use /send to start or /clear to reset.")
+        else:
+            self.output(f"Added to agent requirements draft ({line_count} line(s)). Use /send to start or /clear to reset.")
 
     def _send_agent_draft(self) -> None:
         if self.active_mode != "agent":
@@ -422,6 +454,47 @@ class InteractiveCLI:
             return
         self.agent_draft.clear()
         self._run_agent_project_flow(requirement)
+
+    def _send_adjustment_draft(self) -> None:
+        if self.active_mode != "adjust":
+            self.output("Switch to /adjust before sending adjustment directions.")
+            return
+        adjustment = "\n".join(item.strip() for item in self.agent_draft if item.strip()).strip()
+        if not adjustment:
+            self.output("No adjustment directions collected yet. Paste or type the requested changes first.")
+            return
+        self.agent_draft.clear()
+        self._run_adjustment_flow(adjustment)
+
+    def _run_adjustment_flow(self, message: str) -> None:
+        if not self.state_path.exists():
+            answer = "No existing agent run is available to adjust. Use /agent to start a project first."
+            self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+            self._record_assistant(answer)
+            return
+
+        user_message = ChatMessage("user", message)
+        self.messages.append(user_message)
+        self._append_history(user_message)
+        self.last_task = message
+
+        self.output(self._paint("Agent > adjusting existing run...", "green", bold=True))
+        try:
+            loop = self._make_loop(
+                f"Adjust existing project based on user guidance: {message}",
+                resume=True,
+                include_conversation=True,
+                interaction_mode="adjust",
+                project_spec_path=self._existing_project_spec_path(),
+                materialize_project_spec=False,
+            )
+            result = loop.run()
+        except Exception as exc:
+            answer = f"Run failed: {exc}"
+            self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
+            self._record_assistant(answer)
+            return
+        self._finish_turn(result)
 
     def _run_agent_project_flow(self, message: str) -> None:
         source_path = self._extract_project_spec_path(message)
@@ -436,6 +509,7 @@ class InteractiveCLI:
         self.last_task = message
 
         self.output(self._paint("Agent > preparing project spec...", "green", bold=True))
+        materialize_project_spec = True
         if source_path:
             try:
                 project_spec = source_path.read_text(encoding="utf-8")
@@ -444,6 +518,8 @@ class InteractiveCLI:
                 self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
                 self._record_assistant(answer)
                 return
+            spec_path = source_path
+            materialize_project_spec = False
             self.output(self._paint(f"Agent > project spec source: {self._relative_path(source_path)}", "green", bold=True))
         else:
             try:
@@ -456,10 +532,11 @@ class InteractiveCLI:
                 self.output(f"{self._paint('Agent >', 'red', bold=True)} {answer}\n")
                 self._record_assistant(answer)
                 return
+            spec_path = self._write_project_spec(project_spec)
 
-        spec_path = self._write_project_spec(project_spec)
         self._reset_generated_project_state()
-        self.output(self._paint(f"Agent > project spec saved: {self._relative_path(spec_path)}", "green", bold=True))
+        if materialize_project_spec:
+            self.output(self._paint(f"Agent > project spec saved: {self._relative_path(spec_path)}", "green", bold=True))
         self.output(self._paint("Agent > working...", "green", bold=True))
 
         try:
@@ -469,6 +546,7 @@ class InteractiveCLI:
                 include_conversation=True,
                 interaction_mode="work",
                 project_spec_path=spec_path,
+                materialize_project_spec=materialize_project_spec,
                 use_config_tasks_path=False,
             )
             result = loop.run()
@@ -565,6 +643,12 @@ class InteractiveCLI:
         spec_path.write_text(project_spec, encoding="utf-8")
         return spec_path
 
+    def _existing_project_spec_path(self) -> Path | None:
+        state_spec = self.state_dir / "project_spec.md"
+        if state_spec.exists():
+            return state_spec
+        return self.config.project_spec_path
+
     def _reset_generated_project_state(self) -> None:
         for path in [
             self.state_dir / "generated_tasks.json",
@@ -624,6 +708,7 @@ class InteractiveCLI:
         include_conversation: bool,
         interaction_mode: str,
         project_spec_path: Path | None = None,
+        materialize_project_spec: bool = True,
         use_config_tasks_path: bool = True,
     ) -> AgentLoop:
         return AgentLoop(
@@ -634,9 +719,11 @@ class InteractiveCLI:
             resume=resume,
             tasks_path=self.config.tasks_path if use_config_tasks_path else None,
             project_spec_path=project_spec_path or self.config.project_spec_path,
+            materialize_project_spec=materialize_project_spec,
             benchmark_id=self.config.benchmark_id,
             auto_resume=self.config.auto_resume,
             max_sessions=self.config.max_sessions,
+            system_validation=self.config.system_validation,
             event_handler=self._show_event,
             conversation_messages=(
                 [

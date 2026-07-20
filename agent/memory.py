@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
+SEMANTIC_DUPLICATE_THRESHOLD = 0.82
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,47 @@ def validate_memory(memory: MemoryDocument) -> list[str]:
     return errors
 
 
+def find_semantic_duplicate(
+    memory: MemoryDocument,
+    memory_dir: Path,
+    *,
+    exclude_name: str = "",
+    threshold: float = SEMANTIC_DUPLICATE_THRESHOLD,
+) -> dict[str, str] | None:
+    """Return an existing memory that appears to capture the same durable fact."""
+    if not memory_dir.exists():
+        return None
+    excluded = safe_memory_id(exclude_name)
+    for path in sorted(memory_dir.glob("*.md")):
+        existing = parse_memory(path.read_text(encoding="utf-8"), fallback_name=path.stem)
+        if safe_memory_id(existing.name) == excluded:
+            continue
+        if validate_memory(existing):
+            continue
+        score = semantic_memory_similarity(memory, existing)
+        if score >= threshold:
+            return {
+                "name": existing.name,
+                "description": existing.description,
+                "type": existing.type,
+                "path": path.name,
+                "similarity": f"{score:.3f}",
+            }
+    return None
+
+
+def semantic_memory_similarity(left: MemoryDocument, right: MemoryDocument) -> float:
+    left_text = _memory_similarity_text(left)
+    right_text = _memory_similarity_text(right)
+    left_tokens = _memory_tokens(left_text)
+    right_tokens = _memory_tokens(right_text)
+    token_score = _token_similarity(left_tokens, right_tokens)
+    sequence_score = 0.0
+    if len(set(left_tokens) & set(right_tokens)) >= 4:
+        sequence_score = SequenceMatcher(None, _normalize_text(left_text), _normalize_text(right_text)).ratio()
+    return max(token_score, sequence_score)
+
+
 def contains_relative_date(text: str) -> bool:
     patterns = [
         r"\b(today|tomorrow|yesterday|tonight|this\s+(week|month|quarter|year)|next\s+(week|month|quarter|year))\b",
@@ -143,6 +187,96 @@ def contains_relative_date(text: str) -> bool:
 def safe_memory_id(raw: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw.strip().lower())
     return cleaned.strip("-_")
+
+
+def _memory_similarity_text(memory: MemoryDocument) -> str:
+    return f"{memory.description}\n{memory.content}"
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(_memory_tokens(text))
+
+
+def _memory_tokens(text: str) -> list[str]:
+    raw_tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower())
+    tokens: list[str] = []
+    for token in raw_tokens:
+        canonical = _canonical_token(token)
+        if canonical:
+            tokens.append(canonical)
+    return tokens
+
+
+def _canonical_token(token: str) -> str:
+    if token in _STOPWORDS:
+        return ""
+    token = _stem_token(token)
+    return _SYNONYMS.get(token, token)
+
+
+def _stem_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(token) > len(suffix) + 3 and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def _token_similarity(left: list[str], right: list[str]) -> float:
+    if not left or not right:
+        return 0.0
+    left_counts = Counter(left)
+    right_counts = Counter(right)
+    shared_terms = set(left_counts) & set(right_counts)
+    if len(shared_terms) < 4:
+        return 0.0
+    overlap = sum(min(left_counts[token], right_counts[token]) for token in shared_terms)
+    containment = overlap / min(sum(left_counts.values()), sum(right_counts.values()))
+    dot = sum(left_counts[token] * right_counts[token] for token in shared_terms)
+    left_norm = sum(value * value for value in left_counts.values()) ** 0.5
+    right_norm = sum(value * value for value in right_counts.values()) ** 0.5
+    cosine = dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+    return max(containment, cosine)
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "should",
+    "that",
+    "the",
+    "this",
+    "to",
+    "use",
+    "when",
+    "with",
+}
+
+
+_SYNONYMS = {
+    "actual": "real",
+    "db": "database",
+    "mocked": "mock",
+    "mocking": "mock",
+    "mocker": "mock",
+    "preference": "prefer",
+}
 
 
 def _parse_scalar(value: str) -> str:
