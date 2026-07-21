@@ -26,27 +26,23 @@ See [docs/evaluation_runbook.md](docs/evaluation_runbook.md) for the long-runnin
 
 The tracked repository-root `init.sh` bootstraps the Long-Running Agent harness. An autonomous benchmark INIT generates a separate run-local script at `state/benchmarks/<benchmark_id>/init.sh`; generated application code and public tests belong under `eval/benchmarks/<benchmark_id>/workspace/`.
 
-Run the deterministic offline loop:
+### Agent 项目运行方式
+
+方式 1：进入交互式 agent。
 
 ```powershell
-python -m agent.main "Smoke test the minimal long-running agent" --max-steps 5
+python -m agent.main --chat --benchmark MAPA --provider openai-compatible
 ```
 
-Start an interactive terminal conversation:
+`--benchmark` 设置测评任务的名字。进入 agent 之后，使用 `/agent` 模式开启新的项目，并指定项目规格文件路径；`/adjust` 模式用来对当前项目提出修改建议；`/resume` 模式在新的会话中继续当前项目。
+
+方式 2：直接指定项目规格文件启动。
 
 ```powershell
-python -m agent.main --chat --provider openai-compatible --max-steps 8
+python -m agent.main --project-spec eval\benchmarks\MAPA\task.md --provider openai-compatible --benchmark MAPA
 ```
 
-On Windows, `--chat` opens the conversation in a dedicated terminal window. Use `--chat-inline` to keep the UI in the current terminal, which is useful for scripts and debugging.
-
-You can also provide the first message directly:
-
-```powershell
-python -m agent.main "Inspect the current failure" --chat --provider openai-compatible
-```
-
-Use `/chat <question>` for read-only questions, `/agent <task>` for new project work, and `/adjust <change>` to modify the existing agent run without rebuilding the initial plan. `/ask` and `/do` remain compatibility aliases. Use `/skill` to directly add a trusted user-authored Skill, and `/memory` to add a typed Memory. Memory entries are Markdown files under `state/memories/` with one of four fixed types: `user`, `feedback`, `project`, or `reference`. Agent-authored Skills still require verifier or trace evidence. The chat also supports `/help`, `/status`, `/history`, `/resume`, `/new`, and `/exit`. Conversation records are appended to `state/chat_history.jsonl`, or to the selected benchmark state directory.
+`--project-spec eval\benchmarks\MAPA\task.md` 设置项目规格文件路径。`--benchmark` 设置测评任务的名字。
 
 The memory index at `state/memory.md` is always loaded with a 200-line / 25KB cap. Full memory files are loaded only after synchronous retrieval. Set `LONG_AGENT_MEMORY_MODEL` such as `deepseek-flash` to use a cheap selector model; if it is unset or fails, the harness falls back to local keyword matching.
 
@@ -55,6 +51,8 @@ Summarize a trace:
 ```powershell
 python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl --tasks state\benchmarks\issue_tracker\runtime_tasks.json
 ```
+
+Token usage is recorded separately from the handoff budget estimate. Each trace event includes `token_usage` for that agent step, `session_token_usage` for the active session totals, and `total_token_usage` across all sessions. The durable `current_task.json` also stores `token_usage.totals`, `token_usage.sessions`, and per-turn `token_usage.turns`; `/status` shows the accumulated LLM input and output totals.
 
 Inspect full model context for each action:
 
@@ -85,19 +83,10 @@ $env:LONG_AGENT_API_KEY="your_api_key"
 $env:LONG_AGENT_BASE_URL="https://api.openai.com/v1"
 $env:LONG_AGENT_MODEL="gpt-4.1-mini"
 $env:LONG_AGENT_MEMORY_MODEL="deepseek-flash"  # optional selector model
+$env:LONG_AGENT_TOKEN_PRICES_JSON='{"gpt-4.1-mini":{"input_per_1m":0.0,"output_per_1m":0.0,"currency":"USD"}}'
 ```
 
-Run with:
-
-```powershell
-python -m agent.main "Inspect this repo and suggest the next implementation step" --provider openai-compatible --max-steps 3
-```
-
-For long benchmark runs, let the harness automatically continue from handoff files:
-
-```powershell
-python -m agent.main --benchmark todo_counter --project-spec eval\benchmarks\todo_counter\project_spec.md --provider openai-compatible --max-steps 12 --auto-resume --max-sessions 5
-```
+If the API response includes cost or billing fields, that provider-returned cost is recorded first with `price_source="api"`. Otherwise, set `LONG_AGENT_TOKEN_PRICES_JSON` to the current price you want to use, expressed per 1M tokens; replace the `0.0` example values before relying on cost output. You can also put the same JSON object in a file and set `LONG_AGENT_TOKEN_PRICES_FILE=path\to\prices.json`. When pricing is available for the active model, each trace step's `token_usage.cost` includes input, output, and total cost. Session cost aggregates live under `token_usage.sessions[session_id].costs_by_currency`; all-session aggregates live under `token_usage.totals.costs_by_currency`. If neither API cost nor a configured model price is available, the turn is counted under `unpriced_turn_count`.
 
 When a session reaches the handoff threshold, the harness writes `handoff.md`, resets the per-session budget flags, starts a fresh trace, and resumes from `current_task.json` without requiring a manual `--resume` restart.
 

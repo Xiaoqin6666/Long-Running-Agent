@@ -75,6 +75,11 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
     skill_reflections_dismissed = 0
     no_progress_session = 1
     max_session_tokens = 0
+    llm_input_tokens = 0
+    llm_output_tokens = 0
+    llm_total_tokens = 0
+    llm_costs_by_currency: dict[str, dict[str, float | int]] = {}
+    llm_unpriced_turns = 0
     final_task_status: dict[str, str] = {}
     for event in events:
         name = event["action"]["action"]
@@ -130,6 +135,24 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         if name in PROGRESS_ACTIONS and ok:
             no_progress_session = 0
         max_session_tokens = max(max_session_tokens, int(event.get("session_used_tokens", 0)))
+        token_usage = event.get("token_usage", {})
+        if isinstance(token_usage, dict):
+            llm_input_tokens += int(token_usage.get("input_tokens", 0) or 0)
+            llm_output_tokens += int(token_usage.get("output_tokens", 0) or 0)
+            llm_total_tokens += int(token_usage.get("total_tokens", 0) or 0)
+            cost = token_usage.get("cost", {})
+            if isinstance(cost, dict) and cost.get("available"):
+                currency = str(cost.get("currency", "USD") or "USD")
+                totals = llm_costs_by_currency.setdefault(
+                    currency,
+                    {"input_cost": 0.0, "output_cost": 0.0, "total_cost": 0.0, "turn_count": 0},
+                )
+                totals["input_cost"] = round(float(totals["input_cost"]) + float(cost.get("input_cost", 0.0) or 0.0), 12)
+                totals["output_cost"] = round(float(totals["output_cost"]) + float(cost.get("output_cost", 0.0) or 0.0), 12)
+                totals["total_cost"] = round(float(totals["total_cost"]) + float(cost.get("total_cost", 0.0) or 0.0), 12)
+                totals["turn_count"] = int(totals["turn_count"]) + 1
+            elif token_usage:
+                llm_unpriced_turns += 1
         for node in event.get("nodes", []):
             if isinstance(node, dict) and node.get("id"):
                 final_task_status[str(node["id"])] = str(node.get("status", "unknown"))
@@ -165,6 +188,11 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         "no_progress_sessions": no_progress_session,
         "max_session_used_tokens": max_session_tokens,
         "max_turn_used_tokens": max_session_tokens,
+        "llm_input_tokens": llm_input_tokens,
+        "llm_output_tokens": llm_output_tokens,
+        "llm_total_tokens": llm_total_tokens,
+        "llm_costs_by_currency": llm_costs_by_currency,
+        "llm_unpriced_turns": llm_unpriced_turns,
         "completed_tasks": task_counts["completed_tasks"],
         "blocked_tasks": task_counts["blocked_tasks"],
         "task_final_status": task_counts["task_final_status"],

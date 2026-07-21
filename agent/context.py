@@ -80,7 +80,11 @@ class ContextBuilder:
     def _repair_summary(self, state: TaskState) -> str:
         lines: list[str] = []
         pending = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        initializer = (
+            state.initializer_repair
+            if self._active_task_id(state) == "INIT" and isinstance(state.initializer_repair, dict)
+            else {}
+        )
         if pending:
             reason = str(pending.get("reason", "pending_repair")).replace("\n", " ")[:80]
             command = str(pending.get("command", "")).replace("\n", " ")[:180]
@@ -139,7 +143,12 @@ class ContextBuilder:
         if self.state_dir == self.root / "state":
             root_tasks_overview = self._task_graph_overview(self.root / "tasks.json", state)
         candidate_path = ""
-        if state and isinstance(state.initializer_repair, dict) and state.initializer_repair.get("candidate_path"):
+        if (
+            state
+            and self._active_task_id(state) == "INIT"
+            and isinstance(state.initializer_repair, dict)
+            and state.initializer_repair.get("candidate_path")
+        ):
             candidate_path = self._rel(self.state_dir / "rejected_candidates" / "generated_tasks.json")
         lines = [
             "# Session Startup Context",
@@ -618,7 +627,11 @@ class ContextBuilder:
 
     def _pending_repair_context(self, state: TaskState) -> str:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
-        initializer = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        initializer = (
+            state.initializer_repair
+            if self._active_task_id(state) == "INIT" and isinstance(state.initializer_repair, dict)
+            else {}
+        )
         lines: list[str] = []
         if repair:
             lines.extend(
@@ -953,7 +966,7 @@ class ContextBuilder:
             "The repository-root init.sh belongs to the Long-Running Agent harness and must not be modified by a benchmark INIT.",
             "Any application artifact in the generated task graph must be under the workspace path required by project_spec.md.",
             "Do not use answer or finish during INIT.",
-            "After writing initializer artifacts, use verify. The verifier executes the INIT verification command itself; only Verifier PASS completes INIT and allows Orchestrator to schedule the first Worker task.",
+            "During INIT, bash is allowed for lightweight inspection, formatting, and validation of initializer artifacts, but do not create application code, tests, skeleton files, workspace files, or a regenerated project spec. After writing initializer artifacts, use verify; only Verifier PASS completes INIT and allows Orchestrator to schedule the first Worker task.",
         ]
 
     def _project_spec_context_path(self) -> Path | None:
@@ -989,7 +1002,11 @@ class ContextBuilder:
                 "Next action must be finish target='current_task' to let the harness create the project-level UI/system validation task. "
                 "Do not use read, verify, update_plan, or answer as a substitute for scheduling final validation."
             )
-        initializer_repair = state.initializer_repair if isinstance(state.initializer_repair, dict) else {}
+        initializer_repair = (
+            state.initializer_repair
+            if self._active_task_id(state) == "INIT" and isinstance(state.initializer_repair, dict)
+            else {}
+        )
         if initializer_repair:
             candidate = str(initializer_repair.get("candidate_path", ""))
             errors = initializer_repair.get("validation_errors", [])

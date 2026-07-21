@@ -45,6 +45,7 @@ from agent.skills import (
 )
 from agent.termination import ProjectTerminator
 from agent.tools import BashTool, EditTool, GitTool, ListFilesTool, ReadTool, SearchTool, ToolResult, WriteTool
+from agent.token_usage import estimate_turn_usage, initialize_token_usage, load_pricing_from_env, record_turn_usage
 from agent.ui_contract import write_ui_contract
 from agent.verifier import Verifier
 
@@ -169,6 +170,8 @@ class AgentLoop:
         }
         self._last_memory_selection: dict[str, Any] = {}
         self._current_context_snapshot: dict[str, Any] = {}
+        self._last_token_usage_record: dict[str, Any] = {}
+        self.token_pricing = load_pricing_from_env()
 
     def _benchmark_state_dir(self, benchmark_id: str) -> Path:
         return self.root / "state" / "benchmarks" / benchmark_id
@@ -292,13 +295,14 @@ class AgentLoop:
             self._append_trace(step, action, observation, state, context_snapshot)
             self._write_state(state)
             LOGGER.info(
-                "Step %s action=%s target=%s ok=%s task_id=%s turn_tokens=%s handoff_ready=%s observation=%s",
+                "Step %s action=%s target=%s ok=%s task_id=%s turn_tokens=%s token_usage=%s handoff_ready=%s observation=%s",
                 step,
                 action.get("action", "unknown"),
                 action.get("target", ""),
                 observation.ok,
                 state.task_id,
                 state.session_used_tokens,
+                self._last_token_usage_record,
                 state.handoff_ready,
                 self._log_text(observation.summary),
             )
@@ -312,6 +316,7 @@ class AgentLoop:
                     "ok": observation.ok,
                     "summary": observation.summary,
                     "thought_summary": str(action.get("thought_summary", "")),
+                    "token_usage": dict(self._last_token_usage_record),
                 }
             )
 
@@ -397,6 +402,7 @@ class AgentLoop:
             self._apply_orchestrator_selection(state)
         if self.resume and not state.pending_repair:
             self._recover_pending_repair_from_recent_trace(state)
+        state.token_usage = initialize_token_usage(state.token_usage)
         return state
 
     @staticmethod
@@ -750,14 +756,6 @@ class AgentLoop:
             test_gate = self._implementation_write_test_gate(action, state)
             if test_gate is not None:
                 return test_gate
-        if name == "bash" and self._is_initializer_task(state):
-            allowed_commands = set(self._active_verification_commands(state))
-            if str(action.get("target", "")) not in allowed_commands:
-                return ToolResult(
-                    False,
-                    "INIT may run only its deterministic initializer verification command.",
-                    {"initializer_restricted": True, "allowed_commands": sorted(allowed_commands)},
-                )
         if name == "update_plan":
             return ToolResult(True, "Plan updated by harness.", {"target": action.get("target")})
         if name == "verify":
@@ -772,6 +770,8 @@ class AgentLoop:
             result = self.verifier.run(action.get("target", "default"), state)
             result.data["task_id"] = task_id
             if result.ok:
+                if self._is_initializer_task(state):
+                    state.initializer_repair = {}
                 archived = self._archive_verifier_success(task_id, result)
                 result.data.update(archived)
             pending_skills = [item for item in state.loaded_skills if item.get("status") == "loaded"]
@@ -3454,6 +3454,9 @@ class AgentLoop:
             "state_summary": state.summary(),
             "task_id": state.task_id,
             "session_used_tokens": state.session_used_tokens,
+            "token_usage": dict(self._last_token_usage_record),
+            "session_token_usage": state.token_usage.get("sessions", {}).get(self.trace_path.stem, {}),
+            "total_token_usage": state.token_usage.get("totals", {}),
             "handoff_ready": state.handoff_ready,
             "orchestrator_decision": state.orchestrator_decision,
             "nodes": state.nodes,
@@ -3499,6 +3502,9 @@ class AgentLoop:
             f"- threshold_tokens: {int(state.session_budget_tokens * state.handoff_threshold)}",
             f"- estimated_turn_tokens: {state.session_used_tokens}",
             f"- handoff_ready: {state.handoff_ready}",
+            "",
+            "### Token Usage",
+            *self._format_token_usage_for_handoff(state),
             "",
             "### Active Task",
             self._format_node(active_node) if active_node else "No active task.",
@@ -3610,6 +3616,7 @@ class AgentLoop:
                 "estimated_turn_tokens": state.session_used_tokens,
                 "handoff_ready": state.handoff_ready,
             },
+            "token_usage": state.token_usage,
             "orchestrator_decision": state.orchestrator_decision,
             "active_task": active_node,
             "artifact_status": artifact_status,
@@ -3652,11 +3659,70 @@ class AgentLoop:
         action: dict[str, Any],
         observation: ToolResult,
     ) -> None:
+        self._record_token_usage(state, context, action)
         payload = context + json.dumps(action, ensure_ascii=False) + json.dumps(observation.to_dict(), ensure_ascii=False)
         state.session_used_tokens = max(1, len(payload) // 4)
         threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
         if state.session_used_tokens >= threshold_tokens:
             state.handoff_ready = True
+
+    def _record_token_usage(self, state: TaskState, context: str, action: dict[str, Any]) -> dict[str, Any]:
+        usage = getattr(self.decision_maker, "last_token_usage", None)
+        if not usage:
+            usage = estimate_turn_usage(MAIN_AGENT_SYSTEM_PROMPT, context, action)
+        state.token_usage = initialize_token_usage(state.token_usage)
+        record = record_turn_usage(
+            state.token_usage,
+            session_id=self.trace_path.stem,
+            step=int(getattr(self, "_current_trace_step", 0) or 0),
+            task_id=self._active_task_id(state),
+            provider=self.provider,
+            model=str(getattr(self.decision_maker, "model", self.provider)),
+            operation_type="agent_step_decision",
+            usage=usage,
+            pricing=self.token_pricing,
+            recorded_at=utc_now(),
+        )
+        self._last_token_usage_record = record
+        return record
+
+    def _format_token_usage_for_handoff(self, state: TaskState) -> list[str]:
+        usage = initialize_token_usage(state.token_usage)
+        session_usage = usage.get("sessions", {}).get(self.trace_path.stem, {})
+        totals = usage.get("totals", {})
+        return [
+            (
+                "- current_session: "
+                f"input={int(session_usage.get('input_tokens', 0) or 0)} "
+                f"output={int(session_usage.get('output_tokens', 0) or 0)} "
+                f"total={int(session_usage.get('total_tokens', 0) or 0)} "
+                f"turns={int(session_usage.get('turn_count', 0) or 0)}"
+            ),
+            f"- current_session_cost: {self._format_costs_by_currency(session_usage)}",
+            (
+                "- all_sessions: "
+                f"input={int(totals.get('input_tokens', 0) or 0)} "
+                f"output={int(totals.get('output_tokens', 0) or 0)} "
+                f"total={int(totals.get('total_tokens', 0) or 0)} "
+                f"turns={int(totals.get('turn_count', 0) or 0)}"
+            ),
+            f"- all_sessions_cost: {self._format_costs_by_currency(totals)}",
+        ]
+
+    def _format_costs_by_currency(self, totals: dict[str, Any]) -> str:
+        costs = totals.get("costs_by_currency", {})
+        if not isinstance(costs, dict) or not costs:
+            unpriced = int(totals.get("unpriced_turn_count", 0) or 0)
+            return f"not_configured (unpriced_turns={unpriced})"
+        parts = []
+        for currency, values in sorted(costs.items()):
+            if not isinstance(values, dict):
+                continue
+            parts.append(f"{currency} {float(values.get('total_cost', 0.0) or 0.0):.6f}")
+        unpriced = int(totals.get("unpriced_turn_count", 0) or 0)
+        if unpriced:
+            parts.append(f"unpriced_turns={unpriced}")
+        return ", ".join(parts) if parts else "not_configured"
 
     def _active_node(self, state: TaskState) -> dict[str, Any] | None:
         for node in state.nodes:

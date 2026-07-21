@@ -9,6 +9,7 @@ from typing import Any
 
 from agent.planner import TaskState
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
+from agent.token_usage import normalize_response_usage
 
 
 ALLOWED_ACTIONS = {
@@ -47,7 +48,11 @@ class OfflineDecisionMaker:
     interface without network access or API keys.
     """
 
+    last_token_usage: dict[str, Any] | None = None
+    model = "offline"
+
     def next_action(self, context: str, state: TaskState) -> dict[str, Any]:
+        self.last_token_usage = None
         del context
         if state.iterations == 0:
             return {
@@ -102,6 +107,7 @@ class OpenAICompatibleDecisionMaker:
         self.model = model
         self.timeout = timeout
         self.temperature = temperature
+        self.last_token_usage: dict[str, Any] | None = None
 
     @classmethod
     def from_env(cls) -> "OpenAICompatibleDecisionMaker":
@@ -117,6 +123,7 @@ class OpenAICompatibleDecisionMaker:
         )
 
     def next_action(self, context: str, state: TaskState) -> dict[str, Any]:
+        self.last_token_usage = None
         payload = {
             "model": self.model,
             "temperature": self.temperature,
@@ -132,6 +139,7 @@ class OpenAICompatibleDecisionMaker:
             ],
         }
         response = self._post_chat_completions(payload)
+        self.last_token_usage = normalize_response_usage(response, source="api")
         content = response["choices"][0]["message"]["content"]
         action = parse_action_json(content)
         return validate_action(action, state)

@@ -27,18 +27,14 @@ from agent.skills import SkillDocument, parse_skill, render_skill
 UI_WIDTH = 72
 TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
-  /chat      Switch to read-only chat mode; messages can be answered but do not start project work
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
   /adjust    Switch to adjust mode; provide changes for the existing agent run without reinitializing
-  /send      Start work from the collected /agent requirements or /adjust directions
-  /clear     Clear collected /agent requirements or /adjust directions
+  /resume    Continue the last unfinished agent run
   /mode      Show the current input mode
   /skill     Add a user-authored Skill with a guided form
   /memory    Add a typed Memory with a guided form
-  /help      Show this help
   /status    Show the current durable agent state
   /history   Show messages from this chat session
-  /resume    Continue the last unfinished agent run
   /new       Start a new conversation context
   /exit      Exit the chat
 """
@@ -777,11 +773,18 @@ class InteractiveCLI:
         except (OSError, json.JSONDecodeError) as exc:
             self.output(f"Could not read agent state: {exc}")
             return
+        token_totals = {}
+        token_usage = state.get("token_usage", {})
+        if isinstance(token_usage, dict) and isinstance(token_usage.get("totals"), dict):
+            token_totals = token_usage["totals"]
         self.output(
             "State: "
             f"task={state.get('task_id', 'unknown')}, "
             f"iterations={state.get('iterations', 0)}, "
             f"turn_tokens={state.get('session_used_tokens', 0)}/{state.get('session_budget_tokens', '?')}, "
+            f"llm_input_tokens={token_totals.get('input_tokens', 0)}, "
+            f"llm_output_tokens={token_totals.get('output_tokens', 0)}, "
+            f"llm_cost={format_costs_by_currency(token_totals)}, "
             f"handoff_ready={state.get('handoff_ready', False)}"
         )
 
@@ -815,6 +818,22 @@ def compact_text(value: object, limit: int) -> str:
 def safe_skill_id(raw: str) -> str:
     cleaned = "".join(character if character.isalnum() or character in {"-", "_"} else "-" for character in raw.strip().lower())
     return cleaned.strip("-_")
+
+
+def format_costs_by_currency(totals: dict[str, object]) -> str:
+    costs = totals.get("costs_by_currency", {}) if isinstance(totals, dict) else {}
+    if not isinstance(costs, dict) or not costs:
+        unpriced = int(totals.get("unpriced_turn_count", 0) or 0) if isinstance(totals, dict) else 0
+        return f"not_configured(unpriced_turns={unpriced})"
+    parts: list[str] = []
+    for currency, values in sorted(costs.items()):
+        if not isinstance(values, dict):
+            continue
+        parts.append(f"{currency}:{float(values.get('total_cost', 0.0) or 0.0):.6f}")
+    unpriced = int(totals.get("unpriced_turn_count", 0) or 0) if isinstance(totals, dict) else 0
+    if unpriced:
+        parts.append(f"unpriced_turns:{unpriced}")
+    return "|".join(parts) if parts else "not_configured"
 
 
 def launch_chat_window(argv: list[str], cwd: Path | None = None) -> bool:

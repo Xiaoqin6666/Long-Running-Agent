@@ -73,6 +73,7 @@ class TaskState:
     skill_review_history: list[dict[str, Any]] = field(default_factory=list)
     conversation_messages: list[dict[str, str]] = field(default_factory=list)
     interaction_mode: str = ""
+    token_usage: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskState":
@@ -94,6 +95,7 @@ class TaskState:
         data.setdefault("skill_review_history", [])
         data.setdefault("conversation_messages", [])
         data.setdefault("interaction_mode", "")
+        data.setdefault("token_usage", {})
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +128,7 @@ class TaskState:
             "skill_review_history": self.skill_review_history,
             "conversation_messages": self.conversation_messages,
             "interaction_mode": self.interaction_mode,
+            "token_usage": self.token_usage,
         }
 
     def summary(self) -> str:

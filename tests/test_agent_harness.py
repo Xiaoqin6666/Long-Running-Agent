@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from agent.context import ContextBuilder
-from agent.llm import parse_action_json, validate_action
+from agent.llm import OpenAICompatibleDecisionMaker, parse_action_json, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id, resolve_log_path
 from agent.memory_retrieval import (
@@ -1099,6 +1099,122 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.nodes[0]["status"], "in_progress")
         self.assertFalse(state.evidence_sources)
 
+    def test_initializer_verify_success_clears_repair_state(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initializer_state(
+                spec.read_text(encoding="utf-8"),
+                project_spec_artifact="eval/benchmarks/todo_counter/project_spec.md",
+                requirements_artifact="state/benchmarks/todo_counter/requirements.json",
+                generated_tasks_artifact="state/benchmarks/todo_counter/generated_tasks.json",
+                init_artifact="state/benchmarks/todo_counter/init.sh",
+            )
+            state.initializer_repair = {
+                "candidate_path": "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json",
+                "validation_errors": ["old initializer error"],
+            }
+            requirement = {
+                "id": "REQ-COUNTER",
+                "source": "project_spec.md:1",
+                "text": "Counter core exists.",
+                "type": "service_logic",
+                "priority": "must",
+                "acceptance_intent": "Counter core file is part of the task plan.",
+            }
+            graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "requirement_ids": ["REQ-COUNTER"],
+                        "expected_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "worker_test_artifacts": [],
+                    }
+                ]
+            }
+            loop.requirements_path.write_text(
+                json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            loop.generated_tasks_path.write_text(
+                json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (loop.state_dir / "init.sh").write_text(
+                "#!/usr/bin/env sh\nset -eu\npython -c \"assert True\"\n",
+                encoding="utf-8",
+            )
+
+            observation = loop._execute_action({"action": "verify", "target": "default", "args": {}}, state)
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(state.initializer_repair, {})
+
+    def test_non_init_required_next_action_ignores_stale_initializer_repair(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "todo_counter"
+            state_dir.mkdir(parents=True)
+            state = create_initial_state("Implement counter")
+            state.task_id = "T3"
+            state.nodes = [
+                {
+                    "id": "T3",
+                    "title": "Implement counter",
+                    "status": "in_progress",
+                    "expected_artifacts": ["eval/benchmarks/todo_counter/workspace/counter.py"],
+                    "implementation_artifacts": ["eval/benchmarks/todo_counter/workspace/counter.py"],
+                    "worker_test_artifacts": [],
+                }
+            ]
+            state.initializer_repair = {
+                "candidate_path": "state/benchmarks/todo_counter/rejected_candidates/generated_tasks.json",
+                "validation_errors": ["old initializer error"],
+            }
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -m unittest discover",
+                "summary": "Command exited with code 1.",
+                "output": "AssertionError",
+                "targets": ["eval/benchmarks/todo_counter/workspace/counter.py"],
+                "repair_targets": ["eval/benchmarks/todo_counter/workspace/counter.py"],
+                "required_reads": [],
+                "read_targets": [],
+                "repaired_targets": [],
+            }
+            context_builder = ContextBuilder(root, state_dir=state_dir)
+
+            required = context_builder._required_next_action(state)
+            context = context_builder.build(state)
+
+        self.assertNotIn("Repair the saved INIT candidate", required)
+        self.assertNotIn("initializer_candidate", context)
+        self.assertNotIn("initializer_validation_errors", context)
+        self.assertIn("write or edit one of these implementation artifacts", required)
+
     def test_project_spec_uses_generated_tasks_after_initializer(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1487,6 +1603,33 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(observation.ok)
         self.assertTrue(observation.data["initializer_restricted"])
         self.assertFalse(workspace_exists)
+
+    def test_initializer_allows_bash_for_artifact_inspection(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            loop = AgentLoop(root=root, task="Initialize", max_steps=1)
+            state = create_initializer_state(
+                "# Todo Counter\n",
+                project_spec_artifact="state/project_spec.md",
+                requirements_artifact="state/requirements.json",
+                generated_tasks_artifact="state/generated_tasks.json",
+                init_artifact="state/init.sh",
+            )
+
+            observation = loop._execute_action(
+                {
+                    "action": "bash",
+                    "target": "python -c \"print('init bash ok')\"",
+                    "args": {},
+                },
+                state,
+            )
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(observation.data["returncode"], 0)
+        self.assertIn("init bash ok", observation.data["stdout"])
+        self.assertNotIn("initializer_restricted", observation.data)
 
     def test_initializer_rejects_task_graph_outside_spec_workspace(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -2196,6 +2339,272 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(state.last_action, action)
         self.assertTrue(state.last_observation["ok"])
+
+    def test_openai_decision_maker_exposes_api_token_usage(self) -> None:
+        decision_maker = OpenAICompatibleDecisionMaker(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+        )
+
+        def fake_post(payload: dict[str, object]) -> dict[str, object]:
+            self.assertEqual(payload["model"], "test-model")
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "thought_summary": "Inspect.",
+                                    "action": "list_files",
+                                    "target": ".",
+                                    "args": {},
+                                    "expected_observation": "Workspace entries.",
+                                    "risk": "low",
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "total_tokens": 168,
+                },
+            }
+
+        decision_maker._post_chat_completions = fake_post
+        action = decision_maker.next_action("Context", create_initial_state("Inspect workspace"))
+
+        self.assertEqual(action["action"], "list_files")
+        self.assertEqual(
+            decision_maker.last_token_usage,
+            {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168, "source": "api"},
+        )
+
+    def test_openai_decision_maker_prefers_api_cost_when_returned(self) -> None:
+        decision_maker = OpenAICompatibleDecisionMaker(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+        )
+
+        def fake_post(payload: dict[str, object]) -> dict[str, object]:
+            del payload
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "thought_summary": "Inspect.",
+                                    "action": "list_files",
+                                    "target": ".",
+                                    "args": {},
+                                    "expected_observation": "Workspace entries.",
+                                    "risk": "low",
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "total_tokens": 150,
+                },
+                "cost": {
+                    "input_cost": 0.001,
+                    "output_cost": 0.002,
+                    "total_cost": 0.003,
+                    "currency": "USD",
+                },
+            }
+
+        decision_maker._post_chat_completions = fake_post
+        action = decision_maker.next_action("Context", create_initial_state("Inspect workspace"))
+
+        self.assertEqual(action["action"], "list_files")
+        self.assertEqual(decision_maker.last_token_usage["cost"]["price_source"], "api")
+        self.assertEqual(decision_maker.last_token_usage["cost"]["total_cost"], 0.003)
+
+    def test_loop_records_api_token_usage_by_turn_and_session(self) -> None:
+        action = {
+            "action": "list_files",
+            "target": ".",
+            "args": {},
+            "thought_summary": "Inspect the workspace.",
+            "expected_observation": "Workspace entries.",
+            "risk": "low",
+        }
+
+        class FixedDecisionMaker:
+            model = "test-model"
+            last_token_usage = {
+                "input_tokens": 20,
+                "output_tokens": 8,
+                "total_tokens": 28,
+                "source": "api",
+            }
+
+            def next_action(self, context: str, state: object) -> dict[str, object]:
+                return action
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect workspace", max_steps=1)
+            loop._ensure_state_files()
+            loop.provider = "openai-compatible"
+            loop.decision_maker = FixedDecisionMaker()
+            state = create_initial_state("Inspect workspace")
+
+            loop._run_one_session(state)
+            events = loop._load_trace_events(loop.trace_path)
+
+        totals = state.token_usage["totals"]
+        session_usage = state.token_usage["sessions"][loop.trace_path.stem]
+        turn_usage = state.token_usage["turns"][0]
+        self.assertEqual(totals["input_tokens"], 20)
+        self.assertEqual(totals["output_tokens"], 8)
+        self.assertEqual(totals["total_tokens"], 28)
+        self.assertEqual(session_usage["turn_count"], 1)
+        self.assertEqual(turn_usage["step"], 1)
+        self.assertEqual(turn_usage["model"], "test-model")
+        self.assertEqual(events[0]["token_usage"]["source"], "api")
+        self.assertEqual(events[0]["session_token_usage"]["total_tokens"], 28)
+
+    def test_loop_records_token_usage_cost_when_price_is_configured(self) -> None:
+        action = {
+            "action": "list_files",
+            "target": ".",
+            "args": {},
+            "thought_summary": "Inspect the workspace.",
+            "expected_observation": "Workspace entries.",
+            "risk": "low",
+        }
+
+        class FixedDecisionMaker:
+            model = "priced-model"
+            last_token_usage = {
+                "input_tokens": 1_000,
+                "output_tokens": 500,
+                "total_tokens": 1_500,
+                "source": "api",
+            }
+
+            def next_action(self, context: str, state: object) -> dict[str, object]:
+                return action
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect workspace", max_steps=1)
+            loop._ensure_state_files()
+            loop.decision_maker = FixedDecisionMaker()
+            loop.token_pricing = {
+                "priced-model": {
+                    "input_per_1m": 2.0,
+                    "output_per_1m": 8.0,
+                    "currency": "USD",
+                    "source": "test",
+                }
+            }
+            state = create_initial_state("Inspect workspace")
+
+            loop._run_one_session(state)
+            events = loop._load_trace_events(loop.trace_path)
+
+        cost = state.token_usage["turns"][0]["cost"]
+        self.assertTrue(cost["available"])
+        self.assertEqual(cost["input_cost"], 0.002)
+        self.assertEqual(cost["output_cost"], 0.004)
+        self.assertEqual(cost["total_cost"], 0.006)
+        self.assertEqual(cost["currency"], "USD")
+        self.assertEqual(state.token_usage["totals"]["costs_by_currency"]["USD"]["total_cost"], 0.006)
+        self.assertEqual(state.token_usage["totals"]["unpriced_turn_count"], 0)
+        self.assertEqual(events[0]["token_usage"]["cost"]["total_cost"], 0.006)
+
+    def test_loop_keeps_api_returned_cost_over_configured_price(self) -> None:
+        action = {
+            "action": "list_files",
+            "target": ".",
+            "args": {},
+            "thought_summary": "Inspect the workspace.",
+            "expected_observation": "Workspace entries.",
+            "risk": "low",
+        }
+
+        class FixedDecisionMaker:
+            model = "priced-model"
+            last_token_usage = {
+                "input_tokens": 1_000,
+                "output_tokens": 500,
+                "total_tokens": 1_500,
+                "source": "api",
+                "cost": {
+                    "available": True,
+                    "currency": "USD",
+                    "input_cost": 0.1,
+                    "output_cost": 0.2,
+                    "total_cost": 0.3,
+                    "price_source": "api",
+                },
+            }
+
+            def next_action(self, context: str, state: object) -> dict[str, object]:
+                return action
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect workspace", max_steps=1)
+            loop._ensure_state_files()
+            loop.decision_maker = FixedDecisionMaker()
+            loop.token_pricing = {
+                "priced-model": {
+                    "input_per_1m": 2.0,
+                    "output_per_1m": 8.0,
+                    "currency": "USD",
+                    "source": "test",
+                }
+            }
+            state = create_initial_state("Inspect workspace")
+
+            loop._run_one_session(state)
+
+        cost = state.token_usage["turns"][0]["cost"]
+        self.assertEqual(cost["price_source"], "api")
+        self.assertEqual(cost["total_cost"], 0.3)
+        self.assertEqual(state.token_usage["totals"]["costs_by_currency"]["USD"]["total_cost"], 0.3)
+
+    def test_loop_estimates_token_usage_when_provider_has_no_usage(self) -> None:
+        action = {
+            "action": "list_files",
+            "target": ".",
+            "args": {},
+            "thought_summary": "Inspect the workspace.",
+            "expected_observation": "Workspace entries.",
+            "risk": "low",
+        }
+
+        class FixedDecisionMaker:
+            model = "offline"
+
+            def next_action(self, context: str, state: object) -> dict[str, object]:
+                return action
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect workspace", max_steps=1)
+            loop._ensure_state_files()
+            loop.decision_maker = FixedDecisionMaker()
+            state = create_initial_state("Inspect workspace")
+
+            loop._run_one_session(state)
+
+        turn_usage = state.token_usage["turns"][0]
+        self.assertEqual(turn_usage["source"], "estimated")
+        self.assertGreater(turn_usage["input_tokens"], 0)
+        self.assertGreater(turn_usage["output_tokens"], 0)
+        self.assertEqual(state.token_usage["totals"]["turn_count"], 1)
 
     def test_answer_action_completes_answer_task(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -6730,6 +7139,18 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "action": {"action": "contract"},
                     "observation": {"ok": False, "summary": "Acceptance contract rejected.", "data": {}},
                     "session_used_tokens": 10,
+                    "token_usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 200,
+                        "total_tokens": 1200,
+                        "cost": {
+                            "available": True,
+                            "currency": "USD",
+                            "input_cost": 0.001,
+                            "output_cost": 0.002,
+                            "total_cost": 0.003,
+                        },
+                    },
                     "handoff_ready": False,
                     "nodes": [{"id": "T1", "status": "in_progress"}],
                 },
@@ -6737,6 +7158,12 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "action": {"action": "verify"},
                     "observation": {"ok": False, "summary": "Verifier failed.", "data": {}},
                     "session_used_tokens": 20,
+                    "token_usage": {
+                        "input_tokens": 2000,
+                        "output_tokens": 300,
+                        "total_tokens": 2300,
+                        "cost": {"available": False, "reason": "missing_model_price"},
+                    },
                     "handoff_ready": True,
                     "nodes": [{"id": "T1", "status": "in_progress"}],
                 },
@@ -6759,6 +7186,11 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(summary["no_progress_sessions"], 0)
         self.assertEqual(summary["max_session_used_tokens"], 30)
         self.assertEqual(summary["max_turn_used_tokens"], 30)
+        self.assertEqual(summary["llm_input_tokens"], 3000)
+        self.assertEqual(summary["llm_output_tokens"], 500)
+        self.assertEqual(summary["llm_total_tokens"], 3500)
+        self.assertEqual(summary["llm_costs_by_currency"]["USD"]["total_cost"], 0.003)
+        self.assertEqual(summary["llm_unpriced_turns"], 1)
         self.assertEqual(summary["completed_tasks"], 1)
         self.assertEqual(summary["blocked_tasks"], 1)
 
