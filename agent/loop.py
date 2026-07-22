@@ -878,6 +878,8 @@ class AgentLoop:
         command: str = "",
         state: TaskState | None = None,
     ) -> str | None:
+        if "Command timed out after" in output or "timed out after" in output:
+            return "command_timeout"
         if "SyntaxError:" in output and "invalid syntax" in output:
             return "command_syntax_error"
         if self._looks_like_cwd_environment_failure(output, command):
@@ -1820,10 +1822,17 @@ class AgentLoop:
             command = str(failed.get("command", ""))
             output = str(failed.get("output", ""))
             full_output = self._full_output_from_data(failed)
-            failure_type = self._command_failure_type(full_output, command=command, state=state)
+            failure_type = (
+                "command_timeout"
+                if failed.get("timed_out") is True
+                else self._command_failure_type(full_output, command=command, state=state)
+            )
             if failure_type in {"command_syntax_error", "command_environment_error"}:
                 targets: list[str] = []
                 required_reads: list[str] = []
+            elif failure_type == "command_timeout":
+                targets = self._repair_targets_from_failed_output(command, full_output, state)
+                required_reads = []
             else:
                 targets = self._repair_targets_from_failed_output(command, full_output, state)
                 required_reads = self._repair_read_targets_from_failed_output(command, full_output, state)
@@ -1858,10 +1867,17 @@ class AgentLoop:
                 return
             output = str(observation.data.get("output", ""))
             full_output = self._full_output_from_data(observation.data)
-            failure_type = self._command_failure_type(full_output, command=command, state=state)
+            failure_type = (
+                "command_timeout"
+                if observation.data.get("timed_out") is True
+                else self._command_failure_type(full_output, command=command, state=state)
+            )
             if failure_type in {"command_syntax_error", "command_environment_error"}:
                 targets: list[str] = []
                 required_reads: list[str] = []
+            elif failure_type == "command_timeout":
+                targets = self._repair_targets_from_failed_output(command, full_output, state)
+                required_reads = []
             else:
                 targets = self._repair_targets_from_failed_output(command, full_output, state)
                 required_reads = self._repair_read_targets_from_failed_output(command, full_output, state)
@@ -1888,6 +1904,15 @@ class AgentLoop:
                 read_targets = state.pending_repair.setdefault("read_targets", [])
                 if isinstance(read_targets, list) and target not in {self._normalize_target(item) for item in read_targets}:
                     read_targets.append(target)
+            repaired_targets = state.pending_repair.get("repaired_targets", [])
+            if isinstance(repaired_targets, list) and target in {
+                self._normalize_target(item) for item in repaired_targets
+            }:
+                post_repair_reads = state.pending_repair.setdefault("post_repair_read_targets", [])
+                if isinstance(post_repair_reads, list) and target not in {
+                    self._normalize_target(item) for item in post_repair_reads
+                }:
+                    post_repair_reads.append(target)
             return
         if name in {"write", "edit"} and observation.ok:
             targets = set(self._pending_repair_write_targets(state))
@@ -1898,6 +1923,11 @@ class AgentLoop:
                     self._normalize_target(item) for item in repaired_targets
                 }:
                     repaired_targets.append(target)
+                post_repair_reads = state.pending_repair.get("post_repair_read_targets", [])
+                if isinstance(post_repair_reads, list):
+                    state.pending_repair["post_repair_read_targets"] = [
+                        item for item in post_repair_reads if self._normalize_target(item) != target
+                    ]
 
     def _mark_final_acceptance_stale_after_adjust_write(self, state: TaskState, action: dict[str, Any]) -> None:
         target = self._normalize_target(action.get("target", ""))

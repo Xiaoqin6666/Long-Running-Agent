@@ -287,6 +287,90 @@ class ChatCLITests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_resume_command_accepts_one_time_instruction(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-resume-instruction-{uuid4().hex}"
+        state_dir = root / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "current_task.json").write_text(
+            '{"task_id":"current","user_goal":"Build app","acceptance_criteria":[],"nodes":[]}',
+            encoding="utf-8",
+        )
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=state_dir / "traces" / "run.jsonl",
+            state_path=state_dir / "current_task.json",
+            message="resumed",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_run(loop: AgentLoop) -> RunResult:
+            captured["conversation_messages"] = loop.conversation_messages
+            return run_result
+
+        try:
+            with patch.object(cli, "_make_loop", wraps=cli._make_loop) as make_loop:
+                with patch.object(AgentLoop, "run", fake_run):
+                    cli._handle_command("/resume focus on scheduler.py before editing budget_service.py")
+            self.assertTrue(make_loop.call_args.kwargs["resume"])
+            self.assertTrue(make_loop.call_args.kwargs["include_conversation"])
+            self.assertEqual(make_loop.call_args.kwargs["interaction_mode"], "adjust")
+            self.assertEqual(
+                captured["conversation_messages"],
+                [{"role": "user", "content": "focus on scheduler.py before editing budget_service.py"}],
+            )
+            self.assertEqual(cli.last_task, "")
+            history = (state_dir / "chat_history.jsonl").read_text(encoding="utf-8")
+            self.assertIn("focus on scheduler.py", history)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_resume_command_without_instruction_preserves_existing_behavior(self) -> None:
+        outputs: list[str] = []
+        root = Path.cwd() / ".tmp_tests" / f"chat-resume-plain-{uuid4().hex}"
+        state_dir = root / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "current_task.json").write_text(
+            '{"task_id":"current","user_goal":"Build app","acceptance_criteria":[],"nodes":[]}',
+            encoding="utf-8",
+        )
+        cli = InteractiveCLI(
+            ChatConfig(root=root, provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        run_result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=state_dir / "traces" / "run.jsonl",
+            state_path=state_dir / "current_task.json",
+            message="resumed",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_run(loop: AgentLoop) -> RunResult:
+            captured["conversation_messages"] = loop.conversation_messages
+            return run_result
+
+        try:
+            with patch.object(cli, "_make_loop", wraps=cli._make_loop) as make_loop:
+                with patch.object(AgentLoop, "run", fake_run):
+                    cli._handle_command("/resume")
+            self.assertTrue(make_loop.call_args.kwargs["resume"])
+            self.assertFalse(make_loop.call_args.kwargs["include_conversation"])
+            self.assertEqual(make_loop.call_args.kwargs["interaction_mode"], "")
+            self.assertEqual(captured["conversation_messages"], [])
+            history = (state_dir / "chat_history.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn('"role": "user"', history)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_adjust_mode_collects_directions_until_send(self) -> None:
         outputs: list[str] = []
         inputs = iter(["/adjust", "make it compact", "keep the filters visible", "/send", "/exit"])

@@ -141,6 +141,12 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn('"worker_test_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("verification_procedure", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("write the task's worker_test_artifacts first", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("1-5 closely related requirements", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("independently verifiable", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("targeted tests are preferred over full-suite tests", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("test_mode, dependency-injected dialogs, or mocked modal functions", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("must not rely on mainloop()", MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('do not create a single "Main Window and Panels" task', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Read narrowly instead of preloading the repository", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("continue read has_more pages", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Avoid Unix-only commands", MAIN_AGENT_SYSTEM_PROMPT)
@@ -1074,6 +1080,11 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "project_spec.md").exists())
             self.assertIn("Read specs/user_project_spec.md", context)
             self.assertIn("do not rewrite or regenerate it", context)
+            self.assertIn("Task planning rules after requirement capture", context)
+            self.assertIn("1-5 closely related requirements", context)
+            self.assertIn("Prefer targeted tests over full-suite tests", context)
+            self.assertIn("test_mode, dependency-injected dialogs, or mocked modal functions", context)
+            self.assertIn("Do not create a single \"Main Window and Panels\" task", context)
             self.assertNotIn("state/benchmarks/todo_counter/project_spec.md must exist", context)
             self.assertNotIn("state/benchmarks/todo_counter/project_spec.md", loop._initializer_allowed_targets(state))
 
@@ -1168,8 +1179,12 @@ class HarnessBehaviorTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            required = loop.context_builder._required_next_action(state)
             observation = loop._execute_action({"action": "verify", "target": "default", "args": {}}, state)
 
+        self.assertIn("Next action must be verify", required)
+        self.assertIn("official requirements.json, generated_tasks.json, and init.sh already pass", required)
+        self.assertNotIn("Repair the saved INIT candidate", required)
         self.assertTrue(observation.ok)
         self.assertEqual(state.initializer_repair, {})
 
@@ -3119,6 +3134,53 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.pending_repair["repair_targets"], ["workspace/issue_tracker/store.py"])
         self.assertEqual(state.pending_repair["required_reads"][0], "workspace/tests/test_store.py")
 
+    def test_timed_out_contract_command_records_flexible_repair_without_forced_reads(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            (root / "state" / "traces").mkdir()
+            loop = AgentLoop(root=root, task="Implement store", max_steps=1)
+            state = create_initial_state("Implement store")
+            state.task_id = "IT2"
+            state.nodes = [
+                {
+                    "id": "IT2",
+                    "title": "Store",
+                    "status": "in_progress",
+                    "expected_artifacts": [
+                        "workspace/issue_tracker/store.py",
+                        "workspace/tests/test_store.py",
+                    ],
+                    "implementation_artifacts": ["workspace/issue_tracker/store.py"],
+                    "worker_test_artifacts": ["workspace/tests/test_store.py"],
+                    "verification_commands": ["python -m unittest discover -s workspace/tests"],
+                }
+            ]
+            state.acceptance_contracts.append(
+                {
+                    "task_id": "IT2",
+                    "summary": "Implement store.",
+                    "checks": ["python -m unittest discover -s workspace/tests"],
+                    "status": "agreed",
+                }
+            )
+
+            command = f"cd {root} && python -m unittest discover -s workspace/tests"
+            loop._update_state(
+                state,
+                {"action": "bash", "target": command, "args": {"timeout": 60}},
+                ToolResult(
+                    False,
+                    "Command timed out after 60 second(s).",
+                    {"command": command, "output": "", "timed_out": True},
+                ),
+            )
+
+        self.assertEqual(state.pending_repair["command_failure_type"], "command_timeout")
+        self.assertEqual(state.pending_repair["required_reads"], [])
+        self.assertEqual(state.pending_repair["read_targets"], [])
+        self.assertEqual(state.pending_repair["repair_targets"], ["workspace/issue_tracker/store.py"])
+
     def test_pending_repair_preserves_full_failure_output(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3509,6 +3571,165 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.pending_repair["repaired_targets"], [target])
         self.assertIn(command, context)
         self.assertIn(f"- repaired_targets: ['{target}']", context)
+
+    def test_required_next_action_after_acceptance_repair_allows_inspection_and_targeted_test(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = "workspace/pkg/service.py"
+            command = "python -m unittest workspace.tests.test_service -v"
+            state = create_initial_state("Repair service")
+            state.task_id = "T2"
+            state.nodes = [
+                {
+                    "id": "T2",
+                    "title": "Service",
+                    "status": "in_progress",
+                    "expected_artifacts": [target],
+                    "implementation_artifacts": [target],
+                    "worker_test_artifacts": [],
+                    "verification_commands": [command],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": command,
+                "summary": "Command exited with code 1.",
+                "output": "AssertionError",
+                "targets": [target],
+                "repair_targets": [target],
+                "required_reads": [target],
+                "read_targets": [target],
+                "repaired_targets": [target],
+                "post_repair_read_targets": [],
+            }
+
+            required = ContextBuilder(root)._required_next_action(state)
+
+        self.assertIn("smaller targeted test", required)
+        self.assertIn(f"bash target='{command}'", required)
+        self.assertIn(f"read target='{target}'", required)
+        self.assertIn("git diff", required)
+        self.assertNotIn("Next action must be bash", required)
+        self.assertNotIn("until this command is rerun", required)
+
+    def test_required_next_action_for_timeout_uses_flexible_diagnostics(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = "workspace/pkg/bottom_panel.py"
+            command = "python -m unittest workspace.tests.test_ui -v"
+            state = create_initial_state("Repair UI")
+            state.task_id = "T4"
+            state.nodes = [
+                {
+                    "id": "T4",
+                    "title": "UI",
+                    "status": "in_progress",
+                    "expected_artifacts": [target, "workspace/tests/test_ui.py"],
+                    "implementation_artifacts": [target],
+                    "worker_test_artifacts": ["workspace/tests/test_ui.py"],
+                    "verification_commands": [command],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": command,
+                "summary": "Command timed out after 60 second(s).",
+                "output": "Command timed out after 60 second(s).",
+                "targets": [target, "workspace/tests/test_ui.py"],
+                "repair_targets": [target],
+                "required_reads": [target],
+                "read_targets": [],
+                "repaired_targets": [],
+                "command_failure_type": "command_timeout",
+            }
+
+            required = ContextBuilder(root)._required_next_action(state)
+
+        self.assertIn("timed out", required)
+        self.assertIn("gather timeout evidence", required)
+        self.assertIn("smaller targeted bash test", required)
+        self.assertIn("search likely blocking patterns", required)
+        self.assertIn(target, required)
+        self.assertNotIn(f"Next action must be read target='{target}'", required)
+        self.assertNotIn("before any write/edit repair", required)
+
+    def test_required_next_action_after_verification_repair_allows_targeted_test(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = "workspace/pkg/service.py"
+            state = create_initial_state("Repair service")
+            state.task_id = "T2"
+            state.nodes = [
+                {
+                    "id": "T2",
+                    "title": "Service",
+                    "status": "in_progress",
+                    "expected_artifacts": [target],
+                    "implementation_artifacts": [target],
+                    "worker_test_artifacts": [],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_verification_command",
+                "command": "verify",
+                "summary": "Verifier failed.",
+                "output": "AssertionError",
+                "targets": [target],
+                "repair_targets": [target],
+                "required_reads": [target],
+                "read_targets": [target],
+                "repaired_targets": [target],
+                "post_repair_read_targets": [target],
+            }
+
+            required = ContextBuilder(root)._required_next_action(state)
+
+        self.assertIn("verify to rerun the agreed procedure", required)
+        self.assertIn("smaller targeted test", required)
+        self.assertNotIn("read target=", required)
+        self.assertNotIn("Next action must be verify", required)
+
+    def test_pending_repair_tracks_post_repair_reads(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Repair service", max_steps=1)
+            target = "workspace/pkg/service.py"
+            state = create_initial_state("Repair service")
+            state.task_id = "T2"
+            state.nodes = [
+                {
+                    "id": "T2",
+                    "title": "Service",
+                    "status": "in_progress",
+                    "expected_artifacts": [target],
+                    "implementation_artifacts": [target],
+                    "worker_test_artifacts": [],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -m unittest workspace.tests.test_service -v",
+                "summary": "Command exited with code 1.",
+                "output": "AssertionError",
+                "targets": [target],
+                "repair_targets": [target],
+                "required_reads": [target],
+                "read_targets": [target],
+                "repaired_targets": [],
+                "post_repair_read_targets": [target],
+            }
+
+            edit_action = {"action": "edit", "target": target, "args": {"old": "old", "new": "new"}}
+            loop._update_state(state, edit_action, ToolResult(True, "Edited.", {"path": target}))
+            self.assertEqual(state.pending_repair["repaired_targets"], [target])
+            self.assertEqual(state.pending_repair["post_repair_read_targets"], [])
+
+            read_action = {"action": "read", "target": target, "args": {}}
+            loop._update_state(state, read_action, ToolResult(True, "Read.", {"content": "new"}))
+            self.assertEqual(state.pending_repair["post_repair_read_targets"], [target])
+
+            loop._update_state(state, edit_action, ToolResult(True, "Edited again.", {"path": target}))
+            self.assertEqual(state.pending_repair["post_repair_read_targets"], [])
 
     def test_pytest_traceback_source_files_become_repair_targets_for_test_task(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

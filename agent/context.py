@@ -6,7 +6,12 @@ import subprocess
 from pathlib import Path
 
 from agent.memory_retrieval import truncate_entrypoint_content
-from agent.planner import TaskState
+from agent.planner import (
+    TaskState,
+    validate_generated_task_graph,
+    validate_initializer_script,
+    validate_requirements_matrix,
+)
 from agent.skills import parse_skill, skill_catalog
 
 
@@ -953,6 +958,14 @@ class ContextBuilder:
             "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
             "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
             "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', requirement_ids, expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
+            "Task planning rules after requirement capture:",
+            "1. Preserve traceability. Each task must reference stable requirement_ids from requirements.json. Every must requirement must be covered. Do not invent new requirement ids in generated_tasks.json.",
+            "2. Keep tasks small and independently verifiable. A task should usually cover 1-5 closely related requirements and own a small coherent artifact set. Avoid tasks that span many unrelated UI regions, services, dialogs, widgets, and integration flows at once.",
+            "3. Split by executable verification boundary, not just by folder. A good task is one whose worker_test_artifacts can verify the task without requiring the whole application to be complete. Prefer targeted tests over full-suite tests.",
+            "4. Separate foundations from integrations. Plan data models, storage, service logic, UI shell, widget/dialog primitives, panel APIs, and end-to-end integration as separate tasks with explicit depends_on edges.",
+            "5. Avoid duplicate requirement ownership. Assign each requirement to one primary implementation task when possible. Only repeat a requirement_id in a later integration task when the later task verifies cross-component behavior that cannot be verified in the primary task alone.",
+            "6. For GUI projects, plan non-interactive verification. UI tasks must be testable without human clicks. Generated tasks for Tkinter/PyQt/etc. must require test_mode, dependency-injected dialogs, or mocked modal functions. Worker tests must not rely on mainloop(), messagebox.askyesno(), simpledialog.askstring(), or manual window interaction.",
+            "7. For UI tasks, split shell, components, dialogs/widgets, and integration. Do not create a single \"Main Window and Panels\" task that owns the entire UI. Use smaller tasks: UI shell and test_mode infrastructure; panel public APIs and widget structure; dialogs with non-blocking test adapters; custom widgets; workflow integration across panels.",
             "When a generated task is later selected, the harness derives frozen acceptance criteria from requirements.json using frozen_acceptance when present, otherwise acceptance_intent or text. The Worker must write the selected task's worker_test_artifacts first, putting GUI handler and observable state-change assertions in those test files, then use action='contract' to provide the verification_procedure that runs those tests. Only after that may the Worker write implementation_artifacts.",
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
             "Minimal requirements.json example:",
@@ -979,6 +992,68 @@ class ContextBuilder:
         if self.state_dir == self.root / "state" and root_spec.exists():
             return root_spec
         return state_spec
+
+    def _initializer_official_outputs_valid(self) -> bool:
+        requirements_path = self.state_dir / "requirements.json"
+        generated_path = self.state_dir / "generated_tasks.json"
+        init_path = self.state_dir / "init.sh"
+        spec_path = self._project_spec_context_path()
+        try:
+            requirements_content = requirements_path.read_text(encoding="utf-8")
+            requirements_data = json.loads(requirements_content)
+            generated_data = json.loads(generated_path.read_text(encoding="utf-8"))
+            init_content = init_path.read_text(encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        expected_workspace = self._expected_initializer_workspace_root(spec_path)
+        errors = validate_requirements_matrix(requirements_data)
+        errors.extend(
+            validate_generated_task_graph(
+                generated_data,
+                expected_workspace,
+                standard_library_only=self._project_requires_standard_library(spec_path),
+                require_requirement_coverage=True,
+                requirements_data=requirements_data,
+                require_verification_plan=False,
+            )
+        )
+        errors.extend(
+            validate_initializer_script(
+                init_content,
+                expected_workspace,
+                standard_library_only=self._project_requires_standard_library(spec_path),
+            )
+        )
+        return not errors
+
+    def _expected_initializer_workspace_root(self, spec_path: Path | None) -> str | None:
+        try:
+            spec = spec_path.read_text(encoding="utf-8") if spec_path else ""
+        except OSError:
+            spec = ""
+        for candidate in re.findall(r"`([^`\r\n]+)`", spec):
+            normalized = str(candidate).replace("\\", "/").strip().rstrip("/")
+            if normalized.lower().endswith("/workspace") and not any(char.isspace() for char in normalized):
+                return normalized
+        benchmark = self._benchmark_id_from_state_dir()
+        if benchmark:
+            return f"eval/benchmarks/{benchmark}/workspace"
+        return None
+
+    def _project_requires_standard_library(self, spec_path: Path | None) -> bool:
+        try:
+            spec = spec_path.read_text(encoding="utf-8").lower() if spec_path else ""
+        except OSError:
+            return False
+        return "use only the python standard library" in spec or "standard library only" in spec
+
+    def _benchmark_id_from_state_dir(self) -> str:
+        parts = self.state_dir.parts
+        for index, part in enumerate(parts[:-1]):
+            if part == "benchmarks":
+                return parts[index + 1]
+        return ""
 
     @staticmethod
     def _normalize_path(path: Path) -> str:
@@ -1008,6 +1083,12 @@ class ContextBuilder:
             else {}
         )
         if initializer_repair:
+            if self._initializer_official_outputs_valid():
+                return (
+                    "The saved INIT repair state is stale: official requirements.json, generated_tasks.json, and init.sh already pass deterministic validation. "
+                    "Next action must be verify to let the harness complete INIT and clear initializer_repair. "
+                    "Do not reread or recopy rejected_candidates/generated_tasks.json."
+                )
             candidate = str(initializer_repair.get("candidate_path", ""))
             errors = initializer_repair.get("validation_errors", [])
             error_text = " | ".join(str(error) for error in errors) if isinstance(errors, list) else str(errors)
@@ -1062,6 +1143,19 @@ class ContextBuilder:
             missing_read = self._next_pending_repair_read(state)
             output = str(state.pending_repair.get("output", "")).strip().splitlines()
             excerpt = " | ".join(output[:4])[:700] if output else state.pending_repair.get("summary", "")
+            if self._pending_repair_is_timeout(state):
+                command = str(state.pending_repair.get("command", ""))
+                output_path = str(state.pending_repair.get("output_path", "") or state.pending_repair.get("stderr_path", ""))
+                output_hint = f" read target='{output_path}' for captured output," if output_path else ""
+                return (
+                    "The last acceptance or verification command timed out. "
+                    "Next action should gather timeout evidence before guessing a repair:"
+                    f"{output_hint} read or git diff recently edited files, search likely blocking patterns "
+                    "(messagebox/simpledialog/mainloop/wait_window/grab_set/thread join), or run a smaller targeted bash test "
+                    "that isolates the hang. "
+                    f"After evidence identifies the blocker, use write/edit on one of these implementation artifacts: {', '.join(repair_targets)}. "
+                    f"Do not force-read a single repair target solely because it appears in repair_targets; do not rerun the full timed-out command '{command}' unchanged."
+                )
             if missing_read:
                 return (
                     "The last acceptance or verification command failed. "
@@ -1071,16 +1165,25 @@ class ContextBuilder:
                 )
             if self._pending_repair_has_attempt(state):
                 command = str(state.pending_repair.get("command", ""))
+                post_repair_read_target = self._next_post_repair_read_target(state)
+                post_repair_read_hint = (
+                    f" If the repaired file has not been inspected after the edit, next action may be read target='{post_repair_read_target}' "
+                    "or git diff for that file before retesting."
+                    if post_repair_read_target
+                    else ""
+                )
                 if state.pending_repair.get("reason") == "failed_verification_command":
                     return (
                         "A repair was attempted for the failed verification procedure. "
-                        "Next action must be verify to rerun the agreed procedure. "
-                        "Do not list directories or continue editing until verification is rerun."
+                        "Next action should be verify to rerun the agreed procedure, or bash with a smaller targeted test that directly exercises the repaired failure before full verification. "
+                        f"{post_repair_read_hint} "
+                        "Do not list directories or continue unrelated editing without new evidence."
                     )
                 return (
                     "A repair was attempted for the failed acceptance command. "
-                    f"Next action must be bash target='{command}' to rerun the same acceptance command. "
-                    "Do not list directories or continue editing until this command is rerun."
+                    f"Next action should be bash target='{command}' to rerun the same acceptance command, or bash with a smaller targeted test that directly exercises the repaired failure before full acceptance. "
+                    f"{post_repair_read_hint} "
+                    "Do not list directories or continue unrelated editing without new evidence."
                 )
             if not repair_targets:
                 command = str(state.pending_repair.get("command", ""))
@@ -1226,6 +1329,35 @@ class ContextBuilder:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
         repaired_targets = repair.get("repaired_targets", [])
         return isinstance(repaired_targets, list) and bool(repaired_targets)
+
+    def _pending_repair_is_timeout(self, state: TaskState) -> bool:
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        if str(repair.get("command_failure_type", "")) == "command_timeout":
+            return True
+        combined = "\n".join(
+            str(repair.get(key, ""))
+            for key in ("summary", "output")
+        )
+        return "Command timed out after" in combined or "timed out after" in combined
+
+    def _next_post_repair_read_target(self, state: TaskState) -> str | None:
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        repaired_targets = repair.get("repaired_targets", [])
+        post_repair_reads = repair.get("post_repair_read_targets", [])
+        if not isinstance(repaired_targets, list):
+            return None
+        normalized_reads = set()
+        if isinstance(post_repair_reads, list):
+            normalized_reads = {self._normalize_repair_target(item) for item in post_repair_reads}
+        for target in repaired_targets:
+            normalized = self._normalize_repair_target(target)
+            if normalized and normalized not in normalized_reads:
+                return normalized
+        return None
+
+    @staticmethod
+    def _normalize_repair_target(target: object) -> str:
+        return str(target).replace("\\", "/").strip().rstrip("/")
 
     def _pending_repair_targets(self, state: TaskState) -> list[str]:
         repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}

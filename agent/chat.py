@@ -28,8 +28,10 @@ UI_WIDTH = 72
 TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
 HELP_TEXT = """Commands:
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
+  /send      Start work from the collected /agent requirements or /adjust directions
+  /clear     Clear collected /agent requirements or /adjust directions
   /adjust    Switch to adjust mode; provide changes for the existing agent run without reinitializing
-  /resume    Continue the last unfinished agent run
+  /resume    Continue the last unfinished agent run, optionally with one-time guidance
   /mode      Show the current input mode
   /skill     Add a user-authored Skill with a guided form
   /memory    Add a typed Memory with a guided form
@@ -180,7 +182,7 @@ class InteractiveCLI:
         elif command == "/history":
             self._show_history()
         elif command == "/resume":
-            self._resume()
+            self._resume(content)
         elif command == "/new":
             self.messages.clear()
             self.context_message_start = 0
@@ -680,7 +682,7 @@ class InteractiveCLI:
             return
         self._finish_turn(result)
 
-    def _resume(self) -> None:
+    def _resume(self, instruction: str = "") -> None:
         if not self.state_path.exists():
             self.output("There is no saved agent run to resume.")
             return
@@ -688,10 +690,20 @@ class InteractiveCLI:
         if not task:
             self.output("The saved state has no user goal to resume.")
             return
+        instruction = instruction.strip()
         self.context_message_start = len(self.messages)
+        if instruction:
+            user_message = ChatMessage("user", instruction)
+            self.messages.append(user_message)
+            self._append_history(user_message)
         self.output(self._paint("Agent > resuming...", "green", bold=True))
         try:
-            result = self._make_loop(task, resume=True, include_conversation=False, interaction_mode="").run()
+            result = self._make_loop(
+                task,
+                resume=True,
+                include_conversation=bool(instruction),
+                interaction_mode="adjust" if instruction else "",
+            ).run()
         except Exception as exc:
             self.output(f"{self._paint('Agent >', 'red', bold=True)} Resume failed: {exc}\n")
             return
