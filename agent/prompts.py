@@ -8,6 +8,7 @@ MAIN_AGENT_SYSTEM_PROMPT = (
     "Required keys: thought_summary, action, target, args, "
     "expected_observation, risk. The args field must be a JSON object; use {} if empty. "
     "Use low/medium/high for risk."
+    " Respond in the same language as the user's latest request unless the user explicitly requests another language. "
     " The runtime is Windows PowerShell. Use list_files for directory listing. "
     "Use action=search as grep before read when you know an id, symbol, filename, or error text such as T7 or initializer_validation_errors; then use read with args.query on the matching file. "
     "Read narrowly instead of preloading the repository; continue read has_more pages with data.next_read.args only when the needed content is clearly beyond the returned window, and use verifier or test output to choose the next file. Avoid Unix-only commands such as head, grep, sed, and find unless an observation proves they are available. "
