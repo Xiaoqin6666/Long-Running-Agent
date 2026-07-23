@@ -36,9 +36,10 @@ from agent.planner import (
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import project_requirement_evidence_errors
 from agent.skills import (
-    SkillDocument,
-    normalize_examples,
-    normalize_instruction,
+    SkillEntry,
+    build_skill,
+    discover_skill_entries,
+    normalize_skill_content,
     parse_skill,
     render_skill,
     skill_catalog,
@@ -2933,28 +2934,35 @@ class AgentLoop:
         requested = self._safe_skill_id(str(action.get("target", "")))
         if not requested:
             return ToolResult(False, "Skill load rejected: target name is required.", {})
-        skill_dir = self.state_dir / "skills"
-        matches: list[tuple[Path, SkillDocument]] = []
-        for path in sorted(skill_dir.glob("*.md")):
-            skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
-            if self._safe_skill_id(skill.name) == requested or path.stem == requested:
-                matches.append((path, skill))
+        matches: list[SkillEntry] = []
+        for skill_dir in self._skill_dirs():
+            matches = [
+                entry
+                for entry in discover_skill_entries(skill_dir)
+                if self._safe_skill_id(entry.document.name) == requested
+            ]
+            if matches:
+                break
         if not matches:
             return ToolResult(
                 False,
                 f"Skill not found: {requested}.",
-                {"name": requested, "available": [item["name"] for item in skill_catalog(skill_dir)]},
+                {
+                    "name": requested,
+                    "available": [item["name"] for item in skill_catalog(self._skill_dirs())],
+                },
             )
         if len(matches) > 1:
             return ToolResult(False, f"Skill load rejected: duplicate metadata name {requested}.", {})
-        path, skill = matches[0]
-        if not skill.instruction.strip():
-            return ToolResult(False, f"Skill load rejected: {requested} has no instructions.", {})
+        entry = matches[0]
+        path = entry.path
+        skill = entry.document
+        content_hash = entry.content_hash
         existing = next(
             (
                 item
                 for item in state.loaded_skills
-                if item.get("name") == skill.name and item.get("content_hash") == skill.content_hash
+                if item.get("name") == skill.name and item.get("content_hash") == content_hash
             ),
             None,
         )
@@ -2965,14 +2973,14 @@ class AgentLoop:
                 {
                     "name": skill.name,
                     "description": skill.description,
-                    "content_hash": skill.content_hash,
+                    "content_hash": content_hash,
                     "path": self._rel(path),
                     "already_loaded": True,
                 },
             )
         record = {
             "name": skill.name,
-            "content_hash": skill.content_hash,
+            "content_hash": content_hash,
             "status": "loaded",
             "loaded_at": utc_now(),
             "loaded_iteration": state.iterations,
@@ -2986,7 +2994,7 @@ class AgentLoop:
                 "name": skill.name,
                 "description": skill.description,
                 "content": skill.content,
-                "content_hash": skill.content_hash,
+                "content_hash": content_hash,
                 "path": self._rel(path),
             },
         )
@@ -3075,13 +3083,16 @@ class AgentLoop:
         if not isinstance(args, dict):
             return ToolResult(False, "Skill rejected: args must be an object.", {})
         skill_id = self._safe_skill_id(str(args.get("name") or args.get("skill_id") or action.get("target") or ""))
-        description = str(args.get("description") or args.get("title") or "").strip()
-        instruction = normalize_instruction(args.get("instruction", args.get("body", "")))
-        examples = normalize_examples(args.get("examples"))
+        content = normalize_skill_content(
+            args.get("content", args.get("body", args.get("instruction", "")))
+        )
+        skill = build_skill(skill_id, content)
         evidence_type = str(args.get("evidence_type", "")).strip()
         evidence_refs = args.get("evidence_refs", [])
-        if not skill_id or not description or not instruction:
-            return ToolResult(False, "Skill rejected: name, description, and instruction are required.", {})
+        if not skill_id:
+            return ToolResult(False, "Skill rejected: target name is required.", {})
+        if self._safe_skill_id(skill.name) != skill_id:
+            return ToolResult(False, "Skill rejected: frontmatter name must match the target name.", {})
         if evidence_type not in {"verified_success", "evidence_confirmed_failure"}:
             return ToolResult(
                 False,
@@ -3092,9 +3103,7 @@ class AgentLoop:
             return ToolResult(False, "Skill rejected: evidence_refs list is required.", {})
         candidate = self._create_skill_candidate(
             skill_id=skill_id,
-            description=description,
-            instruction=instruction,
-            examples=examples,
+            content=render_skill(skill),
             evidence_type=evidence_type,
             evidence_refs=evidence_refs,
             state=state,
@@ -3103,18 +3112,18 @@ class AgentLoop:
         candidate_path = self.state_dir / "skill_candidates" / f"{candidate['candidate_id']}.json"
         self._write_json_atomic(candidate_path, candidate)
         skill_dir = self.state_dir / "skills"
-        catalog = skill_catalog(skill_dir)
-        normalized_description = " ".join(description.lower().split())
+        skill_path = skill_dir / f"{skill_id}.md"
+        catalog = skill_catalog(self._skill_dirs())
         duplicate = next(
             (
                 item
                 for item in catalog
                 if self._safe_skill_id(item["name"]) == skill_id
-                or " ".join(item["description"].lower().split()) == normalized_description
             ),
             None,
         )
-        if duplicate:
+        if duplicate or skill_path.exists():
+            duplicate = duplicate or {"name": skill_id, "description": ""}
             self._transition_skill_candidate(
                 candidate, "rejected_duplicate", {"duplicate": duplicate}
             )
@@ -3132,8 +3141,7 @@ class AgentLoop:
         result = self.verifier.validate_skill_promotion(
             {
                 "name": skill_id,
-                "description": description,
-                "instruction": instruction,
+                "content": render_skill(skill),
                 "evidence_type": evidence_type,
                 "evidence_refs": evidence_refs,
             },
@@ -3157,33 +3165,17 @@ class AgentLoop:
             )
             return ToolResult(False, result.summary, data)
         self._transition_skill_candidate(candidate, "evidence_validated", result.data)
-        self._transition_skill_candidate(candidate, "content_validated", result.data.get("checks", {}))
         self._transition_skill_candidate(candidate, "approved", {"decision": "create"})
         self._write_json_atomic(candidate_path, candidate)
-        skill_path = skill_dir / f"{skill_id}.md"
         skill_path.parent.mkdir(parents=True, exist_ok=True)
-        skill = SkillDocument(skill_id, description, instruction, examples)
         temporary_skill_path = skill_path.with_suffix(".md.tmp")
         temporary_skill_path.write_text(render_skill(skill), encoding="utf-8")
-        parsed = parse_skill(temporary_skill_path.read_text(encoding="utf-8"), fallback_name=skill_id)
-        if parsed.name != skill_id or not parsed.description or not parsed.instruction:
-            temporary_skill_path.unlink(missing_ok=True)
-            self._transition_skill_candidate(candidate, "rejected_invalid", {"atomic_validation": False})
-            self._write_json_atomic(candidate_path, candidate)
-            return ToolResult(
-                False,
-                "Skill promotion rejected: rendered Skill failed validation.",
-                {
-                    "candidate_id": candidate["candidate_id"],
-                    "candidate_path": self._rel(candidate_path),
-                    "candidate_status": candidate["status"],
-                },
-            )
+        parsed = parse_skill(temporary_skill_path.read_text(encoding="utf-8"))
         temporary_skill_path.replace(skill_path)
         self._transition_skill_candidate(
             candidate,
             "promoted",
-            {"path": self._rel(skill_path), "content_hash": skill.content_hash},
+            {"path": self._rel(skill_path), "content_hash": parsed.content_hash},
         )
         self._write_json_atomic(candidate_path, candidate)
         return ToolResult(
@@ -3192,7 +3184,7 @@ class AgentLoop:
             {
                 "name": skill_id,
                 "path": self._rel(skill_path),
-                "content_hash": skill.content_hash,
+                "content_hash": parsed.content_hash,
                 "evidence_type": evidence_type,
                 "evidence_refs": evidence_refs,
                 "candidate_id": candidate["candidate_id"],
@@ -3205,9 +3197,7 @@ class AgentLoop:
         self,
         *,
         skill_id: str,
-        description: str,
-        instruction: str,
-        examples: str,
+        content: str,
         evidence_type: str,
         evidence_refs: list[Any],
         state: TaskState,
@@ -3219,9 +3209,7 @@ class AgentLoop:
             "status": "proposed",
             "proposed_skill": {
                 "name": skill_id,
-                "description": description,
-                "instruction": instruction,
-                "examples": examples,
+                "content": content,
             },
             "source": {"task_id": self._active_task_id(state), "evidence_type": evidence_type},
             "evidence_refs": evidence_refs,
@@ -3258,6 +3246,9 @@ class AgentLoop:
     def _safe_skill_id(self, raw: str) -> str:
         cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw.strip().lower())
         return cleaned.strip("-_")
+
+    def _skill_dirs(self) -> list[Path]:
+        return [self.state_dir / "skills", self.root / "default_skills"]
 
     def _archive_verifier_success(self, task_id: str, result: ToolResult) -> dict[str, Any]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -3490,7 +3481,7 @@ class AgentLoop:
             "handoff_ready": state.handoff_ready,
             "orchestrator_decision": state.orchestrator_decision,
             "nodes": state.nodes,
-            "skill_catalog_size": len(skill_catalog(self.state_dir / "skills")),
+            "skill_catalog_size": len(skill_catalog(self._skill_dirs())),
             "memory_catalog_size": len(memory_catalog(self.state_dir / "memories")),
             "memory_selection": self._last_memory_selection,
             "loaded_skill_names": [

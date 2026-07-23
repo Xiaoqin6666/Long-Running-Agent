@@ -352,8 +352,6 @@ class Verifier:
         evidence_type = proposal.get("evidence_type")
         checks = []
         checks.append(("has_name", bool(str(proposal.get("name", proposal.get("skill_id", ""))).strip())))
-        checks.append(("has_description", bool(str(proposal.get("description", proposal.get("title", ""))).strip())))
-        checks.append(("has_instruction", bool(str(proposal.get("instruction", proposal.get("body", ""))).strip())))
         checks.append(("has_evidence_refs", bool(evidence_refs) and isinstance(evidence_refs, list)))
         evidence_checks, resolved_evidence = self._validate_skill_evidence_refs(
             evidence_refs if isinstance(evidence_refs, list) else [], evidence_type, state

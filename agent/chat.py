@@ -21,7 +21,7 @@ from agent.memory import (
     validate_memory,
 )
 from agent.spec_builder import build_project_spec
-from agent.skills import SkillDocument, parse_skill, render_skill
+from agent.skills import build_skill, render_skill
 
 
 UI_WIDTH = 72
@@ -203,20 +203,14 @@ class InteractiveCLI:
             name = self._prompt_skill_field("Name", required=True)
             if name is None:
                 return
-            description = self._prompt_skill_field("Description", required=True)
-            if description is None:
-                return
-            instruction = self._prompt_skill_field("Instruction", required=True)
-            if instruction is None:
-                return
-            example = self._prompt_skill_field("Example (optional)", required=False)
-            if example is None:
+            content = self._prompt_skill_field("Markdown content (optional)", required=False)
+            if content is None:
                 return
         except (EOFError, KeyboardInterrupt):
             self.output("\nSkill setup cancelled.")
             return
 
-        self._save_user_skill(name, description, instruction, example)
+        self._save_user_skill(name, content)
 
     def _prompt_skill_field(self, label: str, required: bool) -> str | None:
         while True:
@@ -341,7 +335,7 @@ class InteractiveCLI:
         self._append_history(record)
         self.output(self._paint(f"Memory saved: {self._relative_path(memory_path)}", "green", bold=True))
 
-    def _save_user_skill(self, name: str, description: str, instruction: str, example: str) -> None:
+    def _save_user_skill(self, name: str, content: str) -> None:
         skill_id = safe_skill_id(name)
         if not skill_id:
             self.output("Skill name must contain a letter, number, underscore, or dash.")
@@ -360,12 +354,11 @@ class InteractiveCLI:
                 self.output("Skill setup cancelled; existing Skill was not changed.")
                 return
 
-        skill = SkillDocument(skill_id, description, instruction, example)
-        rendered = render_skill(skill)
-        parsed = parse_skill(rendered, fallback_name=skill_id)
-        if parsed != skill:
-            self.output("Skill validation failed; no file was written.")
+        skill = build_skill(skill_id, content)
+        if safe_skill_id(skill.name) != skill_id:
+            self.output("Skill frontmatter name must match the entered name.")
             return
+        rendered = render_skill(skill)
 
         skill_dir.mkdir(parents=True, exist_ok=True)
         temporary_path = skill_path.with_suffix(".md.tmp")

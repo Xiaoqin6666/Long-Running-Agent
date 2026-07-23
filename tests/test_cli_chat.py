@@ -411,9 +411,14 @@ class ChatCLITests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_skill_command_collects_guided_fields(self) -> None:
+    def test_skill_command_collects_name_and_freeform_markdown(self) -> None:
         outputs: list[str] = []
-        inputs = iter(["debug-failures", "Diagnose repeat failures", "Inspect the first traceback", "Use on failing tests"])
+        inputs = iter(
+            [
+                "debug-failures",
+                "Diagnose repeat failures.\n\nInspect the first traceback.",
+            ]
+        )
         root = Path.cwd() / ".tmp_tests" / f"chat-skill-{uuid4().hex}"
         root.mkdir(parents=True)
         cli = InteractiveCLI(
@@ -429,9 +434,10 @@ class ChatCLITests(unittest.TestCase):
             skill_path = root / "state" / "skills" / "debug-failures.md"
             skill = parse_skill(skill_path.read_text(encoding="utf-8"))
             self.assertEqual(skill.name, "debug-failures")
-            self.assertEqual(skill.description, "Diagnose repeat failures")
-            self.assertEqual(skill.instruction, "Inspect the first traceback")
-            self.assertEqual(skill.examples, "Use on failing tests")
+            self.assertEqual(skill.description, "Diagnose repeat failures.")
+            self.assertIn("Inspect the first traceback.", skill.content)
+            self.assertNotIn("# Examples", skill.content)
+            self.assertTrue(skill_path.read_text(encoding="utf-8").startswith('---\nname: "debug-failures"\n'))
             self.assertTrue(any("Skill saved:" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)

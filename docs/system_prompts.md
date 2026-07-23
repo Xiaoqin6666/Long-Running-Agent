@@ -182,6 +182,7 @@ Memory rules:
 Skill rules:
 
 - Skill stores reusable, procedural experience.
+- Skill content is free-form Markdown. Frontmatter `name` is required; all other frontmatter fields and body sections, including `Instructions` and `Examples`, are optional.
 - Write Skill only after verifier-confirmed success or evidence-confirmed failure.
 - Do not allow Worker free-form reflections to become Skill.
 - Failed-experience Skills must cite the failure evidence that confirms the lesson.

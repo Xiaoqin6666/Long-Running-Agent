@@ -44,6 +44,13 @@ python -m agent.main --project-spec eval\benchmarks\MAPA\task.md --provider open
 
 `--project-spec eval\benchmarks\MAPA\task.md` 设置项目规格文件路径。`--benchmark` 设置测评任务的名字。
 
+在交互模式中使用 `/skill` 可以直接添加受信任的用户 Skill。Skill 文件必须在 frontmatter 中声明 `name`；`description` 等其他 frontmatter 字段和正文固定章节都是可选的，缺少 `description` 时从正文第一段推导。正文仍是自由 Markdown。Agent 自主创建的 Skill 还必须引用真实的 Verifier 或 trace 证据。
+
+项目内置的默认 Skill 位于 `default_skills/<name>/SKILL.md`。当前随仓库提供 Anthropic
+`anthropics/skills` 的 17 个 Skill，并保留各目录中的 `scripts/`、`references/`、`assets/`
+和许可证文件。运行期间新增的 Skill 保存在 `state/skills/`；同名时运行状态中的 Skill
+覆盖默认 Skill。来源版本和授权说明见 `default_skills/UPSTREAM.md`。
+
 The memory index at `state/memory.md` is always loaded with a 200-line / 25KB cap. Full memory files are loaded only after synchronous retrieval. Set `LONG_AGENT_MEMORY_MODEL` such as `deepseek-flash` to use a cheap selector model; if it is unset or fails, the harness falls back to local keyword matching.
 
 Summarize a trace:

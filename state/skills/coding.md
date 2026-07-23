@@ -10,4 +10,3 @@ description: Apply the standard evidence-driven workflow for coding tasks, inclu
 3. Run syntax checks before finishing.
 4. Record failed attempts in trace or handoff.
 5. Do not mark a task complete without independent verification.
-

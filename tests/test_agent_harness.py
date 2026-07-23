@@ -28,6 +28,7 @@ from agent.planner import (
 )
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import validate_task_requirement_closeout
+from agent.skills import discover_skill_entries
 from agent.system_validation import main as system_validation_main
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
@@ -5018,7 +5019,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(candidate["status"], "promoted")
         self.assertEqual(
             [item["status"] for item in candidate["status_history"]],
-            ["proposed", "evidence_validated", "content_validated", "approved", "promoted"],
+            ["proposed", "evidence_validated", "approved", "promoted"],
         )
 
     def test_skill_accepts_evidence_confirmed_failure(self) -> None:
@@ -5082,8 +5083,8 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "target": "verify-before-finish",
                     "args": {
                         "name": "verify-before-finish",
-                        "description": "Require independent verification before finishing a coding task.",
-                        "instruction": "Run the mapped verification command before finish.",
+                        "content": "Require independent verification before finishing a coding task.\n\n"
+                        "Run the mapped verification command before finish.",
                         "evidence_type": "verified_success",
                         "evidence_refs": [{"type": "verifier_report", "task_id": "current"}],
                     },
@@ -5102,13 +5103,142 @@ class HarnessBehaviorTests(unittest.TestCase):
             (skill_dir / "locate-error.md").write_text(
                 "---\nname: locate-error\n"
                 "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nSECRET FULL PROCEDURE\n",
+                "custom-field: preserved\n---\n\nSECRET FULL PROCEDURE\n",
                 encoding="utf-8",
             )
             context = ContextBuilder(root).build(create_initial_state("Debug tests"))
 
         self.assertIn("locate-error: Locate repeated errors in long logs.", context)
         self.assertNotIn("SECRET FULL PROCEDURE", context)
+
+    def test_default_directory_skill_is_available_and_loads_bundled_resources(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = root / "default_skills" / "package-skill"
+            package_dir.mkdir(parents=True)
+            (package_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: package-skill\n"
+                "description: >-\n"
+                "  Use the bundled helper\n"
+                "  for package workflows.\n"
+                "---\n\n"
+                "Run `scripts/helper.py`.\n",
+                encoding="utf-8",
+            )
+            helper_path = package_dir / "scripts" / "helper.py"
+            helper_path.parent.mkdir()
+            helper_path.write_text("print('first')\n", encoding="utf-8")
+            state = create_initial_state("Use package")
+            loop = AgentLoop(root=root, task="Use package", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "package-skill", "args": {}},
+                state,
+            )
+            loaded_context = ContextBuilder(root).build(state)
+            helper_path.write_text("print('changed')\n", encoding="utf-8")
+            invalidated_context = ContextBuilder(root).build(state)
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(
+            observation.data["description"],
+            "Use the bundled helper for package workflows.",
+        )
+        self.assertEqual(observation.data["path"], "default_skills/package-skill/SKILL.md")
+        self.assertIn("Resolve relative Skill resource paths from: default_skills/package-skill", loaded_context)
+        self.assertIn("Run `scripts/helper.py`.", loaded_context)
+        self.assertIn("Invalidated Skills (reload before use): package-skill", invalidated_context)
+
+    def test_state_skill_overrides_same_named_default_skill(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            default_dir = root / "default_skills" / "shared"
+            default_dir.mkdir(parents=True)
+            (default_dir / "SKILL.md").write_text(
+                "---\nname: shared\ndescription: Default description.\n---\n\nDEFAULT BODY\n",
+                encoding="utf-8",
+            )
+            state_dir = root / "state" / "skills"
+            state_dir.mkdir(parents=True)
+            (state_dir / "shared.md").write_text(
+                "---\nname: shared\ndescription: State description.\n---\n\nSTATE BODY\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Use shared")
+            loop = AgentLoop(root=root, task="Use shared", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "shared", "args": {}},
+                state,
+            )
+            context = ContextBuilder(root).build(state)
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(observation.data["path"], "state/skills/shared.md")
+        self.assertIn("shared: State description.", context)
+        self.assertNotIn("shared: Default description.", context)
+        self.assertIn("STATE BODY", context)
+        self.assertNotIn("DEFAULT BODY", context)
+
+    def test_default_coding_skill_has_structured_frontmatter(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            loop._ensure_state_files()
+            content = (root / "state" / "skills" / "coding.md").read_text(encoding="utf-8")
+
+        self.assertTrue(content.startswith("---\nname: coding\n"))
+        self.assertIn("description:", content)
+        self.assertIn("# Instructions", content)
+
+    def test_bundled_anthropic_default_skill_inventory(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        names = {
+            entry.document.name
+            for entry in discover_skill_entries(root / "default_skills")
+        }
+
+        self.assertEqual(
+            names,
+            {
+                "algorithmic-art",
+                "brand-guidelines",
+                "canvas-design",
+                "claude-api",
+                "doc-coauthoring",
+                "docx",
+                "frontend-design",
+                "internal-comms",
+                "mcp-builder",
+                "pdf",
+                "pptx",
+                "skill-creator",
+                "slack-gif-creator",
+                "theme-factory",
+                "web-artifacts-builder",
+                "webapp-testing",
+                "xlsx",
+            },
+        )
+
+    def test_skill_without_name_frontmatter_is_not_available(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "state" / "skills"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "missing-name.md").write_text(
+                "This file has Markdown content but no required name frontmatter.\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Debug tests")
+            context = ContextBuilder(root).build(state)
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "missing-name", "args": {}},
+                state,
+            )
+
+        self.assertNotIn("missing-name:", context)
+        self.assertFalse(observation.ok)
 
     def test_skill_reflection_does_not_trigger_after_ordinary_verifier_pass(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -5196,7 +5326,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(state.pending_skill_review)
         self.assertEqual(state.skill_review_history[-1]["decision"], "dismissed")
 
-    def test_immutable_verifier_report_resolves_by_report_id(self) -> None:
+    def test_skill_promotion_validation_requires_name_and_evidence_only(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state" / "traces").mkdir(parents=True)
@@ -5209,8 +5339,6 @@ class HarnessBehaviorTests(unittest.TestCase):
             result = loop.verifier.validate_skill_promotion(
                 {
                     "name": "verified-procedure",
-                    "description": "Reuse a verified procedure.",
-                    "instruction": "Execute the procedure and independently verify it.",
                     "evidence_type": "verified_success",
                     "evidence_refs": [
                         {"type": "verifier_report", "report_id": archived["report_id"], "task_id": "T1"}
@@ -5221,6 +5349,9 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["resolved_evidence"][0]["report_id"], archived["report_id"])
+        self.assertTrue(result.data["checks"]["has_name"])
+        self.assertNotIn("has_description", result.data["checks"])
+        self.assertNotIn("has_instruction", result.data["checks"])
 
     def test_load_skill_returns_full_content_and_tracks_pending_validation(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -5229,9 +5360,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             skill_dir = root / "state" / "skills"
             skill_dir.mkdir()
             (skill_dir / "locate-error.md").write_text(
-                "---\nname: locate-error\n"
-                "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nSearch the traceback.\n",
+                "---\nname: locate-error\n---\n\n"
+                "Locate repeated errors in long logs.\n\nSearch the traceback.\n",
                 encoding="utf-8",
             )
             loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
@@ -5244,9 +5374,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             loaded_context = ContextBuilder(root).build(state)
             (skill_dir / "locate-error.md").write_text(
-                "---\nname: locate-error\n"
-                "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nChanged procedure.\n",
+                "---\nname: locate-error\n---\n\n"
+                "Locate repeated errors in long logs.\n\nChanged procedure.\n",
                 encoding="utf-8",
             )
             invalidated_context = ContextBuilder(root).build(state)
@@ -5263,7 +5392,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertNotIn("Search the traceback.", invalidated_context)
         self.assertIn("Invalidated Skills (reload before use): locate-error", invalidated_context)
 
-    def test_save_skill_writes_yaml_structure_and_rejects_duplicate(self) -> None:
+    def test_save_skill_writes_freeform_markdown_and_rejects_duplicate_name(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state" / "traces").mkdir(parents=True)
@@ -5286,9 +5415,8 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "target": "locate-errors",
                 "args": {
                     "name": "locate-errors",
-                    "description": "Locate repeated errors in long logs.",
-                    "instruction": ["Run the failing command", "Inspect the final workspace frame"],
-                    "examples": [{"input": "Traceback", "result": "Relevant source frame"}],
+                    "content": "Locate repeated errors in long logs.\n\n"
+                    "Run the failing command, then inspect the final workspace frame.",
                     "evidence_type": "verified_success",
                     "evidence_refs": [
                         {"type": "trace", "path": "state/traces/run_test.jsonl", "step": 3}
@@ -5301,9 +5429,14 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(first.ok)
         self.assertFalse(second.ok)
-        self.assertTrue(content.startswith('---\nname: "locate-errors"\n'))
-        self.assertIn("# Instructions", content)
-        self.assertIn("# Examples", content)
+        self.assertEqual(
+            content,
+            '---\nname: "locate-errors"\n'
+            'description: "Locate repeated errors in long logs."\n'
+            "---\n\n"
+            "Locate repeated errors in long logs.\n\n"
+            "Run the failing command, then inspect the final workspace frame.\n",
+        )
         self.assertNotIn("run_test.jsonl", content)
 
     def test_save_memory_writes_typed_yaml_and_updates_index(self) -> None:

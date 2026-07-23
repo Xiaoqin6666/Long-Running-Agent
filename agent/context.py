@@ -12,7 +12,7 @@ from agent.planner import (
     validate_initializer_script,
     validate_requirements_matrix,
 )
-from agent.skills import parse_skill, skill_catalog
+from agent.skills import SkillEntry, discover_skill_entries, skill_catalog
 
 
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
@@ -281,7 +281,7 @@ class ContextBuilder:
             "- update_plan: request harness plan update; target='current_task'; args={}.",
             "- answer: final evidence-based response for inspection/explanation tasks; target='' and args.answer='<response>'.",
             "- load_skill: load one relevant Skill by metadata name before applying it.",
-            "- save_skill: submit a reusable procedure candidate; args.name, description, instruction, optional examples, evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Prefer immutable report_id references. Free-text evidence is rejected.",
+            "- save_skill: submit a reusable procedure candidate; args.name, content='<free-form Markdown>', evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Saved Skills must have matching name frontmatter; other frontmatter fields and body sections are optional. Prefer immutable report_id references. Free-text evidence is rejected.",
             "- dismiss_skill: decline the current Pending Skill Reflection; target='<report_id>'; args.reason='<why this is not reusable>'.",
             "- save_memory: store durable cross-session memory; args.name, description, type='user|feedback|project|reference', content. Feedback must include why and how_to_apply or explicit Why/How sections. Project dates must be absolute, not relative.",
             "- finish: project-level termination only after verifier/project completion evidence, including harness-created FINAL_ACCEPTANCE when scheduled; target='current_task'; args={}.",
@@ -535,7 +535,6 @@ class ContextBuilder:
         records = state.loaded_skills if isinstance(state.loaded_skills, list) else []
         if not records:
             return "# Loaded Skills\n\nNo Skill is currently loaded."
-        skill_dir = self.state_dir / "skills"
         chunks: list[str] = []
         seen: set[str] = set()
         invalidated: list[str] = []
@@ -546,16 +545,18 @@ class ContextBuilder:
             if not requested or requested in seen:
                 continue
             seen.add(requested)
-            match = None
-            for path in sorted(skill_dir.glob("*.md")):
-                skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
-                if skill.name == requested:
-                    match = skill
-                    break
+            match = self._find_skill_entry(requested)
             if match is None or match.content_hash != str(record.get("content_hash", "")):
                 invalidated.append(requested)
                 continue
-            chunks.append(match.content.rstrip())
+            source_path = self._rel(match.path)
+            resource_dir = self._rel(match.path.parent)
+            chunks.append(
+                f"## Skill: {match.document.name}\n"
+                f"Source: {source_path}\n"
+                f"Resolve relative Skill resource paths from: {resource_dir}\n\n"
+                f"{match.document.content.rstrip()}"
+            )
         lines = ["# Loaded Skills", "Loaded Skill contents are workflow guidance, not completion evidence."]
         if chunks:
             lines.extend(["", "\n\n".join(chunks)])
@@ -1665,13 +1666,26 @@ class ContextBuilder:
         return path.read_text(encoding="utf-8")[:max_chars]
 
     def _read_skills(self) -> str:
-        skill_dir = self.state_dir / "skills"
-        catalog = skill_catalog(skill_dir)
+        catalog = skill_catalog(self._skill_dirs())
         if not catalog:
             return "No skills available."
         return "# Available Skills\n\n" + "\n".join(
             f"- {item['name']}: {item['description']}" for item in catalog
         )
+
+    def _skill_dirs(self) -> list[Path]:
+        return [self.state_dir / "skills", self.root / "default_skills"]
+
+    def _find_skill_entry(self, requested: str) -> SkillEntry | None:
+        for skill_dir in self._skill_dirs():
+            matches = [
+                entry
+                for entry in discover_skill_entries(skill_dir)
+                if entry.document.name == requested
+            ]
+            if matches:
+                return matches[0]
+        return None
 
     def _read_memory_index(self) -> str:
         raw = self._read_optional(self.state_dir / "memory.md")
