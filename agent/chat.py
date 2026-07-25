@@ -642,6 +642,7 @@ class InteractiveCLI:
 
     def _reset_generated_project_state(self) -> None:
         for path in [
+            self.state_dir / "requirements.json",
             self.state_dir / "generated_tasks.json",
             self.state_dir / "init.sh",
             self.state_dir / "current_task.json",

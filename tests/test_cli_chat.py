@@ -165,6 +165,14 @@ class ChatCLITests(unittest.TestCase):
             output_fn=outputs.append,
             use_color=False,
         )
+        stale_requirements = (
+            root / "state" / "benchmarks" / "sample" / "requirements.json"
+        )
+        stale_requirements.parent.mkdir(parents=True, exist_ok=True)
+        stale_requirements.write_text(
+            '{"requirements":[{"id":"REQ-STALE"}]}\n',
+            encoding="utf-8",
+        )
         run_result = RunResult(
             completed=True,
             steps=1,
@@ -180,6 +188,7 @@ class ChatCLITests(unittest.TestCase):
             run_loop.assert_called_once()
             spec_path = root / "state" / "benchmarks" / "sample" / "project_spec.md"
             self.assertEqual(spec_path.read_text(encoding="utf-8"), "# Built Spec\n")
+            self.assertFalse(stale_requirements.exists())
             self.assertTrue(any("project spec saved" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -574,6 +583,7 @@ class ChatCLITests(unittest.TestCase):
     def test_make_loop_uses_only_current_session_messages(self) -> None:
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=lambda message: None,
             use_color=False,
         )
         cli.messages = [
@@ -591,6 +601,63 @@ class ChatCLITests(unittest.TestCase):
         )
 
         self.assertEqual(loop.conversation_messages, [{"role": "user", "content": "new session question"}])
+
+    def test_new_clears_cli_context_and_next_loop_gets_new_provider_session(self) -> None:
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=lambda message: None,
+            use_color=False,
+        )
+        cli.messages = [
+            ChatMessage("user", "old question"),
+            ChatMessage("assistant", "old answer"),
+        ]
+        old_loop = cli._make_loop(
+            "Old task",
+            resume=False,
+            include_conversation=True,
+            interaction_mode="question",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._handle_command("/new")
+        cli.messages.append(ChatMessage("user", "new question"))
+        new_loop = cli._make_loop(
+            "New task",
+            resume=False,
+            include_conversation=True,
+            interaction_mode="question",
+        )
+
+        self.assertEqual(
+            new_loop.conversation_messages,
+            [{"role": "user", "content": "new question"}],
+        )
+        self.assertNotEqual(new_loop.trace_path, old_loop.trace_path)
+        self.assertEqual(cli.active_mode, "idle")
+        self.assertEqual(cli.context_message_start, 0)
+
+    def test_finish_turn_records_answer_as_visible_assistant_message(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=Path.cwd() / "state" / "traces" / "run.jsonl",
+            state_path=Path.cwd() / "state" / "current_task.json",
+            message="Evidence-backed visible answer.",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._finish_turn(result)
+
+        self.assertEqual(cli.messages[-1].role, "assistant")
+        self.assertEqual(cli.messages[-1].content, "Evidence-backed visible answer.")
+        self.assertTrue(any("Evidence-backed visible answer." in line for line in outputs))
 
     def test_commands_work_without_starting_agent_loop(self) -> None:
         outputs: list[str] = []
@@ -755,11 +822,12 @@ class ChatCLITests(unittest.TestCase):
     @patch("agent.chat.os.name", "nt")
     @patch("agent.chat.subprocess.Popen")
     def test_launch_chat_window_starts_child_console(self, popen) -> None:
-        self.assertTrue(launch_chat_window(["--chat", "--provider", "offline"], Path.cwd()))
+        with patch("agent.chat.subprocess.CREATE_NEW_CONSOLE", 0x10, create=True):
+            self.assertTrue(launch_chat_window(["--chat", "--provider", "offline"], Path.cwd()))
         command = popen.call_args.args[0]
         self.assertEqual(command[:3], [__import__("sys").executable, "-m", "agent.main"])
         self.assertIn("--chat-child", command)
-        self.assertEqual(popen.call_args.kwargs["creationflags"], __import__("subprocess").CREATE_NEW_CONSOLE)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x10)
 
 
 if __name__ == "__main__":

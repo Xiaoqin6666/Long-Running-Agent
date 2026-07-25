@@ -7,6 +7,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from agent.llm import configure_auxiliary_payload
 
 SPEC_BUILDER_PROMPT = """You convert a user's project conversation into a durable project_spec.md.
 
@@ -89,6 +90,7 @@ class OpenAICompatibleSpecBuilder:
                 {"role": "user", "content": content},
             ],
         }
+        configure_auxiliary_payload(payload, base_url=self.base_url, model=self.model)
         response = self._post_chat_completions(payload)
         spec = str(response["choices"][0]["message"]["content"]).strip()
         return _strip_markdown_fence(spec) + "\n"

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent.llm import configure_auxiliary_payload
 from agent.memory import MEMORY_TYPES, MemoryDocument, parse_memory
 
 
@@ -161,6 +162,7 @@ class MemoryRetriever:
                 },
             ],
         }
+        configure_auxiliary_payload(payload, base_url=self.base_url, model=self.model)
         try:
             response = self._post_chat_completions(payload)
             content = str(response["choices"][0]["message"]["content"])

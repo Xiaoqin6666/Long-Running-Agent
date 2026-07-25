@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from agent.context import ContextBuilder
-from agent.llm import OpenAICompatibleDecisionMaker, parse_action_json, validate_action
+from agent.llm import OpenAICompatibleDecisionMaker, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id, resolve_log_path
 from agent.memory_retrieval import (
@@ -29,7 +29,7 @@ from agent.planner import (
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import validate_task_requirement_closeout
 from agent.skills import discover_skill_entries
-from agent.system_validation import main as system_validation_main
+from agent.system_validation import _evaluate_ui_contract_checks, main as system_validation_main
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
 from agent.tools.bash import BashTool
@@ -905,13 +905,13 @@ class HarnessBehaviorTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["Task", "--tasks-json", "eval/benchmarks/issue_tracker/tasks.json"])
 
-        self.assertEqual(str(args.tasks_json), "eval\\benchmarks\\issue_tracker\\tasks.json")
+        self.assertEqual(args.tasks_json.as_posix(), "eval/benchmarks/issue_tracker/tasks.json")
 
     def test_cli_accepts_project_spec(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["--project-spec", "eval/benchmarks/todo_counter/project_spec.md"])
 
-        self.assertEqual(str(args.project_spec), "eval\\benchmarks\\todo_counter\\project_spec.md")
+        self.assertEqual(args.project_spec.as_posix(), "eval/benchmarks/todo_counter/project_spec.md")
 
     def test_cli_accepts_explicit_benchmark(self) -> None:
         parser = build_parser()
@@ -946,7 +946,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["Task", "--log-file", "diagnostics/run.log"])
 
-        self.assertEqual(str(args.log_file), "diagnostics\\run.log")
+        self.assertEqual(args.log_file.as_posix(), "diagnostics/run.log")
 
     def test_debug_context_action_is_rejected_by_validation(self) -> None:
         state = create_initial_state("Inspect context")
@@ -998,10 +998,10 @@ class HarnessBehaviorTests(unittest.TestCase):
             trace_events = loop._load_trace_events(loop.trace_path)
 
         self.assertTrue(observation.ok)
-        self.assertIn("# Full Model Context", snapshot_content)
-        self.assertIn("## System Message", observation.data["content"])
-        self.assertLess(snapshot_content.index("## System Message"), snapshot_content.index("- trace:"))
-        self.assertLess(snapshot_content.index("- written_at:"), snapshot_content.index("## User Context"))
+        self.assertIn("# Harness Context Snapshot", snapshot_content)
+        self.assertIn("## System Policy Snapshot", observation.data["content"])
+        self.assertLess(snapshot_content.index("## System Policy Snapshot"), snapshot_content.index("- trace:"))
+        self.assertLess(snapshot_content.index("- written_at:"), snapshot_content.index("## Harness Context"))
         self.assertEqual(trace_events[0]["context_ref"]["path"], snapshot["path"])
         self.assertEqual(trace_events[0]["tool_return"], trace_events[0]["observation"])
 
@@ -2210,10 +2210,11 @@ class HarnessBehaviorTests(unittest.TestCase):
             add_result = tool.run({"action": "git", "target": "add --all", "args": {}})
             commit_result = tool.run({"action": "git", "target": "commit -m benchmark", "args": {}})
             root_git_exists = (root / ".git").exists()
+            workspace_git_exists = (workspace / ".git").is_dir()
 
         self.assertTrue(add_result.ok, add_result.data.get("output"))
         self.assertTrue(commit_result.ok, commit_result.data.get("output"))
-        self.assertTrue((workspace / ".git").is_dir())
+        self.assertTrue(workspace_git_exists)
         self.assertFalse(root_git_exists)
 
     def test_benchmark_loop_configures_workspace_git(self) -> None:
@@ -2315,15 +2316,6 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(action["args"], {"command": "python --version"})
 
-    def test_parse_action_json_extracts_object_after_preface(self) -> None:
-        action = parse_action_json(
-            'I will inspect first. {"action": "list_files", "target": ".", "args": {}, '
-            '"thought_summary": "Inspect.", "expected_observation": "Files.", "risk": "low"}'
-        )
-
-        self.assertEqual(action["action"], "list_files")
-        self.assertEqual(action["target"], ".")
-
     def test_loop_executes_model_action_without_rewrite(self) -> None:
         action = {
             "action": "list_files",
@@ -2365,20 +2357,32 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         def fake_post(payload: dict[str, object]) -> dict[str, object]:
             self.assertEqual(payload["model"], "test-model")
+            self.assertEqual(payload["tools"][0]["function"]["name"], "submit_action")
             return {
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
                                 {
-                                    "thought_summary": "Inspect.",
-                                    "action": "list_files",
-                                    "target": ".",
-                                    "args": {},
-                                    "expected_observation": "Workspace entries.",
-                                    "risk": "low",
+                                    "id": "call-token-usage",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_action",
+                                        "arguments": json.dumps(
+                                            {
+                                                "thought_summary": "Inspect.",
+                                                "action": "list_files",
+                                                "target": ".",
+                                                "args": {},
+                                                "expected_observation": "Workspace entries.",
+                                                "risk": "low",
+                                            }
+                                        ),
+                                    },
                                 }
-                            )
+                            ],
                         }
                     }
                 ],
@@ -2395,7 +2399,17 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(action["action"], "list_files")
         self.assertEqual(
             decision_maker.last_token_usage,
-            {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168, "source": "api"},
+            {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "total_tokens": 168,
+                "source": "api",
+                "provider_usage": {
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "total_tokens": 168,
+                },
+            },
         )
 
     def test_openai_decision_maker_prefers_api_cost_when_returned(self) -> None:
@@ -2411,16 +2425,27 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
                                 {
-                                    "thought_summary": "Inspect.",
-                                    "action": "list_files",
-                                    "target": ".",
-                                    "args": {},
-                                    "expected_observation": "Workspace entries.",
-                                    "risk": "low",
+                                    "id": "call-cost",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_action",
+                                        "arguments": json.dumps(
+                                            {
+                                                "thought_summary": "Inspect.",
+                                                "action": "list_files",
+                                                "target": ".",
+                                                "args": {},
+                                                "expected_observation": "Workspace entries.",
+                                                "risk": "low",
+                                            }
+                                        ),
+                                    },
                                 }
-                            )
+                            ],
                         }
                     }
                 ],
@@ -3946,10 +3971,87 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.task_id, "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["id"], "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertTrue(state.nodes[0]["final_acceptance"])
+        self.assertTrue(state.nodes[0]["system_owned_validation"])
         self.assertEqual(data["tasks"][1]["status"], "in_progress")
         self.assertEqual(current_task_data["task_id"], "FINAL_ACCEPTANCE")
         self.assertEqual(current_task_data["nodes"][0]["id"], "FINAL_ACCEPTANCE")
         self.assertEqual(current_task_data["nodes"][0]["status"], "in_progress")
+
+    def test_final_acceptance_resume_retargets_html_implementation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_target = "eval/benchmarks/sample/workspace/index.html"
+            source = root / source_target
+            source.parent.mkdir(parents=True)
+            source.write_text("<script>let state = 'gameover';</script>\n", encoding="utf-8")
+            manifest_target = "state/system_validation/final_acceptance_manifest.json"
+            ui_contract_target = "state/system_validation/ui_contract.json"
+            (root / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "status": "completed",
+                                "depends_on": [],
+                                "implementation_artifacts": [source_target],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "status": "in_progress",
+                                "depends_on": ["T1"],
+                                "expected_artifacts": [manifest_target, ui_contract_target],
+                                "implementation_artifacts": [],
+                                "acceptance_artifacts": [manifest_target, ui_contract_target],
+                                "frozen_acceptance_artifacts": [manifest_target, ui_contract_target],
+                                "final_acceptance": True,
+                                "system_owned_validation": True,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(root=root, task="Benchmark project", max_steps=1, resume=True)
+            state = create_initial_state("Benchmark project")
+            loop._apply_orchestrator_selection(state)
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -m agent.system_validation",
+                "summary": "Command exited with code 1.",
+                "output": "AssertionError: no game over state",
+                "targets": [manifest_target, ui_contract_target],
+                "repair_targets": [manifest_target, ui_contract_target],
+                "required_reads": [manifest_target, ui_contract_target],
+                "read_targets": [],
+            }
+
+            loop._refresh_pending_repair_targets(state)
+            rejected = loop._implementation_write_test_gate(
+                {
+                    "action": "write",
+                    "target": manifest_target,
+                    "args": {"content": "{}"},
+                },
+                state,
+            )
+            allowed = loop._implementation_write_test_gate(
+                {
+                    "action": "edit",
+                    "target": source_target,
+                    "args": {"old": "gameover", "new": "gameOver"},
+                },
+                state,
+            )
+
+        self.assertTrue(state.nodes[0]["final_acceptance"])
+        self.assertTrue(state.nodes[0]["system_owned_validation"])
+        self.assertEqual(state.pending_repair["repair_targets"], [source_target])
+        self.assertEqual(state.pending_repair["required_reads"], [source_target])
+        self.assertIsNotNone(rejected)
+        self.assertFalse(rejected.ok)
+        self.assertIsNone(allowed)
 
     def test_ui_contract_generated_for_gui_requirement_shape(self) -> None:
         requirement = {
@@ -3975,6 +4077,208 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(entry["data_display"])
         self.assertTrue(entry["empty_state"])
         self.assertTrue(entry["success_refresh"])
+
+    def test_ui_contract_allows_empty_fields_when_direct_ui_is_not_required(self) -> None:
+        requirement = {
+            "id": "REQ-NO-DEPS",
+            "source": "task.md:1",
+            "text": "The application must not use external dependencies.",
+            "type": "project_structure",
+            "priority": "must",
+        }
+        empty_ui_contract = {
+            "entry_points": [],
+            "buttons": [],
+            "inputs": [],
+            "dialogs": [],
+            "data_display": [],
+            "empty_state": "",
+            "success_refresh": "",
+        }
+
+        for applicability, surface in (("indirect", "widget"), ("not_applicable", "none")):
+            with self.subTest(applicability=applicability):
+                contract = {
+                    "kind": "ui_contract",
+                    "version": 1,
+                    "generated_by": "test",
+                    "contracts": [
+                        {
+                            "requirement_id": requirement["id"],
+                            "ui_applicability": applicability,
+                            "ui_surface": surface,
+                            "ui_contract": empty_ui_contract,
+                        }
+                    ],
+                }
+
+                self.assertEqual(validate_ui_contract({"requirements": [requirement]}, contract), [])
+
+    def test_ui_contract_allows_unused_fields_when_direct_ui_is_required(self) -> None:
+        requirement = {
+            "id": "REQ-RESTART",
+            "source": "task.md:2",
+            "text": "The user can restart the game from the game-over screen.",
+            "type": "gui_workflow",
+            "priority": "must",
+        }
+        contract = {
+            "kind": "ui_contract",
+            "version": 1,
+            "generated_by": "test",
+            "contracts": [
+                {
+                    "requirement_id": requirement["id"],
+                    "ui_applicability": "required",
+                    "ui_surface": "widget",
+                    "ui_contract": {
+                        "entry_points": ["Game-over screen"],
+                        "buttons": [],
+                        "inputs": [],
+                        "dialogs": [],
+                        "data_display": ["Restart instruction"],
+                        "empty_state": "",
+                        "success_refresh": "Reset the game to its ready state.",
+                    },
+                }
+            ],
+        }
+
+        self.assertEqual(validate_ui_contract({"requirements": [requirement]}, contract), [])
+
+    def test_ui_contract_rejects_no_obligations_when_direct_ui_is_required(self) -> None:
+        requirement = {
+            "id": "REQ-RESTART",
+            "source": "task.md:2",
+            "text": "The user can restart the game from the game-over screen.",
+            "type": "gui_workflow",
+            "priority": "must",
+        }
+        contract = {
+            "kind": "ui_contract",
+            "version": 1,
+            "generated_by": "test",
+            "contracts": [
+                {
+                    "requirement_id": requirement["id"],
+                    "ui_applicability": "required",
+                    "ui_surface": "widget",
+                    "ui_contract": {
+                        "entry_points": [],
+                        "buttons": [],
+                        "inputs": [],
+                        "dialogs": [],
+                        "data_display": [],
+                        "empty_state": "",
+                        "success_refresh": "",
+                    },
+                }
+            ],
+        }
+
+        errors = validate_ui_contract({"requirements": [requirement]}, contract)
+
+        self.assertEqual(
+            errors,
+            [
+                "UI Contract for REQ-RESTART must include at least one non-empty UI obligation "
+                "when ui_applicability is required."
+            ],
+        )
+
+    def test_ui_contract_checks_declared_fields_in_html_canvas_source(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "flappybird"
+            workspace = root / "eval" / "benchmarks" / "flappybird" / "workspace"
+            workspace.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            source_path = workspace / "index.html"
+            source_path.write_text(
+                "<canvas id='game'></canvas><script>"
+                "const canvas = document.getElementById('game');"
+                "let gameState = 'ready';"
+                "function draw() { ctx.fillText('Tap to Start', 10, 10); }"
+                "function restart() { gameState = 'ready'; draw(); }"
+                "canvas.addEventListener('click', restart);"
+                "function loop() { draw(); requestAnimationFrame(loop); }"
+                "</script>",
+                encoding="utf-8",
+            )
+            task_evidence = state_dir / "task_evidence"
+            task_evidence.mkdir()
+            (task_evidence / "T1.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T1",
+                        "requirements": [
+                            {
+                                "id": "REQ-RESTART",
+                                "status": "verified",
+                                "evidence": [{"type": "automated_test", "result": "passed"}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            requirement = {
+                "id": "REQ-RESTART",
+                "source": "task.md:2",
+                "text": "The user can restart the game from the game-over screen.",
+                "type": "control",
+                "priority": "must",
+            }
+            tasks = [
+                {
+                    "id": "T1",
+                    "requirement_ids": ["REQ-RESTART"],
+                    "implementation_artifacts": [
+                        "eval/benchmarks/flappybird/workspace/index.html"
+                    ],
+                }
+            ]
+            contract = {
+                "kind": "ui_contract",
+                "version": 1,
+                "generated_by": "test",
+                "contracts": [
+                    {
+                        "requirement_id": "REQ-RESTART",
+                        "ui_applicability": "required",
+                        "ui_surface": "widget",
+                        "ui_contract": {
+                            "entry_points": ["Game canvas"],
+                            "buttons": ["Click the canvas to restart"],
+                            "inputs": ["Mouse click or keyboard input"],
+                            "dialogs": ["Game-over overlay"],
+                            "data_display": ["Canvas text"],
+                            "empty_state": "Ready state displays Tap to Start.",
+                            "success_refresh": "Restart redraws the ready state.",
+                        },
+                    }
+                ],
+            }
+
+            results = _evaluate_ui_contract_checks(
+                root=root,
+                requirements=[requirement],
+                contract_data=contract,
+                tasks=tasks,
+                state_dir=state_dir,
+                benchmark_id="flappybird",
+            )
+
+        entry = results["results"][0]
+        self.assertTrue(entry["passed"], entry["details"])
+        self.assertEqual(
+            entry["source_files"],
+            ["eval/benchmarks/flappybird/workspace/index.html"],
+        )
+        self.assertEqual(
+            entry["details"]["inputs"]["reason"],
+            "source contains an input control",
+        )
 
     def test_system_validation_requires_per_requirement_ui_checks(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

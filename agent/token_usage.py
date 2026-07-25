@@ -7,6 +7,13 @@ from typing import Any
 
 
 TOKEN_USAGE_SCHEMA = "long-agent.token-usage.v1"
+TOKEN_DETAIL_FIELDS = (
+    "cached_input_tokens",
+    "cache_hit_tokens",
+    "cache_miss_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
 
 
 def estimate_tokens(value: object) -> int:
@@ -33,7 +40,37 @@ def normalize_token_usage(raw_usage: object, source: str = "api") -> dict[str, A
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "source": source,
+        "provider_usage": json.loads(json.dumps(raw_usage, ensure_ascii=False)),
     }
+    prompt_details = raw_usage.get("prompt_tokens_details")
+    completion_details = raw_usage.get("completion_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    token_details = {
+        "cached_input_tokens": _first_optional_int(
+            prompt_details.get("cached_tokens"),
+            raw_usage.get("cached_input_tokens"),
+        ),
+        "cache_hit_tokens": _first_optional_int(
+            raw_usage.get("prompt_cache_hit_tokens"),
+            raw_usage.get("cache_hit_tokens"),
+        ),
+        "cache_miss_tokens": _first_optional_int(
+            raw_usage.get("prompt_cache_miss_tokens"),
+            raw_usage.get("cache_miss_tokens"),
+        ),
+        "cache_write_tokens": _first_optional_int(
+            raw_usage.get("cache_creation_input_tokens"),
+            raw_usage.get("cache_write_tokens"),
+        ),
+        "reasoning_tokens": _first_optional_int(
+            completion_details.get("reasoning_tokens"),
+            raw_usage.get("reasoning_tokens"),
+        ),
+    }
+    normalized.update({key: value for key, value in token_details.items() if value is not None})
     api_cost = extract_api_cost(raw_usage)
     if api_cost:
         normalized["cost"] = api_cost
@@ -113,6 +150,13 @@ def record_turn_usage(
         "cost": _usage_cost_or_calculated(usage, model, input_tokens, output_tokens, pricing or {}),
         "recorded_at": recorded_at,
     }
+    for field in TOKEN_DETAIL_FIELDS:
+        if usage.get(field) is not None:
+            record[field] = _int_or_zero(usage.get(field))
+    if isinstance(usage.get("provider_usage"), dict):
+        record["provider_usage"] = json.loads(
+            json.dumps(usage["provider_usage"], ensure_ascii=False)
+        )
     normalized["turns"].append(record)
 
     _add_to_totals(normalized["totals"], record, recorded_at)
@@ -140,6 +184,7 @@ def _empty_totals() -> dict[str, Any]:
         "turn_count": 0,
         "costs_by_currency": {},
         "unpriced_turn_count": 0,
+        **{field: 0 for field in TOKEN_DETAIL_FIELDS},
     }
 
 
@@ -148,6 +193,8 @@ def _add_to_totals(totals: dict[str, Any], record: dict[str, Any], recorded_at: 
     totals["output_tokens"] = _int_or_zero(totals.get("output_tokens")) + record["output_tokens"]
     totals["total_tokens"] = _int_or_zero(totals.get("total_tokens")) + record["total_tokens"]
     totals["turn_count"] = _int_or_zero(totals.get("turn_count")) + 1
+    for field in TOKEN_DETAIL_FIELDS:
+        totals[field] = _int_or_zero(totals.get(field)) + _int_or_zero(record.get(field))
     cost = record.get("cost", {})
     if isinstance(cost, dict) and cost.get("available"):
         currency = str(cost.get("currency", "USD") or "USD")
@@ -346,6 +393,14 @@ def _optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_optional_int(*values: object) -> int | None:
+    for value in values:
+        normalized = _optional_int(value)
+        if normalized is not None:
+            return normalized
+    return None
 
 
 def _int_or_zero(value: object) -> int:

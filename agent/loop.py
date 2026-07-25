@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from itertools import count
+import hashlib
 import json
 import logging
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
 from agent.context import ContextBuilder
-from agent.llm import create_decision_maker
+from agent.llm import ProviderProtocolError, ProviderRequestError, create_decision_maker
 from agent.memory import (
     MemoryDocument,
     find_semantic_duplicate,
@@ -114,6 +115,7 @@ class AgentLoop:
         self.state_dir = self._benchmark_state_dir(self.benchmark_id) if self.benchmark_id else root / "state"
         self.trace_dir = self.state_dir / "traces"
         self.debug_context_dir = self.state_dir / "debug_contexts"
+        self.provider_session_dir = self.state_dir / "provider_sessions"
         self.project_spec_materialized_path = (
             self.state_dir / "project_spec.md" if project_spec_path and materialize_project_spec else None
         )
@@ -132,6 +134,8 @@ class AgentLoop:
         self.initializer_candidate_path = self.state_dir / "rejected_candidates" / "generated_tasks.json"
         self.initializer_requirements_candidate_path = self.state_dir / "rejected_candidates" / "requirements.json"
         self.trace_path = self.trace_dir / self._trace_name()
+        self.provider_session_path = self.provider_session_dir / f"{self.trace_path.stem}.jsonl"
+        self.tool_call_ledger_path = self.provider_session_dir / "tool_call_ledger.json"
         self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
         expected_workspace = self._expected_initializer_workspace_root()
         benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
@@ -251,18 +255,77 @@ class AgentLoop:
         completed = False
         message = "Reached max steps before completion."
         self._record_task_session(state)
+        memory_context = self._relevant_memory_context(state)
+        uses_native_tools = bool(getattr(self.decision_maker, "uses_native_tools", False))
+        self.context_builder.current_trace_path = self.trace_path
+        initial_context = (
+            self.context_builder.build_session_context(
+                state,
+                relevant_memories=memory_context,
+                include_handoff=True,
+            )
+            if uses_native_tools
+            else self.context_builder.build(
+                state,
+                relevant_memories=memory_context,
+                include_handoff=True,
+            )
+        )
+        set_transcript_path = getattr(self.decision_maker, "set_transcript_path", None)
+        if callable(set_transcript_path):
+            set_transcript_path(self.provider_session_path)
+        begin_session = getattr(self.decision_maker, "begin_session", None)
+        if callable(begin_session):
+            begin_session(initial_context, state.conversation_messages)
 
         step_iter = count(1) if self.max_steps is None else range(1, self.max_steps + 1)
         for step in step_iter:
             steps = step
             self._current_trace_step = step
             self._record_task_session(state)
-            memory_context = self._relevant_memory_context(state)
             self.context_builder.current_trace_path = self.trace_path
-            context = self.context_builder.build(state, relevant_memories=memory_context, include_handoff=(step == 1))
+            context = (
+                initial_context
+                if step == 1
+                else self.context_builder.build(
+                    state,
+                    relevant_memories=memory_context,
+                    include_handoff=False,
+                    include_conversation=not uses_native_tools,
+                )
+            )
             context_snapshot = self._record_context_snapshot(step, state, context)
+            fatal_protocol_error = False
+            stop_after_tool_result = False
+            previous_task_id = self._active_task_id(state)
             try:
                 action = self.decision_maker.next_action(context, state)
+            except Exception as exc:
+                LOGGER.exception("Step %s model protocol error", step)
+                fatal_protocol_error = bool(
+                    getattr(self.decision_maker, "fatal_protocol_errors", False)
+                ) or isinstance(exc, (ProviderProtocolError, ProviderRequestError))
+                action = {
+                    "thought_summary": "Harness caught a model protocol error.",
+                    "action": "provider_error" if fatal_protocol_error else "protocol_error",
+                    "target": "decision_maker",
+                    "args": {},
+                    "expected_observation": (
+                        "The provider error is recorded and the Worker session stops."
+                        if fatal_protocol_error
+                        else "The error is recorded so the loop can continue."
+                    ),
+                    "risk": "low",
+                }
+                error_data = {"error_type": type(exc).__name__}
+                error_summary = f"Protocol error: {exc}"
+                if fatal_protocol_error:
+                    error_data["provider_transcript"] = self._rel(self.provider_session_path)
+                    error_summary += (
+                        f" See provider transcript: {self._rel(self.provider_session_path)}."
+                    )
+                observation = ToolResult(False, error_summary, error_data)
+            else:
                 LOGGER.info(
                     "Step %s action=%s target=%s starting task_id=%s",
                     step,
@@ -279,21 +342,83 @@ class AgentLoop:
                         "thought_summary": str(action.get("thought_summary", "")),
                     }
                 )
-                observation = self._execute_action(action, state)
-            except Exception as exc:
-                LOGGER.exception("Step %s model/tool protocol error", step)
-                action = {
-                    "thought_summary": "Harness caught a model or tool protocol error.",
-                    "action": "protocol_error",
-                    "target": "decision_maker",
-                    "args": {},
-                    "expected_observation": "The error is recorded so the loop can continue.",
-                    "risk": "low",
-                }
-                observation = ToolResult(False, f"Protocol error: {exc}", {"error_type": type(exc).__name__})
+                call_id = str(getattr(self.decision_maker, "last_tool_call_id", "") or "")
+                ledger_reserved = False
+                ledger_finalized = False
+                try:
+                    replay = self._tool_call_replay(call_id, action) if call_id else None
+                    if replay is not None:
+                        replay_data = dict(replay.get("data", {}))
+                        replay_data["idempotent_replay"] = True
+                        observation = ToolResult(
+                            bool(replay.get("ok")),
+                            str(replay.get("summary", "")),
+                            replay_data,
+                        )
+                    else:
+                        if call_id:
+                            self._reserve_tool_call(call_id, action)
+                            ledger_reserved = True
+                        observation = self._execute_action(action, state)
+                        if call_id:
+                            self._record_tool_call_result(call_id, action, observation)
+                            ledger_finalized = True
+                except Exception as exc:
+                    LOGGER.exception("Step %s action execution failed", step)
+                    observation = ToolResult(
+                        False,
+                        f"Harness action execution error: {exc}",
+                        {
+                            "error_type": type(exc).__name__,
+                            "tool_call_id": call_id,
+                            "counts_as_progress": False,
+                        },
+                    )
+                    if call_id and ledger_reserved and not ledger_finalized:
+                        try:
+                            self._record_tool_call_result(call_id, action, observation)
+                        except Exception:
+                            LOGGER.exception(
+                                "Step %s could not finalize the failed tool call ledger entry",
+                                step,
+                            )
+                    stop_after_tool_result = bool(call_id)
             self._record_budget_usage(state, context, action, observation)
             self._update_state(state, action, observation)
-            self._append_trace(step, action, observation, state, context_snapshot)
+            if action["action"] == "verify" and observation.ok:
+                self._apply_orchestrator_selection(state)
+            active_task_changed = self._active_task_id(state) != previous_task_id
+            refreshed_memory_context = ""
+            if (action["action"] == "save_memory" and observation.ok) or active_task_changed:
+                memory_context = self._relevant_memory_context(state)
+                refreshed_memory_context = memory_context
+            record_tool_result = getattr(self.decision_maker, "record_tool_result", None)
+            provider_append_error = ""
+            if callable(record_tool_result) and not fatal_protocol_error:
+                try:
+                    record_tool_result(
+                        observation.to_dict(),
+                        self._provider_state_update(
+                            state,
+                            refreshed_memory_context,
+                            include_task_context=(
+                                active_task_changed
+                                or (action["action"] == "contract" and observation.ok)
+                            ),
+                        ),
+                    )
+                    self._refresh_native_budget_after_tool_result(state)
+                except Exception as exc:
+                    LOGGER.exception("Step %s failed to persist the provider tool result", step)
+                    provider_append_error = f"Provider tool-result persistence failed: {exc}"
+            self._append_trace(
+                step,
+                action,
+                observation,
+                state,
+                context_snapshot,
+                action_task_id=previous_task_id,
+            )
             self._write_state(state)
             LOGGER.info(
                 "Step %s action=%s target=%s ok=%s task_id=%s turn_tokens=%s token_usage=%s handoff_ready=%s observation=%s",
@@ -321,6 +446,15 @@ class AgentLoop:
                 }
             )
 
+            if fatal_protocol_error:
+                message = observation.summary
+                break
+            if provider_append_error:
+                message = provider_append_error
+                break
+            if stop_after_tool_result:
+                message = observation.summary
+                break
             if (
                 action["action"] in {"answer", "finish"}
                 and observation.ok
@@ -329,9 +463,6 @@ class AgentLoop:
                 completed = True
                 message = observation.data.get("answer", observation.summary)
                 break
-            if action["action"] == "verify" and observation.ok:
-                self._apply_orchestrator_selection(state)
-                self._write_state(state)
             if state.handoff_ready:
                 self._write_handoff(state)
                 message = "Session handoff threshold reached. Handoff written."
@@ -356,7 +487,11 @@ class AgentLoop:
     def _prepare_auto_resume_session(self) -> TaskState:
         self.resume = True
         self.trace_path = self.trace_dir / self._trace_name()
+        self.provider_session_path = self.provider_session_dir / f"{self.trace_path.stem}.jsonl"
         self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
+        reset_session = getattr(self.decision_maker, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
         bash_tool = self.tools.get("bash")
         if isinstance(bash_tool, BashTool):
             bash_tool.output_dir = self.tool_output_dir
@@ -401,6 +536,8 @@ class AgentLoop:
             self._recover_initializer_repair_from_state(state)
         if not self._is_initializer_task(state):
             self._apply_orchestrator_selection(state)
+        if self.resume and state.pending_repair:
+            self._refresh_pending_repair_targets(state)
         if self.resume and not state.pending_repair:
             self._recover_pending_repair_from_recent_trace(state)
         state.token_usage = initialize_token_usage(state.token_usage)
@@ -455,6 +592,8 @@ class AgentLoop:
                 "requirement_ids": task.get("requirement_ids", []),
                 "requirements": requirements,
                 "criterion_command_map": task.get("criterion_command_map", {}),
+                "final_acceptance": task.get("final_acceptance", False),
+                "system_owned_validation": task.get("system_owned_validation", False),
                 "contract_managed": True,
             }
         ]
@@ -588,20 +727,26 @@ class AgentLoop:
         session_dir.mkdir(parents=True, exist_ok=True)
         path = session_dir / f"step_{step:04d}.md"
         content = (
-            "# Full Model Context\n\n"
-            "## System Message\n\n"
+            "# Harness Context Snapshot\n\n"
+            "The exact append-only provider messages are stored in the linked provider session transcript.\n\n"
+            "## System Policy Snapshot\n\n"
             f"{MAIN_AGENT_SYSTEM_PROMPT}\n\n"
             f"- trace: {self._rel(self.trace_path)}\n"
             f"- step: {step}\n"
             f"- task_id: {self._active_task_id(state)}\n"
             f"- written_at: {utc_now()}\n\n"
-            "## User Context\n\n"
+            "## Harness Context\n\n"
             f"{context}\n"
         )
         path.write_text(content, encoding="utf-8")
         snapshot = {
             "path": self._rel(path),
             "trace": self._rel(self.trace_path),
+            "provider_session_path": (
+                self._rel(self.provider_session_path)
+                if bool(getattr(self.decision_maker, "uses_native_tools", False))
+                else ""
+            ),
             "step": step,
             "chars": len(content),
             "system_chars": len(MAIN_AGENT_SYSTEM_PROMPT),
@@ -1021,7 +1166,7 @@ class AgentLoop:
         return None
 
     def _repair_targets_from_failed_output(self, command: str, output: str, state: TaskState) -> list[str]:
-        artifacts = [self._normalize_target(target) for target in self._active_task_expected_artifacts(state)]
+        artifacts = self._repair_candidate_artifacts(state)
         combined = f"{command}\n{output}".replace("\\", "/")
         targets: list[str] = []
         for target in self._traceback_source_repair_targets_from_failure(command, output, state):
@@ -1065,7 +1210,6 @@ class AgentLoop:
                 for artifact in artifacts:
                     if (
                         not self._looks_like_test_artifact(artifact)
-                        and Path(artifact).suffix.lower() == ".py"
                         and Path(artifact).name != "__init__.py"
                         and artifact not in targets
                     ):
@@ -1074,17 +1218,54 @@ class AgentLoop:
         implementation_targets = [
             artifact
             for artifact in artifacts
-            if Path(artifact).suffix.lower() == ".py" and Path(artifact).name != "__init__.py"
+            if Path(artifact).name != "__init__.py"
             and not self._looks_like_test_artifact(artifact)
         ]
         test_targets = [
             artifact
             for artifact in artifacts
-            if Path(artifact).suffix.lower() == ".py"
-            and Path(artifact).name != "__init__.py"
+            if Path(artifact).name != "__init__.py"
             and self._looks_like_test_artifact(artifact)
         ]
         return implementation_targets + test_targets or artifacts
+
+    def _repair_candidate_artifacts(self, state: TaskState) -> list[str]:
+        active = self._active_task_metadata(state)
+        if active.get("final_acceptance") is not True:
+            return [
+                self._normalize_target(target)
+                for target in self._active_task_expected_artifacts(state)
+            ]
+        dependency_ids = {
+            str(task_id)
+            for task_id in active.get("depends_on", [])
+            if str(task_id).strip()
+        }
+        artifacts: list[str] = []
+        for task in self.orchestrator.load_tasks():
+            if str(task.get("id", "")) not in dependency_ids:
+                continue
+            for target in self._format_artifacts(task.get("implementation_artifacts", [])):
+                normalized = self._normalize_target(target)
+                if normalized and normalized not in artifacts:
+                    artifacts.append(normalized)
+        return artifacts
+
+    def _refresh_pending_repair_targets(self, state: TaskState) -> None:
+        repair = state.pending_repair
+        failure_type = self._pending_repair_command_failure_type(state)
+        if failure_type in {"command_syntax_error", "command_environment_error"}:
+            return
+        command = str(repair.get("command", ""))
+        output = self._full_output_from_data(repair)
+        targets = self._repair_targets_from_failed_output(command, output, state)
+        if not targets:
+            return
+        required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+        repair["targets"] = targets
+        repair["repair_targets"] = self._default_repair_write_targets(targets, state)
+        repair["required_reads"] = required_reads
+        repair["read_targets"] = self._preserve_pending_repair_reads(state, required_reads)
 
     def _traceback_source_repair_targets_from_failure(
         self,
@@ -1606,6 +1787,7 @@ class AgentLoop:
             "edit",
             "write",
             "protocol_error",
+            "provider_error",
         } and not observation.ok:
             state.last_observation["counts_as_progress"] = False
         elif name == "verify" and observation.ok and len(state.nodes) > 2:
@@ -3435,6 +3617,143 @@ class AgentLoop:
         }
         return render_relevant_memories(retrieved.memories, source=retrieved.source)
 
+    def _provider_state_update(
+        self,
+        state: TaskState,
+        refreshed_memory_context: str = "",
+        *,
+        include_task_context: bool = False,
+    ) -> dict[str, Any]:
+        return dict(
+            self.context_builder.build_incremental_state(
+                state,
+                relevant_memories=refreshed_memory_context,
+                include_task_context=include_task_context,
+            )
+        )
+
+    def _tool_call_replay(
+        self,
+        call_id: str,
+        action: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        ledger = self._read_tool_call_ledger()
+        record = ledger.get("calls", {}).get(call_id)
+        if not isinstance(record, dict):
+            return None
+        if record.get("action") != action:
+            raise ProviderProtocolError(
+                f"Native tool_call id {call_id!r} was reused with different arguments."
+            )
+        observation = record.get("observation")
+        if isinstance(observation, dict):
+            return observation
+        if record.get("status") == "in_progress":
+            return {
+                "ok": False,
+                "summary": (
+                    "Tool call was reserved before a previous interruption; its execution outcome is unknown, "
+                    "so the harness will not execute it again."
+                ),
+                "data": {
+                    "tool_call_id": call_id,
+                    "execution_outcome": "unknown",
+                    "duplicate_execution_prevented": True,
+                },
+            }
+        return None
+
+    def _reserve_tool_call(self, call_id: str, action: dict[str, Any]) -> None:
+        ledger = self._read_tool_call_ledger()
+        calls = ledger.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            calls = {}
+            ledger["calls"] = calls
+        existing = calls.get(call_id)
+        if isinstance(existing, dict):
+            if existing.get("action") != action:
+                raise ProviderProtocolError(
+                    f"Native tool_call id {call_id!r} was reused with different arguments."
+                )
+            return
+        calls[call_id] = {
+            "status": "in_progress",
+            "action": action,
+            "trace": self._rel(self.trace_path),
+            "reserved_at": utc_now(),
+        }
+        self._write_tool_call_ledger(ledger)
+
+    def _record_tool_call_result(
+        self,
+        call_id: str,
+        action: dict[str, Any],
+        observation: ToolResult,
+    ) -> None:
+        ledger = self._read_tool_call_ledger()
+        calls = ledger.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            calls = {}
+            ledger["calls"] = calls
+        calls[call_id] = {
+            "status": "completed",
+            "action": action,
+            "observation": observation.to_dict(),
+            "trace": self._rel(self.trace_path),
+            "recorded_at": utc_now(),
+        }
+        self._write_tool_call_ledger(ledger)
+
+    def _write_tool_call_ledger(self, ledger: dict[str, Any]) -> None:
+        temporary_path = self.tool_call_ledger_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            temporary_path.chmod(0o600)
+        except OSError:
+            pass
+        temporary_path.replace(self.tool_call_ledger_path)
+        try:
+            self.tool_call_ledger_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def _read_tool_call_ledger(self) -> dict[str, Any]:
+        if not self.tool_call_ledger_path.exists():
+            return {"schema": "long-agent.tool-call-ledger.v1", "calls": {}}
+        try:
+            payload = json.loads(self.tool_call_ledger_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger is unreadable; refusing to execute "
+                "because the prior execution outcome cannot be determined."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger must be an object; refusing to execute."
+            )
+        payload.setdefault("schema", "long-agent.tool-call-ledger.v1")
+        calls = payload.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger calls must be an object; refusing to execute."
+            )
+        return payload
+
+    def _refresh_native_budget_after_tool_result(self, state: TaskState) -> None:
+        request_token_estimate = getattr(self.decision_maker, "request_token_estimate", None)
+        if not callable(request_token_estimate):
+            return
+        estimated = request_token_estimate()
+        if not estimated:
+            return
+        state.session_used_tokens = estimated
+        threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
+        if state.session_used_tokens >= threshold_tokens:
+            state.handoff_ready = True
+
     def _memory_retrieval_query(self, state: TaskState) -> str:
         messages = state.conversation_messages if isinstance(state.conversation_messages, list) else []
         latest_user = ""
@@ -3464,6 +3783,7 @@ class AgentLoop:
         observation: ToolResult,
         state: TaskState,
         context_snapshot: dict[str, Any] | None = None,
+        action_task_id: str | None = None,
     ) -> None:
         event = {
             "step": step,
@@ -3473,7 +3793,8 @@ class AgentLoop:
             "observation": observation.to_dict(),
             "tool_return": observation.to_dict(),
             "state_summary": state.summary(),
-            "task_id": state.task_id,
+            "task_id": action_task_id or state.task_id,
+            "next_task_id": self._active_task_id(state),
             "session_used_tokens": state.session_used_tokens,
             "token_usage": dict(self._last_token_usage_record),
             "session_token_usage": state.token_usage.get("sessions", {}).get(self.trace_path.stem, {}),
@@ -3488,9 +3809,39 @@ class AgentLoop:
                 str(item.get("name")) for item in state.loaded_skills if isinstance(item, dict) and item.get("name")
             ],
             "pending_skill_review": state.pending_skill_review,
+            "provider_session_ref": self._provider_session_reference(),
         }
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, indent=2) + "\n")
+
+    def _provider_session_reference(self) -> dict[str, Any]:
+        if not bool(getattr(self.decision_maker, "uses_native_tools", False)):
+            return {}
+        reference = {
+            "path": self._rel(self.provider_session_path),
+            "bytes": 0,
+            "sha256": "",
+            "tool_call_id": str(getattr(self.decision_maker, "last_tool_call_id", "") or ""),
+        }
+        transcript_metadata = getattr(self.decision_maker, "transcript_metadata", None)
+        if callable(transcript_metadata):
+            metadata = transcript_metadata()
+            if isinstance(metadata, dict):
+                reference["bytes"] = int(metadata.get("bytes", 0) or 0)
+                reference["sha256"] = str(metadata.get("sha256", "") or "")
+                return reference
+        if not self.provider_session_path.exists():
+            return reference
+        digest = hashlib.sha256()
+        try:
+            with self.provider_session_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            reference["bytes"] = self.provider_session_path.stat().st_size
+            reference["sha256"] = digest.hexdigest()
+        except OSError:
+            pass
+        return reference
 
     def _write_handoff(self, state: TaskState) -> None:
         active_node = self._active_node(state)
@@ -3681,8 +4032,24 @@ class AgentLoop:
         observation: ToolResult,
     ) -> None:
         self._record_token_usage(state, context, action)
-        payload = context + json.dumps(action, ensure_ascii=False) + json.dumps(observation.to_dict(), ensure_ascii=False)
-        state.session_used_tokens = max(1, len(payload) // 4)
+        request_token_estimate = getattr(self.decision_maker, "request_token_estimate", None)
+        native_request_tokens = request_token_estimate() if callable(request_token_estimate) else 0
+        if native_request_tokens:
+            pending_tool_result = json.dumps(
+                {
+                    "observation": observation.to_dict(),
+                    "state_summary": state.summary(),
+                },
+                ensure_ascii=False,
+            )
+            state.session_used_tokens = native_request_tokens + max(1, len(pending_tool_result) // 4)
+        else:
+            payload = (
+                context
+                + json.dumps(action, ensure_ascii=False)
+                + json.dumps(observation.to_dict(), ensure_ascii=False)
+            )
+            state.session_used_tokens = max(1, len(payload) // 4)
         threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
         if state.session_used_tokens >= threshold_tokens:
             state.handoff_ready = True
@@ -3989,6 +4356,11 @@ class AgentLoop:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.debug_context_dir.mkdir(parents=True, exist_ok=True)
+        self.provider_session_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.provider_session_dir.chmod(0o700)
+        except OSError:
+            pass
         (self.state_dir / "skills").mkdir(exist_ok=True)
         (self.state_dir / "memories").mkdir(exist_ok=True)
         (self.state_dir / "skill_candidates").mkdir(exist_ok=True)

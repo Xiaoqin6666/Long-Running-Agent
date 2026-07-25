@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent.llm import configure_auxiliary_payload
 
 UI_CONTRACT_VERSION = 1
 UI_CONTRACT_REQUIRED_FIELDS = (
@@ -62,7 +63,11 @@ Rules:
 - Set ui_applicability='not_applicable' when the requirement has no meaningful UI surface; use ui_surface='none'.
 - Make labels and controls concrete enough for a GUI verifier or human reviewer to check.
 - If a requirement is mainly service logic or persistence, still describe the user-visible surface or explicitly state that no dedicated UI is required and where status/errors are surfaced.
-- Every required field must be present and non-empty.
+- Every ui_contract field must be present.
+- When ui_applicability='required', provide at least one non-empty, directly verifiable UI
+  obligation. Fields for widget categories that do not apply may be empty arrays or empty strings.
+- When ui_applicability is 'indirect' or 'not_applicable', any field without a meaningful UI
+  obligation may also be empty.
 - Do not invent product features beyond what the requirement implies.
 """
 
@@ -160,6 +165,7 @@ class OpenAICompatibleUIContractBuilder:
                 {"role": "user", "content": self._render_user_content(requirements)},
             ],
         }
+        configure_auxiliary_payload(payload, base_url=self.base_url, model=self.model)
         response = self._post_chat_completions(payload)
         content = str(response["choices"][0]["message"]["content"]).strip()
         parsed = _loads_json_object(_strip_markdown_fence(content))
@@ -219,13 +225,14 @@ def _validate_contract_entry(requirement_id: str, contract: dict[str, Any]) -> l
             f"UI Contract for {requirement_id}.ui_surface must be one of: "
             + ", ".join(UI_CONTRACT_SURFACE_VALUES)
         )
-    for field in UI_CONTRACT_REQUIRED_FIELDS:
-        value = ui_contract.get(field)
-        if isinstance(value, list):
-            if not any(str(item).strip() for item in value):
-                errors.append(f"UI Contract for {requirement_id}.{field} must be non-empty.")
-        elif not str(value or "").strip():
-            errors.append(f"UI Contract for {requirement_id}.{field} must be non-empty.")
+    if applicability == "required" and not any(
+        _ui_contract_field_has_value(ui_contract.get(field))
+        for field in UI_CONTRACT_REQUIRED_FIELDS
+    ):
+        errors.append(
+            f"UI Contract for {requirement_id} must include at least one non-empty UI obligation "
+            "when ui_applicability is required."
+        )
     return errors
 
 
@@ -287,6 +294,12 @@ def _coerce_string_list(value: Any) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def _ui_contract_field_has_value(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(str(item).strip() for item in value)
+    return bool(str(value or "").strip())
 
 
 def _build_offline_contract(requirements: list[dict[str, Any]]) -> dict[str, Any]:

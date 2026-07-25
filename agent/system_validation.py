@@ -15,6 +15,18 @@ from agent.ui_contract import UI_CONTRACT_APPLICABILITY_VALUES, UI_CONTRACT_REQU
 
 
 FINAL_ACCEPTANCE_TASK_ID = "FINAL_ACCEPTANCE"
+UI_SOURCE_SUFFIXES = {
+    ".css",
+    ".htm",
+    ".html",
+    ".js",
+    ".jsx",
+    ".py",
+    ".svelte",
+    ".ts",
+    ".tsx",
+    ".vue",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,11 +201,20 @@ def _evaluate_ui_contract_checks(
         ui_applicable = ui_applicability == "required"
         if ui_applicable:
             check_details = {
-                field: _evaluate_ui_field(
-                    field=field,
-                    value=ui_contract.get(field) if isinstance(ui_contract, dict) else None,
-                    source_text=source_text,
-                    has_verified_evidence=requirement_id in verified_ids,
+                field: (
+                    _evaluate_ui_field(
+                        field=field,
+                        value=ui_contract.get(field) if isinstance(ui_contract, dict) else None,
+                        source_text=source_text,
+                        has_verified_evidence=requirement_id in verified_ids,
+                    )
+                    if _ui_contract_field_has_value(
+                        ui_contract.get(field) if isinstance(ui_contract, dict) else None
+                    )
+                    else {
+                        "passed": True,
+                        "reason": "ui_contract declares no obligation for this UI field",
+                    }
                 )
                 for field in UI_CONTRACT_REQUIRED_FIELDS
             }
@@ -271,7 +292,7 @@ def _verified_requirement_ids(*, tasks: list[dict[str, Any]], state_dir: Path) -
 def _ui_source_by_requirement(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> dict[str, dict[str, Any]]:
     files_by_requirement: dict[str, list[Path]] = {}
     targets_by_requirement: dict[str, list[str]] = {}
-    fallback_files = _workspace_python_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    fallback_files = _workspace_ui_source_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
     fallback_targets = [_display_path(root, path) for path in fallback_files]
     for task in tasks:
         if not isinstance(task, dict) or task.get("final_acceptance") is True:
@@ -326,12 +347,10 @@ def _task_ui_source_targets(*, root: Path, task: dict[str, Any], benchmark_id: s
                 path.relative_to(root.resolve())
             except (OSError, ValueError):
                 continue
-            if path.suffix.lower() != ".py":
-                continue
             comparable = normalized.replace("\\", "/").lower()
             if "/tests/" in comparable or Path(comparable).name.startswith("test_"):
                 continue
-            if path.suffix.lower() != ".py":
+            if path.suffix.lower() not in UI_SOURCE_SUFFIXES:
                 continue
             target = _display_path(root, path)
             if path not in paths:
@@ -340,7 +359,7 @@ def _task_ui_source_targets(*, root: Path, task: dict[str, Any], benchmark_id: s
     return targets
 
 
-def _workspace_python_files(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> list[Path]:
+def _workspace_ui_source_files(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> list[Path]:
     workspace = ""
     if benchmark_id:
         workspace = f"eval/benchmarks/{benchmark_id}/workspace"
@@ -359,8 +378,10 @@ def _workspace_python_files(*, root: Path, tasks: list[dict[str, Any]], benchmar
         return []
     return [
         path
-        for path in workspace_path.rglob("*.py")
-        if "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
+        for path in workspace_path.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in UI_SOURCE_SUFFIXES
+        and "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
         and not path.name.startswith("test_")
     ]
 
@@ -450,11 +471,41 @@ def _mentions_action_control(text: str) -> bool:
 
 
 def _has_action_control(text: str) -> bool:
-    return any(marker in text for marker in ("tk.button", "ttk.button", ".add_command(", "menubutton"))
+    return any(
+        marker in text
+        for marker in (
+            "tk.button",
+            "ttk.button",
+            ".add_command(",
+            "menubutton",
+            "<button",
+            "role=\"button\"",
+            "role='button'",
+            "onclick=",
+            ".addeventlistener(",
+        )
+    )
 
 
 def _has_container_or_navigation(text: str) -> bool:
-    return any(marker in text for marker in ("tk.frame", "ttk.frame", "tk.toplevel", "ttk.notebook", ".add(", "menu("))
+    return any(
+        marker in text
+        for marker in (
+            "tk.frame",
+            "ttk.frame",
+            "tk.toplevel",
+            "ttk.notebook",
+            ".add(",
+            "menu(",
+            "<canvas",
+            "<main",
+            "<section",
+            "<form",
+            "<nav",
+            "document.getelementbyid(",
+            "document.queryselector(",
+        )
+    )
 
 
 def _has_input_control(text: str) -> bool:
@@ -472,6 +523,17 @@ def _has_input_control(text: str) -> bool:
             "ttk.checkbutton",
             "tk.checkbutton",
             "radiobutton",
+            "<input",
+            "<select",
+            "<textarea",
+            "contenteditable",
+            "keydown",
+            "keyup",
+            "mousedown",
+            "pointerdown",
+            "touchstart",
+            "onclick=",
+            ".addeventlistener(",
         )
     )
 
@@ -486,6 +548,10 @@ def _has_dialog_or_feedback(text: str) -> bool:
             "status_var",
             ".config(text=",
             ".configure(text=",
+            "<dialog",
+            "alert(",
+            "filltext(",
+            "overlay",
         )
     )
 
@@ -503,14 +569,33 @@ def _has_data_display(text: str) -> bool:
             ".insert(",
             ".create_text(",
             ".create_rectangle(",
+            "filltext(",
+            "fillrect(",
+            "textcontent",
+            "innerhtml",
         )
     )
 
 
 def _has_empty_state(text: str) -> bool:
     return _has_data_display(text) and (
-        any(marker in text for marker in ("empty", "no ", "none", "暂无", "无", "沒有", "没有"))
-        or bool(re.search(r"if\s+not\s+\w+", text))
+        any(
+            marker in text
+            for marker in (
+                "empty",
+                "no ",
+                "none",
+                "暂无",
+                "无",
+                "沒有",
+                "没有",
+                "tap to start",
+                "click to start",
+                "press space",
+                "ready",
+            )
+        )
+        or bool(re.search(r"if\s+(?:not\s+\w+|\([^)]*(?:length|size)\s*={2,3}\s*0)", text))
     )
 
 
@@ -528,6 +613,11 @@ def _has_success_refresh(text: str) -> bool:
             ".config(",
             ".configure(",
             "save_data(",
+            "requestanimationframe(",
+            "render(",
+            "redraw(",
+            "reset(",
+            "restart(",
         )
     )
 
