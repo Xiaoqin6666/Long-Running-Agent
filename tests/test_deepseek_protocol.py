@@ -20,7 +20,7 @@ from agent.llm import (
     create_decision_maker,
 )
 from agent.loop import AgentLoop
-from agent.memory_retrieval import MemoryHeader, MemoryRetriever, RetrievedMemories
+from agent.memory_qa import MemoryQA, MemoryQAResult
 from agent.planner import create_initial_state
 from agent.spec_builder import OpenAICompatibleSpecBuilder
 from agent.tools import ToolResult
@@ -220,6 +220,10 @@ class DeepSeekProtocolTests(unittest.TestCase):
             server.request_payload["tools"][0]["function"]["name"],
             "submit_action",
         )
+        self.assertIn(
+            "recall_memory",
+            server.request_payload["tools"][0]["function"]["parameters"]["properties"]["action"]["enum"],
+        )
         self.assertEqual(
             server.request_payload["tool_choice"],
             {"type": "function", "function": {"name": "submit_action"}},
@@ -266,6 +270,7 @@ class DeepSeekProtocolTests(unittest.TestCase):
             tool["function"]["name"] for tool in first_payload["tools"]
         }
         self.assertIn("read", direct_tool_names)
+        self.assertIn("recall_memory", direct_tool_names)
         self.assertIn("write", direct_tool_names)
         self.assertNotIn("submit_action", direct_tool_names)
         self.assertEqual(first_payload["thinking"], {"type": "enabled"})
@@ -289,6 +294,44 @@ class DeepSeekProtocolTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertEqual(tool_message["tool_call_id"], "call-1")
         self.assertEqual(json.loads(tool_message["content"])["state_update"]["task_id"], "current")
+
+    def test_wrapper_and_direct_protocols_parse_recall_memory(self) -> None:
+        recall_action = {
+            "thought_summary": "Ask Memory QA.",
+            "action": "recall_memory",
+            "target": "What durable preference applies?",
+            "args": {},
+            "expected_observation": "Grounded Memory answer.",
+            "risk": "low",
+        }
+        wrapper = OpenAICompatibleDecisionMaker(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            thinking=False,
+        )
+        wrapper._post_chat_completions = lambda payload: _native_response(
+            "call-wrapper-recall",
+            action=recall_action,
+        )
+        direct = OpenAICompatibleDecisionMaker(
+            api_key="test-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-chat",
+        )
+        direct._post_chat_completions = lambda payload: _direct_native_response(
+            "call-direct-recall",
+            action=recall_action,
+        )
+        state = create_initial_state("Inspect")
+
+        wrapper_action = wrapper.next_action("Context", state)
+        direct_action = direct.next_action("Context", state)
+
+        self.assertEqual(wrapper_action["action"], "recall_memory")
+        self.assertEqual(direct_action["action"], "recall_memory")
+        self.assertEqual(wrapper_action["target"], recall_action["target"])
+        self.assertEqual(direct_action["target"], recall_action["target"])
 
     def test_deepseek_direct_action_accepts_minimal_declared_arguments(self) -> None:
         response = _direct_native_response("call-direct-read")
@@ -601,7 +644,7 @@ class DeepSeekProtocolTests(unittest.TestCase):
 
         self.assertEqual(payload["thinking"], {"type": "disabled"})
 
-    def test_all_single_shot_deepseek_helpers_disable_thinking(self) -> None:
+    def test_memory_qa_preserves_main_deepseek_thinking_configuration(self) -> None:
         captured: list[dict[str, object]] = []
         spec_builder = OpenAICompatibleSpecBuilder(
             api_key="test-key",
@@ -641,34 +684,111 @@ class DeepSeekProtocolTests(unittest.TestCase):
         ui_builder.build([])
 
         with tempfile.TemporaryDirectory() as tmp:
-            retriever = MemoryRetriever(
-                Path(tmp),
+            state_dir = Path(tmp)
+            memory_dir = state_dir / "memories"
+            memory_dir.mkdir()
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use the preference.\n",
+                encoding="utf-8",
+            )
+            memory_qa = MemoryQA(
+                state_dir,
+                api_key="test-key",
+                base_url="https://api.deepseek.com/v1",
+                model="deepseek-chat",
+                thinking=True,
+            )
+            memory_qa._post_chat_completions = lambda payload: (
+                captured.append(json.loads(json.dumps(payload)))
+                or {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "found": True,
+                                        "answer": "Use the preference.",
+                                        "citations": [
+                                            {
+                                                "memory_id": "preference.md",
+                                                "quote": "Use the preference.",
+                                            }
+                                        ],
+                                        "conflicts": [],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+            result = memory_qa.recall("Use the preference.")
+
+        self.assertTrue(result.found)
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(all(payload["thinking"] == {"type": "disabled"} for payload in captured[:2]))
+        self.assertEqual(captured[2]["thinking"], {"type": "enabled"})
+
+    def test_memory_qa_uses_main_model_config_without_mutating_main_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            memory_dir = state_dir / "memories"
+            memory_dir.mkdir()
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            decision_maker = OpenAICompatibleDecisionMaker(
                 api_key="test-key",
                 base_url="https://api.deepseek.com/v1",
                 model="deepseek-chat",
             )
-            retriever._post_chat_completions = lambda payload: (
+            decision_maker.begin_session("Main context")
+            before_messages = json.loads(json.dumps(decision_maker.messages))
+            memory_qa = MemoryQA.from_decision_maker(state_dir, decision_maker)
+            captured: list[dict[str, object]] = []
+            memory_qa._post_chat_completions = lambda payload: (
                 captured.append(json.loads(json.dumps(payload)))
-                or {"choices": [{"message": {"content": '["preference.md"]'}}]}
-            )
-            selected = retriever._select_with_model(
-                "Use the preference.",
-                [
-                    MemoryHeader(
-                        filename="preference.md",
-                        name="preference",
-                        description="User preference",
-                        type="user",
-                        mtime_ms=0,
-                    )
-                ],
+                or {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "found": True,
+                                        "answer": "Use concise answers.",
+                                        "citations": [
+                                            {
+                                                "memory_id": "preference.md",
+                                                "quote": "Use concise answers.",
+                                            }
+                                        ],
+                                        "conflicts": [],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
             )
 
-        self.assertEqual(selected, ["preference.md"])
-        self.assertEqual(len(captured), 3)
-        self.assertTrue(
-            all(payload["thinking"] == {"type": "disabled"} for payload in captured)
-        )
+            memory_qa.recall("How should I answer?")
+
+        self.assertEqual(memory_qa.model, decision_maker.model)
+        self.assertEqual(memory_qa.thinking, decision_maker.thinking)
+        self.assertEqual(decision_maker.messages, before_messages)
+        self.assertEqual(decision_maker.last_tool_call_id, "")
+        self.assertEqual(captured[0]["model"], "deepseek-chat")
 
     def test_deepseek_reasoning_effort_is_normalized(self) -> None:
         decision_maker = OpenAICompatibleDecisionMaker(
@@ -1058,13 +1178,15 @@ class DeepSeekProtocolTests(unittest.TestCase):
                 loop._tool_call_replay("call-after-corruption", _action())
 
     def test_memory_retrieval_runs_once_without_refresh_event(self) -> None:
-        class CountingRetriever:
+        class CountingMemoryQA:
             calls = 0
 
-            def retrieve(self, query: str) -> RetrievedMemories:
+            def recall(self, query: str) -> MemoryQAResult:
                 del query
                 self.calls += 1
-                return RetrievedMemories([], [], "none")
+                return MemoryQAResult(False, "", [], [], "empty", source="none")
+
+            model = "fixed"
 
         class FixedDecisionMaker:
             uses_native_tools = False
@@ -1080,43 +1202,47 @@ class DeepSeekProtocolTests(unittest.TestCase):
             root = Path(tmp)
             loop = AgentLoop(root=root, task="Inspect", max_steps=2)
             loop._ensure_state_files()
-            retriever = CountingRetriever()
-            loop.memory_retriever = retriever
+            memory_qa = CountingMemoryQA()
+            loop.memory_qa = memory_qa
             loop.decision_maker = FixedDecisionMaker()
             state = create_initial_state("Inspect")
             loop._run_one_session(state)
 
-        self.assertEqual(retriever.calls, 1)
+        self.assertEqual(memory_qa.calls, 1)
 
     def test_task_transition_refreshes_memory_selection(self) -> None:
-        class CountingRetriever:
+        class CountingMemoryQA:
             calls = 0
 
-            def retrieve(self, query: str) -> RetrievedMemories:
+            def recall(self, query: str) -> MemoryQAResult:
                 del query
                 self.calls += 1
-                return RetrievedMemories([], [], "none")
+                return MemoryQAResult(False, "", [], [], "empty", source="none")
+
+            model = "fixed"
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             loop = AgentLoop(root=root, task="Build feature", max_steps=1)
             loop._ensure_state_files()
-            retriever = CountingRetriever()
-            loop.memory_retriever = retriever
+            memory_qa = CountingMemoryQA()
+            loop.memory_qa = memory_qa
             state = create_initial_state("Build feature")
             loop._run_one_session(state)
 
         self.assertEqual(state.last_action["action"], "update_plan")
-        self.assertEqual(retriever.calls, 2)
+        self.assertEqual(memory_qa.calls, 2)
 
     def test_new_worker_session_retrieves_memory_again(self) -> None:
-        class CountingRetriever:
+        class CountingMemoryQA:
             calls = 0
 
-            def retrieve(self, query: str) -> RetrievedMemories:
+            def recall(self, query: str) -> MemoryQAResult:
                 del query
                 self.calls += 1
-                return RetrievedMemories([], [], f"selection-{self.calls}")
+                return MemoryQAResult(False, "", [], [], f"selection-{self.calls}", source="none")
+
+            model = "fixed"
 
         class FixedDecisionMaker:
             uses_native_tools = False
@@ -1132,8 +1258,8 @@ class DeepSeekProtocolTests(unittest.TestCase):
             root = Path(tmp)
             loop = AgentLoop(root=root, task="Inspect", max_steps=1)
             loop._ensure_state_files()
-            retriever = CountingRetriever()
-            loop.memory_retriever = retriever
+            memory_qa = CountingMemoryQA()
+            loop.memory_qa = memory_qa
             loop.decision_maker = FixedDecisionMaker()
             state = create_initial_state("Inspect")
             first_session = loop._run_one_session(state)
@@ -1142,16 +1268,18 @@ class DeepSeekProtocolTests(unittest.TestCase):
 
         self.assertEqual(first_session.steps, 1)
         self.assertEqual(second_session.steps, 1)
-        self.assertEqual(retriever.calls, 2)
+        self.assertEqual(memory_qa.calls, 2)
 
     def test_successful_save_memory_triggers_refresh(self) -> None:
-        class CountingRetriever:
+        class CountingMemoryQA:
             calls = 0
 
-            def retrieve(self, query: str) -> RetrievedMemories:
+            def recall(self, query: str) -> MemoryQAResult:
                 del query
                 self.calls += 1
-                return RetrievedMemories([], [], "none")
+                return MemoryQAResult(False, "", [], [], f"selection-{self.calls}", source="none")
+
+            model = "fixed"
 
         class SaveMemoryDecisionMaker:
             uses_native_tools = False
@@ -1181,14 +1309,55 @@ class DeepSeekProtocolTests(unittest.TestCase):
             root = Path(tmp)
             loop = AgentLoop(root=root, task="Remember preference", max_steps=1)
             loop._ensure_state_files()
-            retriever = CountingRetriever()
-            loop.memory_retriever = retriever
+            memory_qa = CountingMemoryQA()
+            loop.memory_qa = memory_qa
             loop.decision_maker = SaveMemoryDecisionMaker()
             state = create_initial_state("Remember preference")
             loop._run_one_session(state)
 
         self.assertTrue(state.last_observation["ok"])
-        self.assertEqual(retriever.calls, 2)
+        self.assertEqual(memory_qa.calls, 2)
+
+    def test_explicit_recall_memory_does_not_trigger_a_second_automatic_recall(self) -> None:
+        class CountingMemoryQA:
+            calls = 0
+            model = "fixed"
+
+            def recall(self, query: str) -> MemoryQAResult:
+                del query
+                self.calls += 1
+                return MemoryQAResult(False, "", [], [], f"corpus-{self.calls}", source="none")
+
+        class RecallDecisionMaker:
+            uses_native_tools = False
+            fatal_protocol_errors = False
+            model = "fixed"
+            last_token_usage = None
+
+            def next_action(self, context: str, state: object) -> dict[str, object]:
+                del context, state
+                return {
+                    "thought_summary": "Ask Memory QA.",
+                    "action": "recall_memory",
+                    "target": "What durable preference applies?",
+                    "args": {},
+                    "expected_observation": "Grounded Memory answer.",
+                    "risk": "low",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Inspect", max_steps=1)
+            loop._ensure_state_files()
+            memory_qa = CountingMemoryQA()
+            loop.memory_qa = memory_qa
+            loop.decision_maker = RecallDecisionMaker()
+            state = create_initial_state("Inspect")
+
+            loop._run_one_session(state)
+
+        self.assertTrue(state.last_observation["ok"])
+        self.assertEqual(memory_qa.calls, 2)
 
     def test_skill_catalog_load_result_and_handoff_hash_rebuild(self) -> None:
         load_action = {

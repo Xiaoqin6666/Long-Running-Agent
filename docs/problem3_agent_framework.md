@@ -339,7 +339,11 @@ Persistent context is the substrate for handoff and ablation analysis.
 
 Persistent memory is stored as typed Markdown files under `<active_state_dir>/memories/`.
 Each memory has exactly one type: `user`, `feedback`, `project`, or `reference`.
-The root `<active_state_dir>/memory.md` file is only an index.
+The root `<active_state_dir>/memory.md` file is only a derived index. The harness
+rebuilds it from the typed files, then uses the main Agent model for a single isolated
+full-corpus QA at Worker-session start, task transitions, successful Memory writes,
+and explicit `recall_memory` calls. Only the grounded answer and exact validated
+citations enter the Main Agent context.
 
 When context grows too large, the harness creates `<active_state_dir>/handoff.md`.
 For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>/`; for ordinary non-benchmark runs it remains `state/`.

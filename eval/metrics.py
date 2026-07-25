@@ -64,6 +64,9 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
     memory_metadata_impressions = 0
     memory_saves = 0
     memory_rejections = 0
+    memory_qa_calls = 0
+    memory_qa_failures = 0
+    memory_qa_cache_hits = 0
     skill_loads = 0
     skill_load_failures = 0
     duplicate_skill_loads_avoided = 0
@@ -136,7 +139,24 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
             no_progress_session = 0
         max_session_tokens = max(max_session_tokens, int(event.get("session_used_tokens", 0)))
         token_usage = event.get("token_usage", {})
-        if isinstance(token_usage, dict):
+        usage_records = [token_usage] if isinstance(token_usage, dict) else []
+        memory_qa_events = event.get("memory_qa_events", [])
+        if isinstance(memory_qa_events, list):
+            for memory_event in memory_qa_events:
+                if not isinstance(memory_event, dict):
+                    continue
+                memory_qa_calls += int(
+                    not (
+                        memory_event.get("ok") is True
+                        and memory_event.get("source") == "none"
+                    )
+                )
+                memory_qa_failures += int(memory_event.get("ok") is False)
+                memory_qa_cache_hits += int(memory_event.get("cache_hit") is True)
+                auxiliary_usage = memory_event.get("token_usage")
+                if isinstance(auxiliary_usage, dict):
+                    usage_records.append(auxiliary_usage)
+        for token_usage in usage_records:
             llm_input_tokens += int(token_usage.get("input_tokens", 0) or 0)
             llm_output_tokens += int(token_usage.get("output_tokens", 0) or 0)
             llm_total_tokens += int(token_usage.get("total_tokens", 0) or 0)
@@ -172,6 +192,9 @@ def summarize(path: Path, tasks_path: Path | None = None) -> dict:
         "memory_metadata_impressions": memory_metadata_impressions,
         "memory_saves": memory_saves,
         "memory_rejections": memory_rejections,
+        "memory_qa_calls": memory_qa_calls,
+        "memory_qa_failures": memory_qa_failures,
+        "memory_qa_cache_hits": memory_qa_cache_hits,
         "skill_loads": skill_loads,
         "skill_load_failures": skill_load_failures,
         "duplicate_skill_loads_avoided": duplicate_skill_loads_avoided,

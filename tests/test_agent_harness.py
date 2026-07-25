@@ -8,16 +8,14 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.context import ContextBuilder
 from agent.llm import OpenAICompatibleDecisionMaker, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id, resolve_log_path
-from agent.memory_retrieval import (
-    MemoryRetriever,
-    scan_memory_headers,
-    truncate_entrypoint_content,
-)
+from agent.memory_qa import MemoryQA, MemoryQAError, MemoryQAResult
+from agent.memory_retrieval import truncate_entrypoint_content
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
 from agent.planner import (
     create_initial_state,
@@ -5779,6 +5777,25 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(hard_memory_exists)
         self.assertFalse(soft_memory_exists)
 
+    def test_memory_store_archives_legacy_files_and_rebuilds_derived_index(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "memory.md").write_text("# Legacy Memory\n", encoding="utf-8")
+            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            loop = AgentLoop(root=root, task="Inspect", max_steps=1)
+
+            loop._ensure_state_files()
+
+            archived = {path.name for path in (state_dir / "legacy_memories").iterdir()}
+            index = (state_dir / "memory.md").read_text(encoding="utf-8")
+
+        self.assertEqual(archived, {"memory.md", "hard_memory.md", "soft_memory.md"})
+        self.assertIn("Typed memories live in `memories/`", index)
+        self.assertIn("No typed memories available.", index)
+
     def test_save_memory_rejects_semantically_similar_memory(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5888,7 +5905,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(by_bytes.was_byte_truncated)
         self.assertLessEqual(len(by_bytes.content.encode("utf-8")), 25_200)
 
-    def test_memory_retriever_scans_headers_and_loads_relevant_memory_with_local_fallback(self) -> None:
+    def test_memory_qa_sends_complete_corpus_and_caches_same_question(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             memory_dir = root / "state" / "memories"
@@ -5913,15 +5930,244 @@ class HarnessBehaviorTests(unittest.TestCase):
                 + ("body line that should not affect header scanning\n" * 40),
                 encoding="utf-8",
             )
+            captured: list[dict[str, object]] = []
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: (
+                captured.append(json.loads(json.dumps(payload)))
+                or {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "found": True,
+                                        "answer": "Use the real database.",
+                                        "citations": [
+                                            {
+                                                "memory_id": "feedback_no_mock_db.md",
+                                                "quote": "Integration tests must use the real database.",
+                                            }
+                                        ],
+                                        "conflicts": ["A newer task instruction may override this Memory."],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+            first = qa.recall("write integration tests against database")
+            second = qa.recall("write integration tests against database")
+            previous_hash = second.corpus_hash
+            with (memory_dir / "feedback_no_mock_db.md").open("a", encoding="utf-8") as handle:
+                handle.write("\nReconfirm database access before running the suite.\n")
+            third = qa.recall("write integration tests against database")
 
-            headers = scan_memory_headers(memory_dir)
-            retrieved = MemoryRetriever(root / "state").retrieve("write integration tests against database")
+        sent = json.loads(captured[0]["messages"][1]["content"])
+        self.assertEqual(
+            {item["id"] for item in sent["memories"]},
+            {"feedback_no_mock_db.md", "user_preferences.md"},
+        )
+        self.assertTrue(first.found)
+        self.assertEqual(first.memory_ids, ["feedback_no_mock_db.md"])
+        self.assertEqual(
+            first.conflicts,
+            ["A newer task instruction may override this Memory."],
+        )
+        self.assertTrue(second.cache_hit)
+        self.assertFalse(third.cache_hit)
+        self.assertNotEqual(third.corpus_hash, previous_hash)
+        self.assertEqual(len(captured), 2)
 
-        self.assertEqual(len(headers), 2)
-        self.assertEqual(headers[0].filename.endswith(".md"), True)
-        self.assertEqual(retrieved.source, "local")
-        self.assertEqual(retrieved.selected_filenames, ["feedback_no_mock_db.md"])
-        self.assertIn("real database", retrieved.memories[0].content)
+    def test_memory_qa_empty_corpus_skips_provider(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "memories").mkdir(parents=True)
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: self.fail(
+                "empty Memory corpus must not call the Provider"
+            )
+            result = qa.recall("What should I remember?")
+
+        self.assertFalse(result.found)
+        self.assertEqual(result.source, "none")
+        self.assertFalse(result.cache_hit)
+
+    def test_memory_qa_rejects_invalid_citations_corrupt_files_and_oversized_corpus(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "state" / "memories"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "found": True,
+                                    "answer": "Be verbose.",
+                                    "citations": [
+                                        {"memory_id": "preference.md", "quote": "Be verbose."}
+                                    ],
+                                    "conflicts": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            with self.assertRaises(MemoryQAError) as invalid_citation:
+                qa.recall("How should I answer?")
+
+            (memory_dir / "broken.md").write_text("not typed Memory", encoding="utf-8")
+            with self.assertRaises(MemoryQAError) as invalid_files:
+                qa.recall("How should I answer now?")
+            (memory_dir / "broken.md").unlink()
+
+            small_window_qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+                context_window_tokens=50,
+            )
+            with self.assertRaises(MemoryQAError) as too_large:
+                small_window_qa.recall("How should I answer?")
+
+        self.assertEqual(invalid_citation.exception.code, "invalid_memory_qa_citation")
+        self.assertEqual(invalid_files.exception.code, "invalid_memory_files")
+        self.assertEqual(too_large.exception.code, "memory_corpus_too_large")
+
+    def test_memory_qa_wraps_invalid_provider_json(self) -> None:
+        class InvalidJSONResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self) -> bytes:
+                return b"not-json"
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "state" / "memories"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            with patch(
+                "agent.memory_qa.urllib.request.urlopen",
+                return_value=InvalidJSONResponse(),
+            ):
+                with self.assertRaises(MemoryQAError) as provider_error:
+                    qa.recall("How should I answer?")
+
+        self.assertEqual(provider_error.exception.code, "memory_qa_provider_error")
+        self.assertFalse(provider_error.exception.data["retryable"])
+
+    def test_recall_memory_is_read_only_and_records_auxiliary_usage(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Answer a question", max_steps=1)
+            loop._ensure_state_files()
+            (root / "state" / "memories" / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            loop.memory_qa = type(
+                "FixedMemoryQA",
+                (),
+                {
+                    "model": "fixed",
+                    "recall": lambda self, question: MemoryQAResult(
+                        True,
+                        "Use concise answers.",
+                        [{"memory_id": "preference.md", "quote": "Use concise answers."}],
+                        [],
+                        "corpus",
+                        usage={
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "total_tokens": 25,
+                            "source": "api",
+                        },
+                    ),
+                },
+            )()
+            state = create_initial_state("Answer a question")
+            state.interaction_mode = "question"
+            evidence_before = list(state.evidence_sources)
+            statuses_before = [node["status"] for node in state.nodes]
+            action = {
+                "action": "recall_memory",
+                "target": "How should responses be written?",
+                "args": {},
+            }
+
+            observation = loop._execute_action(action, state)
+            loop._update_state(state, action, observation)
+            initializer_state = create_initializer_state(
+                "Initialize",
+                project_spec_artifact="project_spec.md",
+                requirements_artifact="state/requirements.json",
+                generated_tasks_artifact="state/generated_tasks.json",
+                init_artifact="state/init.sh",
+            )
+            initializer_observation = loop._execute_action(action, initializer_state)
+
+        self.assertTrue(observation.ok)
+        self.assertTrue(initializer_observation.ok)
+        self.assertEqual(
+            [item["memory_id"] for item in observation.data["citations"]],
+            ["preference.md"],
+        )
+        self.assertFalse(state.last_observation["counts_as_progress"])
+        self.assertEqual(state.evidence_sources, evidence_before)
+        self.assertEqual([node["status"] for node in state.nodes], statuses_before)
+        self.assertEqual(state.token_usage["totals"]["total_tokens"], 25)
 
     def test_agent_loop_injects_relevant_memories_into_context(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -5948,12 +6194,16 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             state = create_initial_state("Write integration tests against the database")
 
-            context = loop.context_builder.build(state, relevant_memories=loop._relevant_memory_context(state))
+            context = loop.context_builder.build(
+                state,
+                relevant_memories=loop._relevant_memory_context(state, trigger="session_start"),
+            )
 
         self.assertIn("# Relevant Memories", context)
         self.assertIn("feedback_no_mock_db.md", context)
-        self.assertIn("Mock tests missed migration failures", context)
-        self.assertEqual(loop._last_memory_selection["source"], "local")
+        self.assertIn("Integration tests must use the real database", context)
+        self.assertNotIn("Mock tests missed migration failures", context)
+        self.assertEqual(loop._last_memory_selection["source"], "offline")
 
     def test_handoff_ready_blocks_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -7851,6 +8101,44 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(summary["llm_unpriced_turns"], 1)
         self.assertEqual(summary["completed_tasks"], 1)
         self.assertEqual(summary["blocked_tasks"], 1)
+
+    def test_metrics_counts_memory_qa_usage_without_marking_progress(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            trace = Path(tmp) / "run.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "action": {"action": "recall_memory"},
+                        "observation": {
+                            "ok": True,
+                            "summary": "Recalled.",
+                            "data": {"counts_as_progress": False},
+                        },
+                        "memory_qa_events": [
+                            {
+                                "ok": True,
+                                "source": "full_qa",
+                                "cache_hit": False,
+                                "token_usage": {
+                                    "input_tokens": 100,
+                                    "output_tokens": 20,
+                                    "total_tokens": 120,
+                                    "cost": {"available": False},
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize(trace)
+
+        self.assertEqual(summary["memory_qa_calls"], 1)
+        self.assertEqual(summary["memory_qa_failures"], 0)
+        self.assertEqual(summary["memory_qa_cache_hits"], 0)
+        self.assertEqual(summary["llm_total_tokens"], 120)
+        self.assertEqual(summary["no_progress_sessions"], 1)
 
     def test_metrics_reports_skill_loading_and_validation(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

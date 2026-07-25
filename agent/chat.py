@@ -13,19 +13,17 @@ from typing import Callable
 from agent.loop import AgentLoop, RunResult
 from agent.memory import (
     MemoryDocument,
-    find_semantic_duplicate,
+    MemoryStore,
+    MemoryStoreError,
     normalize_memory_content,
-    render_memory,
-    render_memory_index,
     safe_memory_id,
-    validate_memory,
 )
 from agent.spec_builder import build_project_spec
 from agent.skills import build_skill, render_skill
 
 
 UI_WIDTH = 72
-TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
+TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "recall_memory", "search", "write"}
 HELP_TEXT = """Commands:
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
   /send      Start work from the collected /agent requirements or /adjust directions
@@ -304,36 +302,21 @@ class InteractiveCLI:
             {"type": memory_type, "content": content, "why": why, "how_to_apply": how_to_apply}
         )
         memory = MemoryDocument(memory_id, description, memory_type, rendered_content)
-        errors = validate_memory(memory)
-        if errors:
-            self.output("Memory validation failed: " + "; ".join(errors))
-            return
-        semantic_duplicate = find_semantic_duplicate(memory, memory_dir, exclude_name=memory_id)
-        if semantic_duplicate:
-            self.output(
-                "Memory validation failed: semantically similar to existing Memory "
-                f"'{semantic_duplicate['name']}' ({semantic_duplicate['similarity']})."
-            )
-            return
-
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        temporary_path = memory_path.with_suffix(".md.tmp")
         try:
-            temporary_path.write_text(render_memory(memory), encoding="utf-8")
-            temporary_path.replace(memory_path)
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            (self.state_dir / "memory.md").write_text(render_memory_index(memory_dir), encoding="utf-8")
+            saved = MemoryStore(self.state_dir).save(memory, overwrite=memory_path.exists())
+        except MemoryStoreError as exc:
+            self.output("Memory validation failed: " + str(exc).removeprefix("Memory rejected: ").rstrip("."))
+            return
         except OSError as exc:
-            temporary_path.unlink(missing_ok=True)
             self.output(f"Could not save Memory: {exc}")
             return
 
         record = ChatMessage(
             "system",
-            f"User added trusted Memory '{memory_id}' at {self._relative_path(memory_path)}.",
+            f"User added trusted Memory '{memory_id}' at {self._relative_path(Path(saved['path']))}.",
         )
         self._append_history(record)
-        self.output(self._paint(f"Memory saved: {self._relative_path(memory_path)}", "green", bold=True))
+        self.output(self._paint(f"Memory saved: {self._relative_path(Path(saved['path']))}", "green", bold=True))
 
     def _save_user_skill(self, name: str, content: str) -> None:
         skill_id = safe_skill_id(name)

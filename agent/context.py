@@ -341,6 +341,7 @@ class ContextBuilder:
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
             "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
+            "- recall_memory: run one read-only full-corpus Memory QA using the main Agent model; target='<natural-language question>'; args={}. Use only when the startup result does not answer a newly relevant durable-context question.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
             "- edit: exact text replacement or line-range replacement; target='<path>'; use args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false, or use args.start=<line>, args.end=<line>, args.content='<replacement text>'.",
             "- bash: run a needed command from repository root; target='<command>'; args.timeout=30.",

@@ -51,7 +51,7 @@ python -m agent.main --project-spec eval\benchmarks\MAPA\task.md --provider open
 和许可证文件。运行期间新增的 Skill 保存在 `state/skills/`；同名时运行状态中的 Skill
 覆盖默认 Skill。来源版本和授权说明见 `default_skills/UPSTREAM.md`。
 
-The memory index at `state/memory.md` is loaded at Worker-session start with a 200-line / 25KB cap. Relevant full memory files are refreshed on external user input, task transitions, and successful `save_memory` events instead of every model step. Set `LONG_AGENT_MEMORY_MODEL` such as `deepseek-flash` to use a cheap selector model; if it is unset or fails, the harness falls back to local keyword matching. DeepSeek selector calls explicitly disable thinking.
+Typed Memory bodies live in `state/memories/*.md`; `state/memory.md` is a derived index rebuilt at startup and after writes. At Worker-session start, task transitions, and successful `save_memory` events, the harness sends the complete valid typed-Memory corpus to the main `LONG_AGENT_MODEL` in one isolated QA request and injects only its grounded answer and validated exact citations into the Main Agent context. The Main Agent can also call the read-only `recall_memory` action with a natural-language question. The full corpus is never silently truncated or replaced with keyword search: an oversized or invalid corpus produces an explicit error. Because every typed Memory body is sent to the configured main-model provider, do not store credentials or secrets in Memory.
 
 Summarize a trace:
 
@@ -95,7 +95,6 @@ $env:LONG_AGENT_THINKING="auto"
 $env:LONG_AGENT_REASONING_EFFORT="high"
 $env:LONG_AGENT_PROVIDER_MAX_ATTEMPTS="3"
 $env:LONG_AGENT_CONTEXT_WINDOW_TOKENS="128000"
-$env:LONG_AGENT_MEMORY_MODEL="deepseek-flash"  # optional selector model
 $env:LONG_AGENT_TOKEN_PRICES_JSON='{"gpt-4.1-mini":{"input_per_1m":0.0,"output_per_1m":0.0,"currency":"USD"}}'
 ```
 

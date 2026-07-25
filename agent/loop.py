@@ -15,16 +15,13 @@ from agent.context import ContextBuilder
 from agent.llm import ProviderProtocolError, ProviderRequestError, create_decision_maker
 from agent.memory import (
     MemoryDocument,
-    find_semantic_duplicate,
+    MemoryStore,
+    MemoryStoreError,
     memory_catalog,
     normalize_memory_content,
-    parse_memory,
-    render_memory,
-    render_memory_index,
     safe_memory_id,
-    validate_memory,
 )
-from agent.memory_retrieval import MemoryRetriever, render_relevant_memories
+from agent.memory_qa import MemoryQA, MemoryQAError, MemoryQAResult, render_memory_qa_result
 from agent.orchestrator import Orchestrator
 from agent.planner import (
     TaskState,
@@ -146,7 +143,7 @@ class AgentLoop:
             git_root=benchmark_git_root,
             project_spec_path=self._active_project_spec_path(),
         )
-        self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
+        self.memory_store = MemoryStore(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
         self.terminator = ProjectTerminator(
             root,
@@ -156,6 +153,7 @@ class AgentLoop:
             final_validation_required=self.system_validation,
         )
         self.decision_maker = create_decision_maker(provider)
+        self.memory_qa = MemoryQA.from_decision_maker(self.state_dir, self.decision_maker)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
             "bash": BashTool(root, python_path=benchmark_python_path, output_dir=self.tool_output_dir),
@@ -174,6 +172,7 @@ class AgentLoop:
             "write": WriteTool(root),
         }
         self._last_memory_selection: dict[str, Any] = {}
+        self._pending_memory_qa_events: list[dict[str, Any]] = []
         self._current_context_snapshot: dict[str, Any] = {}
         self._last_token_usage_record: dict[str, Any] = {}
         self.token_pricing = load_pricing_from_env()
@@ -255,7 +254,8 @@ class AgentLoop:
         completed = False
         message = "Reached max steps before completion."
         self._record_task_session(state)
-        memory_context = self._relevant_memory_context(state)
+        self._current_trace_step = 0
+        memory_context = self._relevant_memory_context(state, trigger="session_start")
         uses_native_tools = bool(getattr(self.decision_maker, "uses_native_tools", False))
         self.context_builder.current_trace_path = self.trace_path
         initial_context = (
@@ -389,8 +389,11 @@ class AgentLoop:
                 self._apply_orchestrator_selection(state)
             active_task_changed = self._active_task_id(state) != previous_task_id
             refreshed_memory_context = ""
-            if (action["action"] == "save_memory" and observation.ok) or active_task_changed:
-                memory_context = self._relevant_memory_context(state)
+            if action["action"] == "recall_memory" and observation.ok:
+                memory_context = str(observation.data.get("relevant_memories", ""))
+            elif (action["action"] == "save_memory" and observation.ok) or active_task_changed:
+                trigger = "after_save" if action["action"] == "save_memory" else "task_transition"
+                memory_context = self._relevant_memory_context(state, trigger=trigger)
                 refreshed_memory_context = memory_context
             record_tool_result = getattr(self.decision_maker, "record_tool_result", None)
             provider_append_error = ""
@@ -858,6 +861,8 @@ class AgentLoop:
             return self._validate_contract_action(action, state)
         if name == "load_skill":
             return self._handle_load_skill_action(action, state)
+        if name == "recall_memory":
+            return self._handle_recall_memory_action(action, state)
         if name == "save_memory":
             if self._is_initializer_task(state):
                 return ToolResult(False, "Memory saving is disabled during INIT.", {"initializer_restricted": True})
@@ -1663,7 +1668,7 @@ class AgentLoop:
 
         name = action.get("action")
         active_task_id = self._active_task_id(state)
-        if name == "debug_context":
+        if name in {"debug_context", "recall_memory"}:
             state.last_observation["counts_as_progress"] = False
         elif name == "contract" and observation.ok:
             contract = dict(observation.data["contract"])
@@ -3181,6 +3186,57 @@ class AgentLoop:
             },
         )
 
+    def _handle_recall_memory_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        question = str(action.get("target", "")).strip()
+        if not question:
+            return ToolResult(
+                False,
+                "Memory recall rejected: target must contain a natural-language question.",
+                {"error": "empty_memory_question", "counts_as_progress": False},
+            )
+        try:
+            result = self.memory_qa.recall(question)
+        except MemoryQAError as exc:
+            self._record_memory_qa_event(
+                state,
+                trigger="tool",
+                question=question,
+                error=exc,
+            )
+            error_data = dict(exc.data)
+            error_data.pop("usage", None)
+            return ToolResult(
+                False,
+                f"Memory recall failed: {exc}",
+                {**error_data, "counts_as_progress": False},
+            )
+        self._record_memory_qa_event(
+            state,
+            trigger="tool",
+            question=question,
+            result=result,
+        )
+        self._last_memory_selection = {
+            "source": result.source,
+            "selected": result.memory_ids,
+            "corpus_hash": result.corpus_hash,
+            "cache_hit": result.cache_hit,
+        }
+        rendered = render_memory_qa_result(result)
+        return ToolResult(
+            True,
+            (
+                f"Memory recall found {len(result.memory_ids)} cited Memory file(s)."
+                if result.found
+                else "Memory recall found no grounded answer."
+            ),
+            {
+                **result.to_dict(),
+                "relevant_memories": rendered,
+                "counts_as_progress": False,
+            },
+        )
+
     def _handle_save_memory_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
         args = action.get("args", {})
         if not isinstance(args, dict):
@@ -3190,54 +3246,17 @@ class AgentLoop:
         memory_type = str(args.get("type") or "").strip()
         content = normalize_memory_content(args)
         memory = MemoryDocument(memory_id, description, memory_type, content)
-        errors = validate_memory(memory)
-        if errors:
-            return ToolResult(False, "Memory rejected: " + "; ".join(errors) + ".", {"errors": errors})
-
-        memory_dir = self.state_dir / "memories"
-        catalog = memory_catalog(memory_dir)
-        normalized_description = " ".join(description.lower().split())
-        duplicate = next(
-            (
-                item
-                for item in catalog
-                if safe_memory_id(item["name"]) == memory_id
-                or " ".join(item["description"].lower().split()) == normalized_description
-            ),
-            None,
-        )
-        if duplicate:
-            return ToolResult(False, f"Memory rejected: duplicate of existing memory {duplicate['name']}.", {"duplicate": duplicate})
-        semantic_duplicate = find_semantic_duplicate(memory, memory_dir)
-        if semantic_duplicate:
-            return ToolResult(
-                False,
-                (
-                    "Memory rejected: semantically similar to existing memory "
-                    f"{semantic_duplicate['name']}."
-                ),
-                {"duplicate": semantic_duplicate, "duplicate_reason": "semantic_similarity"},
-            )
-
-        memory_path = memory_dir / f"{memory_id}.md"
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = memory_path.with_suffix(".md.tmp")
-        temporary_path.write_text(render_memory(memory), encoding="utf-8")
-        parsed = validate_memory(parse_memory(temporary_path.read_text(encoding="utf-8"), fallback_name=memory_id))
-        if parsed:
-            temporary_path.unlink(missing_ok=True)
-            return ToolResult(False, "Memory rejected: rendered Memory failed validation.", {"errors": parsed})
-        temporary_path.replace(memory_path)
-        self.memory_path.write_text(render_memory_index(memory_dir), encoding="utf-8")
+        try:
+            saved = self.memory_store.save(memory)
+        except MemoryStoreError as exc:
+            return ToolResult(False, str(exc), dict(exc.data))
+        memory_path = Path(saved["path"])
         return ToolResult(
             True,
             f"Memory saved: {memory_id}.",
             {
-                "name": memory_id,
-                "description": description,
-                "type": memory_type,
+                **saved,
                 "path": self._rel(memory_path),
-                "content_hash": memory.content_hash,
             },
         )
 
@@ -3599,23 +3618,101 @@ class AgentLoop:
             encoding="utf-8",
         )
 
-    def _relevant_memory_context(self, state: TaskState) -> str:
-        query = self._memory_retrieval_query(state)
+    def _relevant_memory_context(self, state: TaskState, *, trigger: str) -> str:
+        question = self._memory_retrieval_query(state)
         try:
-            retrieved = self.memory_retriever.retrieve(query)
-        except Exception as exc:
-            LOGGER.warning("Memory retrieval failed: %s", exc)
+            result = self.memory_qa.recall(question)
+        except MemoryQAError as exc:
+            LOGGER.warning("Memory QA failed: %s", exc)
             self._last_memory_selection = {
                 "source": "error",
                 "selected": [],
-                "error_type": type(exc).__name__,
+                "error": exc.code,
             }
-            return render_relevant_memories([], source="error")
+            self._record_memory_qa_event(
+                state,
+                trigger=trigger,
+                question=question,
+                error=exc,
+            )
+            return (
+                "# Relevant Memories\n"
+                "Memory QA was unavailable; no Memory content was injected.\n\n"
+                f"Error: {exc.code}."
+            )
         self._last_memory_selection = {
-            "source": retrieved.source,
-            "selected": retrieved.selected_filenames,
+            "source": result.source,
+            "selected": result.memory_ids,
+            "corpus_hash": result.corpus_hash,
+            "cache_hit": result.cache_hit,
         }
-        return render_relevant_memories(retrieved.memories, source=retrieved.source)
+        self._record_memory_qa_event(
+            state,
+            trigger=trigger,
+            question=question,
+            result=result,
+        )
+        return render_memory_qa_result(result)
+
+    def _record_memory_qa_event(
+        self,
+        state: TaskState,
+        *,
+        trigger: str,
+        question: str,
+        result: MemoryQAResult | None = None,
+        error: MemoryQAError | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "trigger": trigger,
+            "question_hash": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "ok": error is None,
+        }
+        if result is not None:
+            event.update(
+                {
+                    "found": result.found,
+                    "memory_ids": result.memory_ids,
+                    "corpus_hash": result.corpus_hash,
+                    "cache_hit": result.cache_hit,
+                    "source": result.source,
+                }
+            )
+            if result.usage:
+                state.token_usage = initialize_token_usage(state.token_usage)
+                usage_record = record_turn_usage(
+                    state.token_usage,
+                    session_id=self.trace_path.stem,
+                    step=int(getattr(self, "_current_trace_step", 0) or 0),
+                    task_id=self._active_task_id(state),
+                    provider=self.provider,
+                    model=self.memory_qa.model,
+                    operation_type=f"memory_qa_{trigger}",
+                    usage=result.usage,
+                    pricing=self.token_pricing,
+                    recorded_at=utc_now(),
+                )
+                event["token_usage"] = usage_record
+        if error is not None:
+            error_details = dict(error.data)
+            error_usage = error_details.pop("usage", None)
+            if isinstance(error_usage, dict):
+                state.token_usage = initialize_token_usage(state.token_usage)
+                usage_record = record_turn_usage(
+                    state.token_usage,
+                    session_id=self.trace_path.stem,
+                    step=int(getattr(self, "_current_trace_step", 0) or 0),
+                    task_id=self._active_task_id(state),
+                    provider=self.provider,
+                    model=self.memory_qa.model,
+                    operation_type=f"memory_qa_{trigger}",
+                    usage=error_usage,
+                    pricing=self.token_pricing,
+                    recorded_at=utc_now(),
+                )
+                event["token_usage"] = usage_record
+            event.update({"error": error.code, "details": error_details})
+        self._pending_memory_qa_events.append(event)
 
     def _provider_state_update(
         self,
@@ -3805,6 +3902,7 @@ class AgentLoop:
             "skill_catalog_size": len(skill_catalog(self._skill_dirs())),
             "memory_catalog_size": len(memory_catalog(self.state_dir / "memories")),
             "memory_selection": self._last_memory_selection,
+            "memory_qa_events": list(self._pending_memory_qa_events),
             "loaded_skill_names": [
                 str(item.get("name")) for item in state.loaded_skills if isinstance(item, dict) and item.get("name")
             ],
@@ -3813,6 +3911,7 @@ class AgentLoop:
         }
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, indent=2) + "\n")
+        self._pending_memory_qa_events.clear()
 
     def _provider_session_reference(self) -> dict[str, Any]:
         if not bool(getattr(self.decision_maker, "uses_native_tools", False)):
@@ -4362,13 +4461,11 @@ class AgentLoop:
         except OSError:
             pass
         (self.state_dir / "skills").mkdir(exist_ok=True)
-        (self.state_dir / "memories").mkdir(exist_ok=True)
         (self.state_dir / "skill_candidates").mkdir(exist_ok=True)
         (self.state_dir / "verifier_reports").mkdir(exist_ok=True)
-        if not self.memory_path.exists():
-            self.memory_path.write_text(render_memory_index(self.state_dir / "memories"), encoding="utf-8")
-        for legacy_memory in (self.state_dir / "hard_memory.md", self.state_dir / "soft_memory.md"):
-            legacy_memory.unlink(missing_ok=True)
+        archived_memories = self.memory_store.ensure_layout()
+        for archived_memory in archived_memories:
+            LOGGER.warning("Archived legacy Memory file at %s.", self._rel(archived_memory))
         if not (self.state_dir / "skills" / "coding.md").exists():
             (self.state_dir / "skills" / "coding.md").write_text(
                 "---\n"
