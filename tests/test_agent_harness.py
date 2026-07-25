@@ -8,16 +8,14 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.context import ContextBuilder
-from agent.llm import OpenAICompatibleDecisionMaker, parse_action_json, validate_action
+from agent.llm import OpenAICompatibleDecisionMaker, validate_action
 from agent.loop import AgentLoop
 from agent.main import build_parser, infer_benchmark_id, resolve_log_path
-from agent.memory_retrieval import (
-    MemoryRetriever,
-    scan_memory_headers,
-    truncate_entrypoint_content,
-)
+from agent.memory_qa import MemoryQA, MemoryQAError, MemoryQAResult
+from agent.memory_retrieval import truncate_entrypoint_content
 from agent.orchestrator import Orchestrator, count_unlocked_tasks, select_current_task
 from agent.planner import (
     create_initial_state,
@@ -28,6 +26,7 @@ from agent.planner import (
 )
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import validate_task_requirement_closeout
+from agent.skills import discover_skill_entries
 from agent.system_validation import (
     _evaluate_ui_field,
     _ui_source_by_requirement,
@@ -909,13 +908,13 @@ class HarnessBehaviorTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["Task", "--tasks-json", "eval/benchmarks/issue_tracker/tasks.json"])
 
-        self.assertEqual(str(args.tasks_json), "eval\\benchmarks\\issue_tracker\\tasks.json")
+        self.assertEqual(args.tasks_json.as_posix(), "eval/benchmarks/issue_tracker/tasks.json")
 
     def test_cli_accepts_project_spec(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["--project-spec", "eval/benchmarks/todo_counter/project_spec.md"])
 
-        self.assertEqual(str(args.project_spec), "eval\\benchmarks\\todo_counter\\project_spec.md")
+        self.assertEqual(args.project_spec.as_posix(), "eval/benchmarks/todo_counter/project_spec.md")
 
     def test_cli_accepts_explicit_benchmark(self) -> None:
         parser = build_parser()
@@ -929,6 +928,19 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(args.auto_resume)
         self.assertEqual(args.max_sessions, 3)
+
+    def test_cli_enables_unlimited_auto_resume_by_default(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task"])
+
+        self.assertTrue(args.auto_resume)
+        self.assertIsNone(args.max_sessions)
+
+    def test_cli_can_disable_auto_resume(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task", "--no-auto-resume"])
+
+        self.assertFalse(args.auto_resume)
 
     def test_cli_can_disable_system_validation(self) -> None:
         parser = build_parser()
@@ -970,7 +982,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["Task", "--log-file", "diagnostics/run.log"])
 
-        self.assertEqual(str(args.log_file), "diagnostics\\run.log")
+        self.assertEqual(args.log_file.as_posix(), "diagnostics/run.log")
 
     def test_debug_context_action_is_rejected_by_validation(self) -> None:
         state = create_initial_state("Inspect context")
@@ -1022,10 +1034,10 @@ class HarnessBehaviorTests(unittest.TestCase):
             trace_events = loop._load_trace_events(loop.trace_path)
 
         self.assertTrue(observation.ok)
-        self.assertIn("# Full Model Context", snapshot_content)
-        self.assertIn("## System Message", observation.data["content"])
-        self.assertLess(snapshot_content.index("## System Message"), snapshot_content.index("- trace:"))
-        self.assertLess(snapshot_content.index("- written_at:"), snapshot_content.index("## User Context"))
+        self.assertIn("# Harness Context Snapshot", snapshot_content)
+        self.assertIn("## System Policy Snapshot", observation.data["content"])
+        self.assertLess(snapshot_content.index("## System Policy Snapshot"), snapshot_content.index("- trace:"))
+        self.assertLess(snapshot_content.index("- written_at:"), snapshot_content.index("## Harness Context"))
         self.assertEqual(trace_events[0]["context_ref"]["path"], snapshot["path"])
         self.assertEqual(trace_events[0]["tool_return"], trace_events[0]["observation"])
 
@@ -2422,10 +2434,11 @@ class HarnessBehaviorTests(unittest.TestCase):
             add_result = tool.run({"action": "git", "target": "add --all", "args": {}})
             commit_result = tool.run({"action": "git", "target": "commit -m benchmark", "args": {}})
             root_git_exists = (root / ".git").exists()
+            workspace_git_exists = (workspace / ".git").is_dir()
 
         self.assertTrue(add_result.ok, add_result.data.get("output"))
         self.assertTrue(commit_result.ok, commit_result.data.get("output"))
-        self.assertTrue((workspace / ".git").is_dir())
+        self.assertTrue(workspace_git_exists)
         self.assertFalse(root_git_exists)
 
     def test_benchmark_loop_configures_workspace_git(self) -> None:
@@ -2527,15 +2540,6 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertEqual(action["args"], {"command": "python --version"})
 
-    def test_parse_action_json_extracts_object_after_preface(self) -> None:
-        action = parse_action_json(
-            'I will inspect first. {"action": "list_files", "target": ".", "args": {}, '
-            '"thought_summary": "Inspect.", "expected_observation": "Files.", "risk": "low"}'
-        )
-
-        self.assertEqual(action["action"], "list_files")
-        self.assertEqual(action["target"], ".")
-
     def test_loop_executes_model_action_without_rewrite(self) -> None:
         action = {
             "action": "list_files",
@@ -2577,20 +2581,32 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         def fake_post(payload: dict[str, object]) -> dict[str, object]:
             self.assertEqual(payload["model"], "test-model")
+            self.assertEqual(payload["tools"][0]["function"]["name"], "submit_action")
             return {
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
                                 {
-                                    "thought_summary": "Inspect.",
-                                    "action": "list_files",
-                                    "target": ".",
-                                    "args": {},
-                                    "expected_observation": "Workspace entries.",
-                                    "risk": "low",
+                                    "id": "call-token-usage",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_action",
+                                        "arguments": json.dumps(
+                                            {
+                                                "thought_summary": "Inspect.",
+                                                "action": "list_files",
+                                                "target": ".",
+                                                "args": {},
+                                                "expected_observation": "Workspace entries.",
+                                                "risk": "low",
+                                            }
+                                        ),
+                                    },
                                 }
-                            )
+                            ],
                         }
                     }
                 ],
@@ -2607,7 +2623,17 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(action["action"], "list_files")
         self.assertEqual(
             decision_maker.last_token_usage,
-            {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168, "source": "api"},
+            {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "total_tokens": 168,
+                "source": "api",
+                "provider_usage": {
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "total_tokens": 168,
+                },
+            },
         )
 
     def test_openai_decision_maker_prefers_api_cost_when_returned(self) -> None:
@@ -2623,16 +2649,27 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
                                 {
-                                    "thought_summary": "Inspect.",
-                                    "action": "list_files",
-                                    "target": ".",
-                                    "args": {},
-                                    "expected_observation": "Workspace entries.",
-                                    "risk": "low",
+                                    "id": "call-cost",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_action",
+                                        "arguments": json.dumps(
+                                            {
+                                                "thought_summary": "Inspect.",
+                                                "action": "list_files",
+                                                "target": ".",
+                                                "args": {},
+                                                "expected_observation": "Workspace entries.",
+                                                "risk": "low",
+                                            }
+                                        ),
+                                    },
                                 }
-                            )
+                            ],
                         }
                     }
                 ],
@@ -4163,6 +4200,8 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(state.task_id, "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["id"], "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["status"], "in_progress")
+        self.assertTrue(state.nodes[0]["final_acceptance"])
+        self.assertTrue(state.nodes[0]["system_owned_validation"])
         self.assertEqual(data["tasks"][1]["status"], "in_progress")
         self.assertEqual(current_task_data["task_id"], "FINAL_ACCEPTANCE")
         self.assertEqual(current_task_data["nodes"][0]["id"], "FINAL_ACCEPTANCE")
@@ -6273,7 +6312,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(candidate["status"], "promoted")
         self.assertEqual(
             [item["status"] for item in candidate["status_history"]],
-            ["proposed", "evidence_validated", "content_validated", "approved", "promoted"],
+            ["proposed", "evidence_validated", "approved", "promoted"],
         )
 
     def test_skill_accepts_evidence_confirmed_failure(self) -> None:
@@ -6337,8 +6376,8 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "target": "verify-before-finish",
                     "args": {
                         "name": "verify-before-finish",
-                        "description": "Require independent verification before finishing a coding task.",
-                        "instruction": "Run the mapped verification command before finish.",
+                        "content": "Require independent verification before finishing a coding task.\n\n"
+                        "Run the mapped verification command before finish.",
                         "evidence_type": "verified_success",
                         "evidence_refs": [{"type": "verifier_report", "task_id": "current"}],
                     },
@@ -6357,13 +6396,142 @@ class HarnessBehaviorTests(unittest.TestCase):
             (skill_dir / "locate-error.md").write_text(
                 "---\nname: locate-error\n"
                 "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nSECRET FULL PROCEDURE\n",
+                "custom-field: preserved\n---\n\nSECRET FULL PROCEDURE\n",
                 encoding="utf-8",
             )
             context = ContextBuilder(root).build(create_initial_state("Debug tests"))
 
         self.assertIn("locate-error: Locate repeated errors in long logs.", context)
         self.assertNotIn("SECRET FULL PROCEDURE", context)
+
+    def test_default_directory_skill_is_available_and_loads_bundled_resources(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = root / "default_skills" / "package-skill"
+            package_dir.mkdir(parents=True)
+            (package_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: package-skill\n"
+                "description: >-\n"
+                "  Use the bundled helper\n"
+                "  for package workflows.\n"
+                "---\n\n"
+                "Run `scripts/helper.py`.\n",
+                encoding="utf-8",
+            )
+            helper_path = package_dir / "scripts" / "helper.py"
+            helper_path.parent.mkdir()
+            helper_path.write_text("print('first')\n", encoding="utf-8")
+            state = create_initial_state("Use package")
+            loop = AgentLoop(root=root, task="Use package", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "package-skill", "args": {}},
+                state,
+            )
+            loaded_context = ContextBuilder(root).build(state)
+            helper_path.write_text("print('changed')\n", encoding="utf-8")
+            invalidated_context = ContextBuilder(root).build(state)
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(
+            observation.data["description"],
+            "Use the bundled helper for package workflows.",
+        )
+        self.assertEqual(observation.data["path"], "default_skills/package-skill/SKILL.md")
+        self.assertIn("Resolve relative Skill resource paths from: default_skills/package-skill", loaded_context)
+        self.assertIn("Run `scripts/helper.py`.", loaded_context)
+        self.assertIn("Invalidated Skills (reload before use): package-skill", invalidated_context)
+
+    def test_state_skill_overrides_same_named_default_skill(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            default_dir = root / "default_skills" / "shared"
+            default_dir.mkdir(parents=True)
+            (default_dir / "SKILL.md").write_text(
+                "---\nname: shared\ndescription: Default description.\n---\n\nDEFAULT BODY\n",
+                encoding="utf-8",
+            )
+            state_dir = root / "state" / "skills"
+            state_dir.mkdir(parents=True)
+            (state_dir / "shared.md").write_text(
+                "---\nname: shared\ndescription: State description.\n---\n\nSTATE BODY\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Use shared")
+            loop = AgentLoop(root=root, task="Use shared", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "shared", "args": {}},
+                state,
+            )
+            context = ContextBuilder(root).build(state)
+
+        self.assertTrue(observation.ok)
+        self.assertEqual(observation.data["path"], "state/skills/shared.md")
+        self.assertIn("shared: State description.", context)
+        self.assertNotIn("shared: Default description.", context)
+        self.assertIn("STATE BODY", context)
+        self.assertNotIn("DEFAULT BODY", context)
+
+    def test_default_coding_skill_has_structured_frontmatter(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            loop._ensure_state_files()
+            content = (root / "state" / "skills" / "coding.md").read_text(encoding="utf-8")
+
+        self.assertTrue(content.startswith("---\nname: coding\n"))
+        self.assertIn("description:", content)
+        self.assertIn("# Instructions", content)
+
+    def test_bundled_anthropic_default_skill_inventory(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        names = {
+            entry.document.name
+            for entry in discover_skill_entries(root / "default_skills")
+        }
+
+        self.assertEqual(
+            names,
+            {
+                "algorithmic-art",
+                "brand-guidelines",
+                "canvas-design",
+                "claude-api",
+                "doc-coauthoring",
+                "docx",
+                "frontend-design",
+                "internal-comms",
+                "mcp-builder",
+                "pdf",
+                "pptx",
+                "skill-creator",
+                "slack-gif-creator",
+                "theme-factory",
+                "web-artifacts-builder",
+                "webapp-testing",
+                "xlsx",
+            },
+        )
+
+    def test_skill_without_name_frontmatter_is_not_available(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "state" / "skills"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "missing-name.md").write_text(
+                "This file has Markdown content but no required name frontmatter.\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Debug tests")
+            context = ContextBuilder(root).build(state)
+            loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
+            observation = loop._execute_action(
+                {"action": "load_skill", "target": "missing-name", "args": {}},
+                state,
+            )
+
+        self.assertNotIn("missing-name:", context)
+        self.assertFalse(observation.ok)
 
     def test_skill_reflection_does_not_trigger_after_ordinary_verifier_pass(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -6451,7 +6619,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(state.pending_skill_review)
         self.assertEqual(state.skill_review_history[-1]["decision"], "dismissed")
 
-    def test_immutable_verifier_report_resolves_by_report_id(self) -> None:
+    def test_skill_promotion_validation_requires_name_and_evidence_only(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state" / "traces").mkdir(parents=True)
@@ -6464,8 +6632,6 @@ class HarnessBehaviorTests(unittest.TestCase):
             result = loop.verifier.validate_skill_promotion(
                 {
                     "name": "verified-procedure",
-                    "description": "Reuse a verified procedure.",
-                    "instruction": "Execute the procedure and independently verify it.",
                     "evidence_type": "verified_success",
                     "evidence_refs": [
                         {"type": "verifier_report", "report_id": archived["report_id"], "task_id": "T1"}
@@ -6476,6 +6642,9 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["resolved_evidence"][0]["report_id"], archived["report_id"])
+        self.assertTrue(result.data["checks"]["has_name"])
+        self.assertNotIn("has_description", result.data["checks"])
+        self.assertNotIn("has_instruction", result.data["checks"])
 
     def test_load_skill_returns_full_content_and_tracks_pending_validation(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -6484,9 +6653,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             skill_dir = root / "state" / "skills"
             skill_dir.mkdir()
             (skill_dir / "locate-error.md").write_text(
-                "---\nname: locate-error\n"
-                "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nSearch the traceback.\n",
+                "---\nname: locate-error\n---\n\n"
+                "Locate repeated errors in long logs.\n\nSearch the traceback.\n",
                 encoding="utf-8",
             )
             loop = AgentLoop(root=root, task="Debug tests", max_steps=1)
@@ -6499,9 +6667,8 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             loaded_context = ContextBuilder(root).build(state)
             (skill_dir / "locate-error.md").write_text(
-                "---\nname: locate-error\n"
-                "description: Locate repeated errors in long logs.\n"
-                "---\n\n# Instructions\n\nChanged procedure.\n",
+                "---\nname: locate-error\n---\n\n"
+                "Locate repeated errors in long logs.\n\nChanged procedure.\n",
                 encoding="utf-8",
             )
             invalidated_context = ContextBuilder(root).build(state)
@@ -6518,7 +6685,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertNotIn("Search the traceback.", invalidated_context)
         self.assertIn("Invalidated Skills (reload before use): locate-error", invalidated_context)
 
-    def test_save_skill_writes_yaml_structure_and_rejects_duplicate(self) -> None:
+    def test_save_skill_writes_freeform_markdown_and_rejects_duplicate_name(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "state" / "traces").mkdir(parents=True)
@@ -6541,9 +6708,8 @@ class HarnessBehaviorTests(unittest.TestCase):
                 "target": "locate-errors",
                 "args": {
                     "name": "locate-errors",
-                    "description": "Locate repeated errors in long logs.",
-                    "instruction": ["Run the failing command", "Inspect the final workspace frame"],
-                    "examples": [{"input": "Traceback", "result": "Relevant source frame"}],
+                    "content": "Locate repeated errors in long logs.\n\n"
+                    "Run the failing command, then inspect the final workspace frame.",
                     "evidence_type": "verified_success",
                     "evidence_refs": [
                         {"type": "trace", "path": "state/traces/run_test.jsonl", "step": 3}
@@ -6556,9 +6722,14 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertTrue(first.ok)
         self.assertFalse(second.ok)
-        self.assertTrue(content.startswith('---\nname: "locate-errors"\n'))
-        self.assertIn("# Instructions", content)
-        self.assertIn("# Examples", content)
+        self.assertEqual(
+            content,
+            '---\nname: "locate-errors"\n'
+            'description: "Locate repeated errors in long logs."\n'
+            "---\n\n"
+            "Locate repeated errors in long logs.\n\n"
+            "Run the failing command, then inspect the final workspace frame.\n",
+        )
         self.assertNotIn("run_test.jsonl", content)
 
     def test_save_memory_writes_typed_yaml_and_updates_index(self) -> None:
@@ -6596,6 +6767,25 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("[feedback] real-db-integration-tests", index)
         self.assertFalse(hard_memory_exists)
         self.assertFalse(soft_memory_exists)
+
+    def test_memory_store_archives_legacy_files_and_rebuilds_derived_index(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            (state_dir / "memory.md").write_text("# Legacy Memory\n", encoding="utf-8")
+            (state_dir / "hard_memory.md").write_text("# Hard Memory\n", encoding="utf-8")
+            (state_dir / "soft_memory.md").write_text("# Soft Memory\n", encoding="utf-8")
+            loop = AgentLoop(root=root, task="Inspect", max_steps=1)
+
+            loop._ensure_state_files()
+
+            archived = {path.name for path in (state_dir / "legacy_memories").iterdir()}
+            index = (state_dir / "memory.md").read_text(encoding="utf-8")
+
+        self.assertEqual(archived, {"memory.md", "hard_memory.md", "soft_memory.md"})
+        self.assertIn("Typed memories live in `memories/`", index)
+        self.assertIn("No typed memories available.", index)
 
     def test_save_memory_rejects_semantically_similar_memory(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -6706,7 +6896,7 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(by_bytes.was_byte_truncated)
         self.assertLessEqual(len(by_bytes.content.encode("utf-8")), 25_200)
 
-    def test_memory_retriever_scans_headers_and_loads_relevant_memory_with_local_fallback(self) -> None:
+    def test_memory_qa_sends_complete_corpus_and_caches_same_question(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
             memory_dir = root / "state" / "memories"
@@ -6731,15 +6921,244 @@ class HarnessBehaviorTests(unittest.TestCase):
                 + ("body line that should not affect header scanning\n" * 40),
                 encoding="utf-8",
             )
+            captured: list[dict[str, object]] = []
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: (
+                captured.append(json.loads(json.dumps(payload)))
+                or {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "found": True,
+                                        "answer": "Use the real database.",
+                                        "citations": [
+                                            {
+                                                "memory_id": "feedback_no_mock_db.md",
+                                                "quote": "Integration tests must use the real database.",
+                                            }
+                                        ],
+                                        "conflicts": ["A newer task instruction may override this Memory."],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+            first = qa.recall("write integration tests against database")
+            second = qa.recall("write integration tests against database")
+            previous_hash = second.corpus_hash
+            with (memory_dir / "feedback_no_mock_db.md").open("a", encoding="utf-8") as handle:
+                handle.write("\nReconfirm database access before running the suite.\n")
+            third = qa.recall("write integration tests against database")
 
-            headers = scan_memory_headers(memory_dir)
-            retrieved = MemoryRetriever(root / "state").retrieve("write integration tests against database")
+        sent = json.loads(captured[0]["messages"][1]["content"])
+        self.assertEqual(
+            {item["id"] for item in sent["memories"]},
+            {"feedback_no_mock_db.md", "user_preferences.md"},
+        )
+        self.assertTrue(first.found)
+        self.assertEqual(first.memory_ids, ["feedback_no_mock_db.md"])
+        self.assertEqual(
+            first.conflicts,
+            ["A newer task instruction may override this Memory."],
+        )
+        self.assertTrue(second.cache_hit)
+        self.assertFalse(third.cache_hit)
+        self.assertNotEqual(third.corpus_hash, previous_hash)
+        self.assertEqual(len(captured), 2)
 
-        self.assertEqual(len(headers), 2)
-        self.assertEqual(headers[0].filename.endswith(".md"), True)
-        self.assertEqual(retrieved.source, "local")
-        self.assertEqual(retrieved.selected_filenames, ["feedback_no_mock_db.md"])
-        self.assertIn("real database", retrieved.memories[0].content)
+    def test_memory_qa_empty_corpus_skips_provider(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state" / "memories").mkdir(parents=True)
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: self.fail(
+                "empty Memory corpus must not call the Provider"
+            )
+            result = qa.recall("What should I remember?")
+
+        self.assertFalse(result.found)
+        self.assertEqual(result.source, "none")
+        self.assertFalse(result.cache_hit)
+
+    def test_memory_qa_rejects_invalid_citations_corrupt_files_and_oversized_corpus(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "state" / "memories"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            qa._post_chat_completions = lambda payload: {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "found": True,
+                                    "answer": "Be verbose.",
+                                    "citations": [
+                                        {"memory_id": "preference.md", "quote": "Be verbose."}
+                                    ],
+                                    "conflicts": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            with self.assertRaises(MemoryQAError) as invalid_citation:
+                qa.recall("How should I answer?")
+
+            (memory_dir / "broken.md").write_text("not typed Memory", encoding="utf-8")
+            with self.assertRaises(MemoryQAError) as invalid_files:
+                qa.recall("How should I answer now?")
+            (memory_dir / "broken.md").unlink()
+
+            small_window_qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+                context_window_tokens=50,
+            )
+            with self.assertRaises(MemoryQAError) as too_large:
+                small_window_qa.recall("How should I answer?")
+
+        self.assertEqual(invalid_citation.exception.code, "invalid_memory_qa_citation")
+        self.assertEqual(invalid_files.exception.code, "invalid_memory_files")
+        self.assertEqual(too_large.exception.code, "memory_corpus_too_large")
+
+    def test_memory_qa_wraps_invalid_provider_json(self) -> None:
+        class InvalidJSONResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self) -> bytes:
+                return b"not-json"
+
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "state" / "memories"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            qa = MemoryQA(
+                root / "state",
+                api_key="test-key",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            with patch(
+                "agent.memory_qa.urllib.request.urlopen",
+                return_value=InvalidJSONResponse(),
+            ):
+                with self.assertRaises(MemoryQAError) as provider_error:
+                    qa.recall("How should I answer?")
+
+        self.assertEqual(provider_error.exception.code, "memory_qa_provider_error")
+        self.assertFalse(provider_error.exception.data["retryable"])
+
+    def test_recall_memory_is_read_only_and_records_auxiliary_usage(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Answer a question", max_steps=1)
+            loop._ensure_state_files()
+            (root / "state" / "memories" / "preference.md").write_text(
+                "---\n"
+                "name: preference\n"
+                "description: User preference\n"
+                "type: user\n"
+                "---\n\n"
+                "Use concise answers.\n",
+                encoding="utf-8",
+            )
+            loop.memory_qa = type(
+                "FixedMemoryQA",
+                (),
+                {
+                    "model": "fixed",
+                    "recall": lambda self, question: MemoryQAResult(
+                        True,
+                        "Use concise answers.",
+                        [{"memory_id": "preference.md", "quote": "Use concise answers."}],
+                        [],
+                        "corpus",
+                        usage={
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "total_tokens": 25,
+                            "source": "api",
+                        },
+                    ),
+                },
+            )()
+            state = create_initial_state("Answer a question")
+            state.interaction_mode = "question"
+            evidence_before = list(state.evidence_sources)
+            statuses_before = [node["status"] for node in state.nodes]
+            action = {
+                "action": "recall_memory",
+                "target": "How should responses be written?",
+                "args": {},
+            }
+
+            observation = loop._execute_action(action, state)
+            loop._update_state(state, action, observation)
+            initializer_state = create_initializer_state(
+                "Initialize",
+                project_spec_artifact="project_spec.md",
+                requirements_artifact="state/requirements.json",
+                generated_tasks_artifact="state/generated_tasks.json",
+                init_artifact="state/init.sh",
+            )
+            initializer_observation = loop._execute_action(action, initializer_state)
+
+        self.assertTrue(observation.ok)
+        self.assertTrue(initializer_observation.ok)
+        self.assertEqual(
+            [item["memory_id"] for item in observation.data["citations"]],
+            ["preference.md"],
+        )
+        self.assertFalse(state.last_observation["counts_as_progress"])
+        self.assertEqual(state.evidence_sources, evidence_before)
+        self.assertEqual([node["status"] for node in state.nodes], statuses_before)
+        self.assertEqual(state.token_usage["totals"]["total_tokens"], 25)
 
     def test_agent_loop_injects_relevant_memories_into_context(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -6766,12 +7185,16 @@ class HarnessBehaviorTests(unittest.TestCase):
             )
             state = create_initial_state("Write integration tests against the database")
 
-            context = loop.context_builder.build(state, relevant_memories=loop._relevant_memory_context(state))
+            context = loop.context_builder.build(
+                state,
+                relevant_memories=loop._relevant_memory_context(state, trigger="session_start"),
+            )
 
         self.assertIn("# Relevant Memories", context)
         self.assertIn("feedback_no_mock_db.md", context)
-        self.assertIn("Mock tests missed migration failures", context)
-        self.assertEqual(loop._last_memory_selection["source"], "local")
+        self.assertIn("Integration tests must use the real database", context)
+        self.assertNotIn("Mock tests missed migration failures", context)
+        self.assertEqual(loop._last_memory_selection["source"], "offline")
 
     def test_handoff_ready_blocks_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -7012,6 +7435,43 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(result.steps, 2)
         self.assertEqual(len(trace_files), 2)
         self.assertIn("Session handoff threshold reached", result.message)
+
+    def test_auto_resume_without_session_limit_continues_until_completion(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(
+                root=root,
+                task="Complete task",
+                max_steps=1,
+                auto_resume=True,
+                max_sessions=None,
+            )
+            first_state = create_initial_state("Complete task")
+            first_state.handoff_ready = True
+            resumed_state = create_initial_state("Complete task")
+            completed_state = create_initial_state("Complete task")
+            sessions = [
+                AgentLoop._SessionResult(False, True, 1, first_state, "Handoff written."),
+                AgentLoop._SessionResult(True, False, 1, completed_state, "Done."),
+            ]
+
+            events: list[dict[str, object]] = []
+            loop.event_handler = events.append
+            with (
+                patch.object(loop, "_load_or_create_state", return_value=first_state),
+                patch.object(loop, "_run_one_session", side_effect=sessions),
+                patch.object(loop, "_prepare_auto_resume_session", return_value=resumed_state),
+            ):
+                result = loop.run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.sessions, 2)
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(result.message, "Done.")
+        self.assertEqual(
+            events,
+            [{"type": "session_handoff", "session": 2, "max_sessions": None}],
+        )
 
     def test_handoff_contains_session_budget_and_resume_sections(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -8772,6 +9232,44 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(summary["llm_unpriced_turns"], 1)
         self.assertEqual(summary["completed_tasks"], 1)
         self.assertEqual(summary["blocked_tasks"], 1)
+
+    def test_metrics_counts_memory_qa_usage_without_marking_progress(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            trace = Path(tmp) / "run.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "action": {"action": "recall_memory"},
+                        "observation": {
+                            "ok": True,
+                            "summary": "Recalled.",
+                            "data": {"counts_as_progress": False},
+                        },
+                        "memory_qa_events": [
+                            {
+                                "ok": True,
+                                "source": "full_qa",
+                                "cache_hit": False,
+                                "token_usage": {
+                                    "input_tokens": 100,
+                                    "output_tokens": 20,
+                                    "total_tokens": 120,
+                                    "cost": {"available": False},
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize(trace)
+
+        self.assertEqual(summary["memory_qa_calls"], 1)
+        self.assertEqual(summary["memory_qa_failures"], 0)
+        self.assertEqual(summary["memory_qa_cache_hits"], 0)
+        self.assertEqual(summary["llm_total_tokens"], 120)
+        self.assertEqual(summary["no_progress_sessions"], 1)
 
     def test_metrics_reports_skill_loading_and_validation(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

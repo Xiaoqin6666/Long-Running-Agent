@@ -30,7 +30,11 @@ Configure an OpenAI-compatible provider:
 $env:LONG_AGENT_API_KEY="..."
 $env:LONG_AGENT_BASE_URL="https://api.openai.com/v1"
 $env:LONG_AGENT_MODEL="gpt-4.1-mini"
+$env:LONG_AGENT_THINKING="auto"
+$env:LONG_AGENT_REASONING_EFFORT="high"
 ```
+
+The main provider path requires native Chat Completions function calling. DeepSeek endpoints/models enable thinking automatically, expose the existing actions as direct native functions because thinking mode rejects `tool_choice`, and preserve `reasoning_content` across assistant tool calls and matching tool results. If the model returns final content while the harness still requires an action, a bounded native user correction asks for one declared function. If it emits parallel tool calls, every call ID receives an explicit rejected-without-execution result before the model is asked for one action; the harness never leaves a half call or reports a rejected action as executed.
 
 Start the first Worker session:
 

@@ -64,14 +64,20 @@ long_running_agent/
       bash.py
       git.py
       write.py              # compatibility alias-style whole-file writer
+  default_skills/
+    <name>/
+      SKILL.md              # bundled default Skill entrypoint
+      scripts/              # optional executable resources
+      references/           # optional on-demand references
+      assets/               # optional output resources
   state/
     current_task.json       # machine-readable task state
     memory.md               # durable facts and decisions
     handoff.md              # compact cross-session summary
     skills/
-      coding.md             # reusable coding workflow skill
-      debugging.md
-      testing.md
+      coding.md             # runtime-created or overriding single-file Skill
+      <name>/
+        SKILL.md            # runtime directory Skill is also supported
     traces/
       run_001.jsonl         # action, observation, state snapshots
   eval/
@@ -333,7 +339,11 @@ Persistent context is the substrate for handoff and ablation analysis.
 
 Persistent memory is stored as typed Markdown files under `<active_state_dir>/memories/`.
 Each memory has exactly one type: `user`, `feedback`, `project`, or `reference`.
-The root `<active_state_dir>/memory.md` file is only an index.
+The root `<active_state_dir>/memory.md` file is only a derived index. The harness
+rebuilds it from the typed files, then uses the main Agent model for a single isolated
+full-corpus QA at Worker-session start, task transitions, successful Memory writes,
+and explicit `recall_memory` calls. Only the grounded answer and exact validated
+citations enter the Main Agent context.
 
 When context grows too large, the harness creates `<active_state_dir>/handoff.md`.
 For benchmark runs, `<active_state_dir>` is `state/benchmarks/<benchmark_id>/`; for ordinary non-benchmark runs it remains `state/`.
@@ -473,26 +483,34 @@ Optional evaluator scripts live outside benchmark task directories under `eval/m
 
 ## 9. Skill Mechanism
 
-Skills are reusable procedural knowledge saved as Markdown files. They are retrieved by keyword and task type.
+Skills are reusable procedural knowledge saved either as a single Markdown file or as a
+self-contained `<name>/SKILL.md` directory with optional bundled resources. They are retrieved by
+metadata and task relevance.
 
 Example skill file:
 
 ```text
-# Python CLI Skill
+---
+name: python-cli
+description: Build and verify a Python command-line tool.
+---
 
-Use when building a Python command-line tool.
+Use this when building a Python command-line tool.
 
-Checklist:
-- define argparse entrypoint;
-- isolate side effects behind functions;
-- add a smoke command;
-- run python -m py_compile;
-- document environment variables.
-
-Common failure modes:
-- import path breaks when launched from another cwd;
-- tests pass but CLI entrypoint is missing.
+- Define an argparse entrypoint.
+- Isolate side effects behind functions.
+- Add a smoke command.
+- Run python -m py_compile.
+- Document environment variables.
 ```
+
+The file body may contain any Markdown. Frontmatter must contain `name`; all other frontmatter fields and body sections are optional. If `description` is absent, the catalog derives it from the first Markdown paragraph. No `Instructions` or `Examples` section is required. Examples, scripts, and references belong in the body only when they are useful to that Skill.
+
+Repository defaults are discovered from `default_skills/`. Runtime-created and user-provided Skills
+are discovered from `<active_state_dir>/skills/`, which takes precedence when the same metadata
+`name` exists in both locations. The catalog exposes metadata only. A `load_skill` action loads the
+full `SKILL.md` body and records a hash of the whole Skill directory, so a later change to any
+bundled script, reference, or asset invalidates the loaded Skill until it is reloaded.
 
 Write to Skill only when:
 

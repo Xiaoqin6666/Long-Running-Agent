@@ -1,30 +1,28 @@
 from __future__ import annotations
 
-from itertools import count
+import hashlib
 import json
 import logging
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
 from agent.context import ContextBuilder
 from agent.integration_contract import write_integration_contract
-from agent.llm import create_decision_maker
+from agent.llm import ProviderProtocolError, ProviderRequestError, create_decision_maker
 from agent.memory import (
     MemoryDocument,
-    find_semantic_duplicate,
+    MemoryStore,
+    MemoryStoreError,
     memory_catalog,
     normalize_memory_content,
-    parse_memory,
-    render_memory,
-    render_memory_index,
     safe_memory_id,
-    validate_memory,
 )
-from agent.memory_retrieval import MemoryRetriever, render_relevant_memories
+from agent.memory_qa import MemoryQA, MemoryQAError, MemoryQAResult, render_memory_qa_result
 from agent.orchestrator import Orchestrator
 from agent.planner import (
     TaskState,
@@ -37,9 +35,10 @@ from agent.planner import (
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import project_requirement_evidence_errors
 from agent.skills import (
-    SkillDocument,
-    normalize_examples,
-    normalize_instruction,
+    SkillEntry,
+    build_skill,
+    discover_skill_entries,
+    normalize_skill_content,
     parse_skill,
     render_skill,
     skill_catalog,
@@ -89,8 +88,8 @@ class AgentLoop:
         project_spec_path: Path | None = None,
         materialize_project_spec: bool = True,
         benchmark_id: str | None = None,
-        auto_resume: bool = False,
-        max_sessions: int = 1,
+        auto_resume: bool = True,
+        max_sessions: int | None = None,
         system_validation: bool = True,
         ui_contract_validation: bool = True,
         integration_contract_validation: bool = False,
@@ -105,7 +104,7 @@ class AgentLoop:
         self.provider = provider
         self.resume = resume
         self.auto_resume = auto_resume
-        self.max_sessions = max(1, max_sessions)
+        self.max_sessions = max(1, max_sessions) if max_sessions is not None else None
         self.system_validation = system_validation
         self.ui_contract_validation = ui_contract_validation
         self.integration_contract_validation = integration_contract_validation
@@ -120,6 +119,7 @@ class AgentLoop:
         self.state_dir = self._benchmark_state_dir(self.benchmark_id) if self.benchmark_id else root / "state"
         self.trace_dir = self.state_dir / "traces"
         self.debug_context_dir = self.state_dir / "debug_contexts"
+        self.provider_session_dir = self.state_dir / "provider_sessions"
         self.project_spec_materialized_path = (
             self.state_dir / "project_spec.md" if project_spec_path and materialize_project_spec else None
         )
@@ -138,6 +138,8 @@ class AgentLoop:
         self.initializer_candidate_path = self.state_dir / "rejected_candidates" / "generated_tasks.json"
         self.initializer_requirements_candidate_path = self.state_dir / "rejected_candidates" / "requirements.json"
         self.trace_path = self.trace_dir / self._trace_name()
+        self.provider_session_path = self.provider_session_dir / f"{self.trace_path.stem}.jsonl"
+        self.tool_call_ledger_path = self.provider_session_dir / "tool_call_ledger.json"
         self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
         expected_workspace = self._expected_initializer_workspace_root()
         benchmark_python_path = (root / expected_workspace).resolve() if expected_workspace else None
@@ -152,7 +154,7 @@ class AgentLoop:
             integration_contract_validation=self.integration_contract_validation,
             system_validation=self.system_validation,
         )
-        self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
+        self.memory_store = MemoryStore(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
         self.terminator = ProjectTerminator(
             root,
@@ -164,6 +166,7 @@ class AgentLoop:
             integration_contract_required=self.integration_contract_validation,
         )
         self.decision_maker = create_decision_maker(provider)
+        self.memory_qa = MemoryQA.from_decision_maker(self.state_dir, self.decision_maker)
         self.verifier = Verifier(root, state_dir=self.state_dir)
         self.tools = {
             "bash": BashTool(root, python_path=benchmark_python_path, output_dir=self.tool_output_dir),
@@ -182,6 +185,7 @@ class AgentLoop:
             "write": WriteTool(root),
         }
         self._last_memory_selection: dict[str, Any] = {}
+        self._pending_memory_qa_events: list[dict[str, Any]] = []
         self._current_context_snapshot: dict[str, Any] = {}
         self._last_token_usage_record: dict[str, Any] = {}
         self.token_pricing = load_pricing_from_env()
@@ -206,7 +210,7 @@ class AgentLoop:
         message = "Reached max steps before completion."
         sessions = 1
 
-        while sessions <= self.max_sessions:
+        while self.max_sessions is None or sessions <= self.max_sessions:
             LOGGER.info(
                 "Session %s/%s started task_id=%s trace=%s",
                 sessions,
@@ -223,9 +227,18 @@ class AgentLoop:
                 break
             if not session.handoff_ready:
                 break
-            if not self.auto_resume or sessions >= self.max_sessions:
+            if not self.auto_resume or (
+                self.max_sessions is not None and sessions >= self.max_sessions
+            ):
                 break
             sessions += 1
+            self._emit_event(
+                {
+                    "type": "session_handoff",
+                    "session": sessions,
+                    "max_sessions": self.max_sessions,
+                }
+            )
             LOGGER.info("Auto-resuming from handoff into session %s/%s", sessions, self.max_sessions)
             state = self._prepare_auto_resume_session()
 
@@ -263,18 +276,78 @@ class AgentLoop:
         completed = False
         message = "Reached max steps before completion."
         self._record_task_session(state)
+        self._current_trace_step = 0
+        memory_context = self._relevant_memory_context(state, trigger="session_start")
+        uses_native_tools = bool(getattr(self.decision_maker, "uses_native_tools", False))
+        self.context_builder.current_trace_path = self.trace_path
+        initial_context = (
+            self.context_builder.build_session_context(
+                state,
+                relevant_memories=memory_context,
+                include_handoff=True,
+            )
+            if uses_native_tools
+            else self.context_builder.build(
+                state,
+                relevant_memories=memory_context,
+                include_handoff=True,
+            )
+        )
+        set_transcript_path = getattr(self.decision_maker, "set_transcript_path", None)
+        if callable(set_transcript_path):
+            set_transcript_path(self.provider_session_path)
+        begin_session = getattr(self.decision_maker, "begin_session", None)
+        if callable(begin_session):
+            begin_session(initial_context, state.conversation_messages)
 
         step_iter = count(1) if self.max_steps is None else range(1, self.max_steps + 1)
         for step in step_iter:
             steps = step
             self._current_trace_step = step
             self._record_task_session(state)
-            memory_context = self._relevant_memory_context(state)
             self.context_builder.current_trace_path = self.trace_path
-            context = self.context_builder.build(state, relevant_memories=memory_context, include_handoff=(step == 1))
+            context = (
+                initial_context
+                if step == 1
+                else self.context_builder.build(
+                    state,
+                    relevant_memories=memory_context,
+                    include_handoff=False,
+                    include_conversation=not uses_native_tools,
+                )
+            )
             context_snapshot = self._record_context_snapshot(step, state, context)
+            fatal_protocol_error = False
+            stop_after_tool_result = False
+            previous_task_id = self._active_task_id(state)
             try:
                 action = self.decision_maker.next_action(context, state)
+            except Exception as exc:
+                LOGGER.exception("Step %s model protocol error", step)
+                fatal_protocol_error = bool(
+                    getattr(self.decision_maker, "fatal_protocol_errors", False)
+                ) or isinstance(exc, (ProviderProtocolError, ProviderRequestError))
+                action = {
+                    "thought_summary": "Harness caught a model protocol error.",
+                    "action": "provider_error" if fatal_protocol_error else "protocol_error",
+                    "target": "decision_maker",
+                    "args": {},
+                    "expected_observation": (
+                        "The provider error is recorded and the Worker session stops."
+                        if fatal_protocol_error
+                        else "The error is recorded so the loop can continue."
+                    ),
+                    "risk": "low",
+                }
+                error_data = {"error_type": type(exc).__name__}
+                error_summary = f"Protocol error: {exc}"
+                if fatal_protocol_error:
+                    error_data["provider_transcript"] = self._rel(self.provider_session_path)
+                    error_summary += (
+                        f" See provider transcript: {self._rel(self.provider_session_path)}."
+                    )
+                observation = ToolResult(False, error_summary, error_data)
+            else:
                 LOGGER.info(
                     "Step %s action=%s target=%s starting task_id=%s",
                     step,
@@ -291,21 +364,86 @@ class AgentLoop:
                         "thought_summary": str(action.get("thought_summary", "")),
                     }
                 )
-                observation = self._execute_action(action, state)
-            except Exception as exc:
-                LOGGER.exception("Step %s model/tool protocol error", step)
-                action = {
-                    "thought_summary": "Harness caught a model or tool protocol error.",
-                    "action": "protocol_error",
-                    "target": "decision_maker",
-                    "args": {},
-                    "expected_observation": "The error is recorded so the loop can continue.",
-                    "risk": "low",
-                }
-                observation = ToolResult(False, f"Protocol error: {exc}", {"error_type": type(exc).__name__})
+                call_id = str(getattr(self.decision_maker, "last_tool_call_id", "") or "")
+                ledger_reserved = False
+                ledger_finalized = False
+                try:
+                    replay = self._tool_call_replay(call_id, action) if call_id else None
+                    if replay is not None:
+                        replay_data = dict(replay.get("data", {}))
+                        replay_data["idempotent_replay"] = True
+                        observation = ToolResult(
+                            bool(replay.get("ok")),
+                            str(replay.get("summary", "")),
+                            replay_data,
+                        )
+                    else:
+                        if call_id:
+                            self._reserve_tool_call(call_id, action)
+                            ledger_reserved = True
+                        observation = self._execute_action(action, state)
+                        if call_id:
+                            self._record_tool_call_result(call_id, action, observation)
+                            ledger_finalized = True
+                except Exception as exc:
+                    LOGGER.exception("Step %s action execution failed", step)
+                    observation = ToolResult(
+                        False,
+                        f"Harness action execution error: {exc}",
+                        {
+                            "error_type": type(exc).__name__,
+                            "tool_call_id": call_id,
+                            "counts_as_progress": False,
+                        },
+                    )
+                    if call_id and ledger_reserved and not ledger_finalized:
+                        try:
+                            self._record_tool_call_result(call_id, action, observation)
+                        except Exception:
+                            LOGGER.exception(
+                                "Step %s could not finalize the failed tool call ledger entry",
+                                step,
+                            )
+                    stop_after_tool_result = bool(call_id)
             self._record_budget_usage(state, context, action, observation)
             self._update_state(state, action, observation)
-            self._append_trace(step, action, observation, state, context_snapshot)
+            if action["action"] == "verify" and observation.ok:
+                self._apply_orchestrator_selection(state)
+            active_task_changed = self._active_task_id(state) != previous_task_id
+            refreshed_memory_context = ""
+            if action["action"] == "recall_memory" and observation.ok:
+                memory_context = str(observation.data.get("relevant_memories", ""))
+            elif (action["action"] == "save_memory" and observation.ok) or active_task_changed:
+                trigger = "after_save" if action["action"] == "save_memory" else "task_transition"
+                memory_context = self._relevant_memory_context(state, trigger=trigger)
+                refreshed_memory_context = memory_context
+            record_tool_result = getattr(self.decision_maker, "record_tool_result", None)
+            provider_append_error = ""
+            if callable(record_tool_result) and not fatal_protocol_error:
+                try:
+                    record_tool_result(
+                        observation.to_dict(),
+                        self._provider_state_update(
+                            state,
+                            refreshed_memory_context,
+                            include_task_context=(
+                                active_task_changed
+                                or (action["action"] == "contract" and observation.ok)
+                            ),
+                        ),
+                    )
+                    self._refresh_native_budget_after_tool_result(state)
+                except Exception as exc:
+                    LOGGER.exception("Step %s failed to persist the provider tool result", step)
+                    provider_append_error = f"Provider tool-result persistence failed: {exc}"
+            self._append_trace(
+                step,
+                action,
+                observation,
+                state,
+                context_snapshot,
+                action_task_id=previous_task_id,
+            )
             self._write_state(state)
             LOGGER.info(
                 "Step %s action=%s target=%s ok=%s task_id=%s turn_tokens=%s token_usage=%s handoff_ready=%s observation=%s",
@@ -333,6 +471,15 @@ class AgentLoop:
                 }
             )
 
+            if fatal_protocol_error:
+                message = observation.summary
+                break
+            if provider_append_error:
+                message = provider_append_error
+                break
+            if stop_after_tool_result:
+                message = observation.summary
+                break
             if (
                 action["action"] in {"answer", "finish"}
                 and observation.ok
@@ -341,9 +488,6 @@ class AgentLoop:
                 completed = True
                 message = observation.data.get("answer", observation.summary)
                 break
-            if action["action"] == "verify" and observation.ok:
-                self._apply_orchestrator_selection(state)
-                self._write_state(state)
             if state.handoff_ready:
                 self._write_handoff(state)
                 message = "Session handoff threshold reached. Handoff written."
@@ -368,7 +512,11 @@ class AgentLoop:
     def _prepare_auto_resume_session(self) -> TaskState:
         self.resume = True
         self.trace_path = self.trace_dir / self._trace_name()
+        self.provider_session_path = self.provider_session_dir / f"{self.trace_path.stem}.jsonl"
         self.tool_output_dir = self.state_dir / "tool_outputs" / self.trace_path.stem
+        reset_session = getattr(self.decision_maker, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
         bash_tool = self.tools.get("bash")
         if isinstance(bash_tool, BashTool):
             bash_tool.output_dir = self.tool_output_dir
@@ -414,6 +562,8 @@ class AgentLoop:
             self._recover_initializer_repair_from_state(state)
         if not self._is_initializer_task(state):
             self._apply_orchestrator_selection(state)
+        if self.resume and state.pending_repair:
+            self._refresh_pending_repair_targets(state)
         if self.resume and not state.pending_repair:
             self._recover_pending_repair_from_recent_trace(state)
         state.token_usage = initialize_token_usage(state.token_usage)
@@ -468,6 +618,8 @@ class AgentLoop:
                 "requirement_ids": task.get("requirement_ids", []),
                 "requirements": requirements,
                 "criterion_command_map": task.get("criterion_command_map", {}),
+                "final_acceptance": task.get("final_acceptance", False),
+                "system_owned_validation": task.get("system_owned_validation", False),
                 "contract_managed": True,
             }
         ]
@@ -601,20 +753,26 @@ class AgentLoop:
         session_dir.mkdir(parents=True, exist_ok=True)
         path = session_dir / f"step_{step:04d}.md"
         content = (
-            "# Full Model Context\n\n"
-            "## System Message\n\n"
+            "# Harness Context Snapshot\n\n"
+            "The exact append-only provider messages are stored in the linked provider session transcript.\n\n"
+            "## System Policy Snapshot\n\n"
             f"{MAIN_AGENT_SYSTEM_PROMPT}\n\n"
             f"- trace: {self._rel(self.trace_path)}\n"
             f"- step: {step}\n"
             f"- task_id: {self._active_task_id(state)}\n"
             f"- written_at: {utc_now()}\n\n"
-            "## User Context\n\n"
+            "## Harness Context\n\n"
             f"{context}\n"
         )
         path.write_text(content, encoding="utf-8")
         snapshot = {
             "path": self._rel(path),
             "trace": self._rel(self.trace_path),
+            "provider_session_path": (
+                self._rel(self.provider_session_path)
+                if bool(getattr(self.decision_maker, "uses_native_tools", False))
+                else ""
+            ),
             "step": step,
             "chars": len(content),
             "system_chars": len(MAIN_AGENT_SYSTEM_PROMPT),
@@ -726,6 +884,8 @@ class AgentLoop:
             return self._validate_contract_action(action, state)
         if name == "load_skill":
             return self._handle_load_skill_action(action, state)
+        if name == "recall_memory":
+            return self._handle_recall_memory_action(action, state)
         if name == "save_memory":
             if self._is_initializer_task(state):
                 return ToolResult(False, "Memory saving is disabled during INIT.", {"initializer_restricted": True})
@@ -1037,7 +1197,7 @@ class AgentLoop:
         return None
 
     def _repair_targets_from_failed_output(self, command: str, output: str, state: TaskState) -> list[str]:
-        artifacts = [self._normalize_target(target) for target in self._active_task_expected_artifacts(state)]
+        artifacts = self._repair_candidate_artifacts(state)
         combined = f"{command}\n{output}".replace("\\", "/")
         targets: list[str] = []
         for target in self._traceback_source_repair_targets_from_failure(command, output, state):
@@ -1081,7 +1241,6 @@ class AgentLoop:
                 for artifact in artifacts:
                     if (
                         not self._looks_like_test_artifact(artifact)
-                        and Path(artifact).suffix.lower() == ".py"
                         and Path(artifact).name != "__init__.py"
                         and artifact not in targets
                     ):
@@ -1090,17 +1249,54 @@ class AgentLoop:
         implementation_targets = [
             artifact
             for artifact in artifacts
-            if Path(artifact).suffix.lower() == ".py" and Path(artifact).name != "__init__.py"
+            if Path(artifact).name != "__init__.py"
             and not self._looks_like_test_artifact(artifact)
         ]
         test_targets = [
             artifact
             for artifact in artifacts
-            if Path(artifact).suffix.lower() == ".py"
-            and Path(artifact).name != "__init__.py"
+            if Path(artifact).name != "__init__.py"
             and self._looks_like_test_artifact(artifact)
         ]
         return implementation_targets + test_targets or artifacts
+
+    def _repair_candidate_artifacts(self, state: TaskState) -> list[str]:
+        active = self._active_task_metadata(state)
+        if active.get("final_acceptance") is not True:
+            return [
+                self._normalize_target(target)
+                for target in self._active_task_expected_artifacts(state)
+            ]
+        dependency_ids = {
+            str(task_id)
+            for task_id in active.get("depends_on", [])
+            if str(task_id).strip()
+        }
+        artifacts: list[str] = []
+        for task in self.orchestrator.load_tasks():
+            if str(task.get("id", "")) not in dependency_ids:
+                continue
+            for target in self._format_artifacts(task.get("implementation_artifacts", [])):
+                normalized = self._normalize_target(target)
+                if normalized and normalized not in artifacts:
+                    artifacts.append(normalized)
+        return artifacts
+
+    def _refresh_pending_repair_targets(self, state: TaskState) -> None:
+        repair = state.pending_repair
+        failure_type = self._pending_repair_command_failure_type(state)
+        if failure_type in {"command_syntax_error", "command_environment_error"}:
+            return
+        command = str(repair.get("command", ""))
+        output = self._full_output_from_data(repair)
+        targets = self._repair_targets_from_failed_output(command, output, state)
+        if not targets:
+            return
+        required_reads = self._repair_read_targets_from_failed_output(command, output, state)
+        repair["targets"] = targets
+        repair["repair_targets"] = self._default_repair_write_targets(targets, state)
+        repair["required_reads"] = required_reads
+        repair["read_targets"] = self._preserve_pending_repair_reads(state, required_reads)
 
     def _traceback_source_repair_targets_from_failure(
         self,
@@ -1498,7 +1694,7 @@ class AgentLoop:
 
         name = action.get("action")
         active_task_id = self._active_task_id(state)
-        if name == "debug_context":
+        if name in {"debug_context", "recall_memory"}:
             state.last_observation["counts_as_progress"] = False
         elif name == "contract" and observation.ok:
             contract = dict(observation.data["contract"])
@@ -1622,6 +1818,7 @@ class AgentLoop:
             "edit",
             "write",
             "protocol_error",
+            "provider_error",
         } and not observation.ok:
             state.last_observation["counts_as_progress"] = False
         elif name == "verify" and observation.ok and len(state.nodes) > 2:
@@ -3073,28 +3270,35 @@ class AgentLoop:
         requested = self._safe_skill_id(str(action.get("target", "")))
         if not requested:
             return ToolResult(False, "Skill load rejected: target name is required.", {})
-        skill_dir = self.state_dir / "skills"
-        matches: list[tuple[Path, SkillDocument]] = []
-        for path in sorted(skill_dir.glob("*.md")):
-            skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
-            if self._safe_skill_id(skill.name) == requested or path.stem == requested:
-                matches.append((path, skill))
+        matches: list[SkillEntry] = []
+        for skill_dir in self._skill_dirs():
+            matches = [
+                entry
+                for entry in discover_skill_entries(skill_dir)
+                if self._safe_skill_id(entry.document.name) == requested
+            ]
+            if matches:
+                break
         if not matches:
             return ToolResult(
                 False,
                 f"Skill not found: {requested}.",
-                {"name": requested, "available": [item["name"] for item in skill_catalog(skill_dir)]},
+                {
+                    "name": requested,
+                    "available": [item["name"] for item in skill_catalog(self._skill_dirs())],
+                },
             )
         if len(matches) > 1:
             return ToolResult(False, f"Skill load rejected: duplicate metadata name {requested}.", {})
-        path, skill = matches[0]
-        if not skill.instruction.strip():
-            return ToolResult(False, f"Skill load rejected: {requested} has no instructions.", {})
+        entry = matches[0]
+        path = entry.path
+        skill = entry.document
+        content_hash = entry.content_hash
         existing = next(
             (
                 item
                 for item in state.loaded_skills
-                if item.get("name") == skill.name and item.get("content_hash") == skill.content_hash
+                if item.get("name") == skill.name and item.get("content_hash") == content_hash
             ),
             None,
         )
@@ -3105,14 +3309,14 @@ class AgentLoop:
                 {
                     "name": skill.name,
                     "description": skill.description,
-                    "content_hash": skill.content_hash,
+                    "content_hash": content_hash,
                     "path": self._rel(path),
                     "already_loaded": True,
                 },
             )
         record = {
             "name": skill.name,
-            "content_hash": skill.content_hash,
+            "content_hash": content_hash,
             "status": "loaded",
             "loaded_at": utc_now(),
             "loaded_iteration": state.iterations,
@@ -3126,8 +3330,59 @@ class AgentLoop:
                 "name": skill.name,
                 "description": skill.description,
                 "content": skill.content,
-                "content_hash": skill.content_hash,
+                "content_hash": content_hash,
                 "path": self._rel(path),
+            },
+        )
+
+    def _handle_recall_memory_action(self, action: dict[str, Any], state: TaskState) -> ToolResult:
+        question = str(action.get("target", "")).strip()
+        if not question:
+            return ToolResult(
+                False,
+                "Memory recall rejected: target must contain a natural-language question.",
+                {"error": "empty_memory_question", "counts_as_progress": False},
+            )
+        try:
+            result = self.memory_qa.recall(question)
+        except MemoryQAError as exc:
+            self._record_memory_qa_event(
+                state,
+                trigger="tool",
+                question=question,
+                error=exc,
+            )
+            error_data = dict(exc.data)
+            error_data.pop("usage", None)
+            return ToolResult(
+                False,
+                f"Memory recall failed: {exc}",
+                {**error_data, "counts_as_progress": False},
+            )
+        self._record_memory_qa_event(
+            state,
+            trigger="tool",
+            question=question,
+            result=result,
+        )
+        self._last_memory_selection = {
+            "source": result.source,
+            "selected": result.memory_ids,
+            "corpus_hash": result.corpus_hash,
+            "cache_hit": result.cache_hit,
+        }
+        rendered = render_memory_qa_result(result)
+        return ToolResult(
+            True,
+            (
+                f"Memory recall found {len(result.memory_ids)} cited Memory file(s)."
+                if result.found
+                else "Memory recall found no grounded answer."
+            ),
+            {
+                **result.to_dict(),
+                "relevant_memories": rendered,
+                "counts_as_progress": False,
             },
         )
 
@@ -3140,54 +3395,17 @@ class AgentLoop:
         memory_type = str(args.get("type") or "").strip()
         content = normalize_memory_content(args)
         memory = MemoryDocument(memory_id, description, memory_type, content)
-        errors = validate_memory(memory)
-        if errors:
-            return ToolResult(False, "Memory rejected: " + "; ".join(errors) + ".", {"errors": errors})
-
-        memory_dir = self.state_dir / "memories"
-        catalog = memory_catalog(memory_dir)
-        normalized_description = " ".join(description.lower().split())
-        duplicate = next(
-            (
-                item
-                for item in catalog
-                if safe_memory_id(item["name"]) == memory_id
-                or " ".join(item["description"].lower().split()) == normalized_description
-            ),
-            None,
-        )
-        if duplicate:
-            return ToolResult(False, f"Memory rejected: duplicate of existing memory {duplicate['name']}.", {"duplicate": duplicate})
-        semantic_duplicate = find_semantic_duplicate(memory, memory_dir)
-        if semantic_duplicate:
-            return ToolResult(
-                False,
-                (
-                    "Memory rejected: semantically similar to existing memory "
-                    f"{semantic_duplicate['name']}."
-                ),
-                {"duplicate": semantic_duplicate, "duplicate_reason": "semantic_similarity"},
-            )
-
-        memory_path = memory_dir / f"{memory_id}.md"
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = memory_path.with_suffix(".md.tmp")
-        temporary_path.write_text(render_memory(memory), encoding="utf-8")
-        parsed = validate_memory(parse_memory(temporary_path.read_text(encoding="utf-8"), fallback_name=memory_id))
-        if parsed:
-            temporary_path.unlink(missing_ok=True)
-            return ToolResult(False, "Memory rejected: rendered Memory failed validation.", {"errors": parsed})
-        temporary_path.replace(memory_path)
-        self.memory_path.write_text(render_memory_index(memory_dir), encoding="utf-8")
+        try:
+            saved = self.memory_store.save(memory)
+        except MemoryStoreError as exc:
+            return ToolResult(False, str(exc), dict(exc.data))
+        memory_path = Path(saved["path"])
         return ToolResult(
             True,
             f"Memory saved: {memory_id}.",
             {
-                "name": memory_id,
-                "description": description,
-                "type": memory_type,
+                **saved,
                 "path": self._rel(memory_path),
-                "content_hash": memory.content_hash,
             },
         )
 
@@ -3215,13 +3433,16 @@ class AgentLoop:
         if not isinstance(args, dict):
             return ToolResult(False, "Skill rejected: args must be an object.", {})
         skill_id = self._safe_skill_id(str(args.get("name") or args.get("skill_id") or action.get("target") or ""))
-        description = str(args.get("description") or args.get("title") or "").strip()
-        instruction = normalize_instruction(args.get("instruction", args.get("body", "")))
-        examples = normalize_examples(args.get("examples"))
+        content = normalize_skill_content(
+            args.get("content", args.get("body", args.get("instruction", "")))
+        )
+        skill = build_skill(skill_id, content)
         evidence_type = str(args.get("evidence_type", "")).strip()
         evidence_refs = args.get("evidence_refs", [])
-        if not skill_id or not description or not instruction:
-            return ToolResult(False, "Skill rejected: name, description, and instruction are required.", {})
+        if not skill_id:
+            return ToolResult(False, "Skill rejected: target name is required.", {})
+        if self._safe_skill_id(skill.name) != skill_id:
+            return ToolResult(False, "Skill rejected: frontmatter name must match the target name.", {})
         if evidence_type not in {"verified_success", "evidence_confirmed_failure"}:
             return ToolResult(
                 False,
@@ -3232,9 +3453,7 @@ class AgentLoop:
             return ToolResult(False, "Skill rejected: evidence_refs list is required.", {})
         candidate = self._create_skill_candidate(
             skill_id=skill_id,
-            description=description,
-            instruction=instruction,
-            examples=examples,
+            content=render_skill(skill),
             evidence_type=evidence_type,
             evidence_refs=evidence_refs,
             state=state,
@@ -3243,18 +3462,18 @@ class AgentLoop:
         candidate_path = self.state_dir / "skill_candidates" / f"{candidate['candidate_id']}.json"
         self._write_json_atomic(candidate_path, candidate)
         skill_dir = self.state_dir / "skills"
-        catalog = skill_catalog(skill_dir)
-        normalized_description = " ".join(description.lower().split())
+        skill_path = skill_dir / f"{skill_id}.md"
+        catalog = skill_catalog(self._skill_dirs())
         duplicate = next(
             (
                 item
                 for item in catalog
                 if self._safe_skill_id(item["name"]) == skill_id
-                or " ".join(item["description"].lower().split()) == normalized_description
             ),
             None,
         )
-        if duplicate:
+        if duplicate or skill_path.exists():
+            duplicate = duplicate or {"name": skill_id, "description": ""}
             self._transition_skill_candidate(
                 candidate, "rejected_duplicate", {"duplicate": duplicate}
             )
@@ -3272,8 +3491,7 @@ class AgentLoop:
         result = self.verifier.validate_skill_promotion(
             {
                 "name": skill_id,
-                "description": description,
-                "instruction": instruction,
+                "content": render_skill(skill),
                 "evidence_type": evidence_type,
                 "evidence_refs": evidence_refs,
             },
@@ -3297,33 +3515,17 @@ class AgentLoop:
             )
             return ToolResult(False, result.summary, data)
         self._transition_skill_candidate(candidate, "evidence_validated", result.data)
-        self._transition_skill_candidate(candidate, "content_validated", result.data.get("checks", {}))
         self._transition_skill_candidate(candidate, "approved", {"decision": "create"})
         self._write_json_atomic(candidate_path, candidate)
-        skill_path = skill_dir / f"{skill_id}.md"
         skill_path.parent.mkdir(parents=True, exist_ok=True)
-        skill = SkillDocument(skill_id, description, instruction, examples)
         temporary_skill_path = skill_path.with_suffix(".md.tmp")
         temporary_skill_path.write_text(render_skill(skill), encoding="utf-8")
-        parsed = parse_skill(temporary_skill_path.read_text(encoding="utf-8"), fallback_name=skill_id)
-        if parsed.name != skill_id or not parsed.description or not parsed.instruction:
-            temporary_skill_path.unlink(missing_ok=True)
-            self._transition_skill_candidate(candidate, "rejected_invalid", {"atomic_validation": False})
-            self._write_json_atomic(candidate_path, candidate)
-            return ToolResult(
-                False,
-                "Skill promotion rejected: rendered Skill failed validation.",
-                {
-                    "candidate_id": candidate["candidate_id"],
-                    "candidate_path": self._rel(candidate_path),
-                    "candidate_status": candidate["status"],
-                },
-            )
+        parsed = parse_skill(temporary_skill_path.read_text(encoding="utf-8"))
         temporary_skill_path.replace(skill_path)
         self._transition_skill_candidate(
             candidate,
             "promoted",
-            {"path": self._rel(skill_path), "content_hash": skill.content_hash},
+            {"path": self._rel(skill_path), "content_hash": parsed.content_hash},
         )
         self._write_json_atomic(candidate_path, candidate)
         return ToolResult(
@@ -3332,7 +3534,7 @@ class AgentLoop:
             {
                 "name": skill_id,
                 "path": self._rel(skill_path),
-                "content_hash": skill.content_hash,
+                "content_hash": parsed.content_hash,
                 "evidence_type": evidence_type,
                 "evidence_refs": evidence_refs,
                 "candidate_id": candidate["candidate_id"],
@@ -3345,9 +3547,7 @@ class AgentLoop:
         self,
         *,
         skill_id: str,
-        description: str,
-        instruction: str,
-        examples: str,
+        content: str,
         evidence_type: str,
         evidence_refs: list[Any],
         state: TaskState,
@@ -3359,9 +3559,7 @@ class AgentLoop:
             "status": "proposed",
             "proposed_skill": {
                 "name": skill_id,
-                "description": description,
-                "instruction": instruction,
-                "examples": examples,
+                "content": content,
             },
             "source": {"task_id": self._active_task_id(state), "evidence_type": evidence_type},
             "evidence_refs": evidence_refs,
@@ -3398,6 +3596,9 @@ class AgentLoop:
     def _safe_skill_id(self, raw: str) -> str:
         cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in raw.strip().lower())
         return cleaned.strip("-_")
+
+    def _skill_dirs(self) -> list[Path]:
+        return [self.state_dir / "skills", self.root / "default_skills"]
 
     def _archive_verifier_success(self, task_id: str, result: ToolResult) -> dict[str, Any]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -3789,23 +3990,238 @@ class AgentLoop:
             encoding="utf-8",
         )
 
-    def _relevant_memory_context(self, state: TaskState) -> str:
-        query = self._memory_retrieval_query(state)
+    def _relevant_memory_context(self, state: TaskState, *, trigger: str) -> str:
+        question = self._memory_retrieval_query(state)
         try:
-            retrieved = self.memory_retriever.retrieve(query)
-        except Exception as exc:
-            LOGGER.warning("Memory retrieval failed: %s", exc)
+            result = self.memory_qa.recall(question)
+        except MemoryQAError as exc:
+            LOGGER.warning("Memory QA failed: %s", exc)
             self._last_memory_selection = {
                 "source": "error",
                 "selected": [],
-                "error_type": type(exc).__name__,
+                "error": exc.code,
             }
-            return render_relevant_memories([], source="error")
+            self._record_memory_qa_event(
+                state,
+                trigger=trigger,
+                question=question,
+                error=exc,
+            )
+            return (
+                "# Relevant Memories\n"
+                "Memory QA was unavailable; no Memory content was injected.\n\n"
+                f"Error: {exc.code}."
+            )
         self._last_memory_selection = {
-            "source": retrieved.source,
-            "selected": retrieved.selected_filenames,
+            "source": result.source,
+            "selected": result.memory_ids,
+            "corpus_hash": result.corpus_hash,
+            "cache_hit": result.cache_hit,
         }
-        return render_relevant_memories(retrieved.memories, source=retrieved.source)
+        self._record_memory_qa_event(
+            state,
+            trigger=trigger,
+            question=question,
+            result=result,
+        )
+        return render_memory_qa_result(result)
+
+    def _record_memory_qa_event(
+        self,
+        state: TaskState,
+        *,
+        trigger: str,
+        question: str,
+        result: MemoryQAResult | None = None,
+        error: MemoryQAError | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "trigger": trigger,
+            "question_hash": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "ok": error is None,
+        }
+        if result is not None:
+            event.update(
+                {
+                    "found": result.found,
+                    "memory_ids": result.memory_ids,
+                    "corpus_hash": result.corpus_hash,
+                    "cache_hit": result.cache_hit,
+                    "source": result.source,
+                }
+            )
+            if result.usage:
+                state.token_usage = initialize_token_usage(state.token_usage)
+                usage_record = record_turn_usage(
+                    state.token_usage,
+                    session_id=self.trace_path.stem,
+                    step=int(getattr(self, "_current_trace_step", 0) or 0),
+                    task_id=self._active_task_id(state),
+                    provider=self.provider,
+                    model=self.memory_qa.model,
+                    operation_type=f"memory_qa_{trigger}",
+                    usage=result.usage,
+                    pricing=self.token_pricing,
+                    recorded_at=utc_now(),
+                )
+                event["token_usage"] = usage_record
+        if error is not None:
+            error_details = dict(error.data)
+            error_usage = error_details.pop("usage", None)
+            if isinstance(error_usage, dict):
+                state.token_usage = initialize_token_usage(state.token_usage)
+                usage_record = record_turn_usage(
+                    state.token_usage,
+                    session_id=self.trace_path.stem,
+                    step=int(getattr(self, "_current_trace_step", 0) or 0),
+                    task_id=self._active_task_id(state),
+                    provider=self.provider,
+                    model=self.memory_qa.model,
+                    operation_type=f"memory_qa_{trigger}",
+                    usage=error_usage,
+                    pricing=self.token_pricing,
+                    recorded_at=utc_now(),
+                )
+                event["token_usage"] = usage_record
+            event.update({"error": error.code, "details": error_details})
+        self._pending_memory_qa_events.append(event)
+
+    def _provider_state_update(
+        self,
+        state: TaskState,
+        refreshed_memory_context: str = "",
+        *,
+        include_task_context: bool = False,
+    ) -> dict[str, Any]:
+        return dict(
+            self.context_builder.build_incremental_state(
+                state,
+                relevant_memories=refreshed_memory_context,
+                include_task_context=include_task_context,
+            )
+        )
+
+    def _tool_call_replay(
+        self,
+        call_id: str,
+        action: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        ledger = self._read_tool_call_ledger()
+        record = ledger.get("calls", {}).get(call_id)
+        if not isinstance(record, dict):
+            return None
+        if record.get("action") != action:
+            raise ProviderProtocolError(
+                f"Native tool_call id {call_id!r} was reused with different arguments."
+            )
+        observation = record.get("observation")
+        if isinstance(observation, dict):
+            return observation
+        if record.get("status") == "in_progress":
+            return {
+                "ok": False,
+                "summary": (
+                    "Tool call was reserved before a previous interruption; its execution outcome is unknown, "
+                    "so the harness will not execute it again."
+                ),
+                "data": {
+                    "tool_call_id": call_id,
+                    "execution_outcome": "unknown",
+                    "duplicate_execution_prevented": True,
+                },
+            }
+        return None
+
+    def _reserve_tool_call(self, call_id: str, action: dict[str, Any]) -> None:
+        ledger = self._read_tool_call_ledger()
+        calls = ledger.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            calls = {}
+            ledger["calls"] = calls
+        existing = calls.get(call_id)
+        if isinstance(existing, dict):
+            if existing.get("action") != action:
+                raise ProviderProtocolError(
+                    f"Native tool_call id {call_id!r} was reused with different arguments."
+                )
+            return
+        calls[call_id] = {
+            "status": "in_progress",
+            "action": action,
+            "trace": self._rel(self.trace_path),
+            "reserved_at": utc_now(),
+        }
+        self._write_tool_call_ledger(ledger)
+
+    def _record_tool_call_result(
+        self,
+        call_id: str,
+        action: dict[str, Any],
+        observation: ToolResult,
+    ) -> None:
+        ledger = self._read_tool_call_ledger()
+        calls = ledger.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            calls = {}
+            ledger["calls"] = calls
+        calls[call_id] = {
+            "status": "completed",
+            "action": action,
+            "observation": observation.to_dict(),
+            "trace": self._rel(self.trace_path),
+            "recorded_at": utc_now(),
+        }
+        self._write_tool_call_ledger(ledger)
+
+    def _write_tool_call_ledger(self, ledger: dict[str, Any]) -> None:
+        temporary_path = self.tool_call_ledger_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            temporary_path.chmod(0o600)
+        except OSError:
+            pass
+        temporary_path.replace(self.tool_call_ledger_path)
+        try:
+            self.tool_call_ledger_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def _read_tool_call_ledger(self) -> dict[str, Any]:
+        if not self.tool_call_ledger_path.exists():
+            return {"schema": "long-agent.tool-call-ledger.v1", "calls": {}}
+        try:
+            payload = json.loads(self.tool_call_ledger_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger is unreadable; refusing to execute "
+                "because the prior execution outcome cannot be determined."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger must be an object; refusing to execute."
+            )
+        payload.setdefault("schema", "long-agent.tool-call-ledger.v1")
+        calls = payload.setdefault("calls", {})
+        if not isinstance(calls, dict):
+            raise ProviderProtocolError(
+                "Tool-call idempotency ledger calls must be an object; refusing to execute."
+            )
+        return payload
+
+    def _refresh_native_budget_after_tool_result(self, state: TaskState) -> None:
+        request_token_estimate = getattr(self.decision_maker, "request_token_estimate", None)
+        if not callable(request_token_estimate):
+            return
+        estimated = request_token_estimate()
+        if not estimated:
+            return
+        state.session_used_tokens = estimated
+        threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
+        if state.session_used_tokens >= threshold_tokens:
+            state.handoff_ready = True
 
     def _memory_retrieval_query(self, state: TaskState) -> str:
         messages = state.conversation_messages if isinstance(state.conversation_messages, list) else []
@@ -3836,6 +4252,7 @@ class AgentLoop:
         observation: ToolResult,
         state: TaskState,
         context_snapshot: dict[str, Any] | None = None,
+        action_task_id: str | None = None,
     ) -> None:
         event = {
             "step": step,
@@ -3845,7 +4262,8 @@ class AgentLoop:
             "observation": observation.to_dict(),
             "tool_return": observation.to_dict(),
             "state_summary": state.summary(),
-            "task_id": state.task_id,
+            "task_id": action_task_id or state.task_id,
+            "next_task_id": self._active_task_id(state),
             "session_used_tokens": state.session_used_tokens,
             "token_usage": dict(self._last_token_usage_record),
             "session_token_usage": state.token_usage.get("sessions", {}).get(self.trace_path.stem, {}),
@@ -3853,16 +4271,48 @@ class AgentLoop:
             "handoff_ready": state.handoff_ready,
             "orchestrator_decision": state.orchestrator_decision,
             "nodes": state.nodes,
-            "skill_catalog_size": len(skill_catalog(self.state_dir / "skills")),
+            "skill_catalog_size": len(skill_catalog(self._skill_dirs())),
             "memory_catalog_size": len(memory_catalog(self.state_dir / "memories")),
             "memory_selection": self._last_memory_selection,
+            "memory_qa_events": list(self._pending_memory_qa_events),
             "loaded_skill_names": [
                 str(item.get("name")) for item in state.loaded_skills if isinstance(item, dict) and item.get("name")
             ],
             "pending_skill_review": state.pending_skill_review,
+            "provider_session_ref": self._provider_session_reference(),
         }
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, indent=2) + "\n")
+        self._pending_memory_qa_events.clear()
+
+    def _provider_session_reference(self) -> dict[str, Any]:
+        if not bool(getattr(self.decision_maker, "uses_native_tools", False)):
+            return {}
+        reference = {
+            "path": self._rel(self.provider_session_path),
+            "bytes": 0,
+            "sha256": "",
+            "tool_call_id": str(getattr(self.decision_maker, "last_tool_call_id", "") or ""),
+        }
+        transcript_metadata = getattr(self.decision_maker, "transcript_metadata", None)
+        if callable(transcript_metadata):
+            metadata = transcript_metadata()
+            if isinstance(metadata, dict):
+                reference["bytes"] = int(metadata.get("bytes", 0) or 0)
+                reference["sha256"] = str(metadata.get("sha256", "") or "")
+                return reference
+        if not self.provider_session_path.exists():
+            return reference
+        digest = hashlib.sha256()
+        try:
+            with self.provider_session_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            reference["bytes"] = self.provider_session_path.stat().st_size
+            reference["sha256"] = digest.hexdigest()
+        except OSError:
+            pass
+        return reference
 
     def _write_handoff(self, state: TaskState) -> None:
         active_node = self._active_node(state)
@@ -4053,8 +4503,24 @@ class AgentLoop:
         observation: ToolResult,
     ) -> None:
         self._record_token_usage(state, context, action)
-        payload = context + json.dumps(action, ensure_ascii=False) + json.dumps(observation.to_dict(), ensure_ascii=False)
-        state.session_used_tokens = max(1, len(payload) // 4)
+        request_token_estimate = getattr(self.decision_maker, "request_token_estimate", None)
+        native_request_tokens = request_token_estimate() if callable(request_token_estimate) else 0
+        if native_request_tokens:
+            pending_tool_result = json.dumps(
+                {
+                    "observation": observation.to_dict(),
+                    "state_summary": state.summary(),
+                },
+                ensure_ascii=False,
+            )
+            state.session_used_tokens = native_request_tokens + max(1, len(pending_tool_result) // 4)
+        else:
+            payload = (
+                context
+                + json.dumps(action, ensure_ascii=False)
+                + json.dumps(observation.to_dict(), ensure_ascii=False)
+            )
+            state.session_used_tokens = max(1, len(payload) // 4)
         threshold_tokens = int(state.session_budget_tokens * state.handoff_threshold)
         if state.session_used_tokens >= threshold_tokens:
             state.handoff_ready = True
@@ -4363,14 +4829,17 @@ class AgentLoop:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.debug_context_dir.mkdir(parents=True, exist_ok=True)
+        self.provider_session_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.provider_session_dir.chmod(0o700)
+        except OSError:
+            pass
         (self.state_dir / "skills").mkdir(exist_ok=True)
-        (self.state_dir / "memories").mkdir(exist_ok=True)
         (self.state_dir / "skill_candidates").mkdir(exist_ok=True)
         (self.state_dir / "verifier_reports").mkdir(exist_ok=True)
-        if not self.memory_path.exists():
-            self.memory_path.write_text(render_memory_index(self.state_dir / "memories"), encoding="utf-8")
-        for legacy_memory in (self.state_dir / "hard_memory.md", self.state_dir / "soft_memory.md"):
-            legacy_memory.unlink(missing_ok=True)
+        archived_memories = self.memory_store.ensure_layout()
+        for archived_memory in archived_memories:
+            LOGGER.warning("Archived legacy Memory file at %s.", self._rel(archived_memory))
         if not (self.state_dir / "skills" / "coding.md").exists():
             (self.state_dir / "skills" / "coding.md").write_text(
                 "---\n"

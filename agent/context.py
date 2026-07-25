@@ -12,7 +12,7 @@ from agent.planner import (
     validate_initializer_script,
     validate_requirements_matrix,
 )
-from agent.skills import parse_skill, skill_catalog
+from agent.skills import SkillEntry, discover_skill_entries, skill_catalog
 
 
 RECENT_TOOL_OBSERVATION_MAX_CHARS = 8000
@@ -43,11 +43,74 @@ class ContextBuilder:
         self.system_validation = system_validation
         self.current_trace_path: Path | None = None
 
-    def build(self, state: TaskState, relevant_memories: str = "", include_handoff: bool | None = None) -> str:
+    def build(
+        self,
+        state: TaskState,
+        relevant_memories: str = "",
+        include_handoff: bool | None = None,
+        include_conversation: bool = True,
+    ) -> str:
         critical = self._critical_context(state)
-        working = self._working_context(state)
+        working = self._working_context(state, include_conversation=include_conversation)
         reference = self._reference_context(state, relevant_memories=relevant_memories, include_handoff=include_handoff)
         return self._pack_context(critical, working, reference)
+
+    def build_session_context(
+        self,
+        state: TaskState,
+        relevant_memories: str = "",
+        *,
+        include_handoff: bool = True,
+    ) -> str:
+        """Build the one-time model context for a new provider session."""
+        return self.build(
+            state,
+            relevant_memories=relevant_memories,
+            include_handoff=include_handoff,
+            include_conversation=False,
+        )
+
+    def build_incremental_state(
+        self,
+        state: TaskState,
+        relevant_memories: str = "",
+        *,
+        include_task_context: bool = False,
+    ) -> dict[str, object]:
+        """Build the task-local state appended inside the next tool result."""
+        active_task_id = self._active_task_id(state)
+        update: dict[str, object] = {
+            "task_id": active_task_id,
+            "required_next_action": self._required_next_action(state),
+            "state_summary": state.summary(),
+            "pending_repair": dict(state.pending_repair),
+            "initializer_repair": dict(state.initializer_repair),
+            "pending_skill_review": dict(state.pending_skill_review),
+            "handoff_ready": state.handoff_ready,
+        }
+        if include_task_context:
+            active_node = next(
+                (
+                    dict(node)
+                    for node in state.nodes
+                    if isinstance(node, dict) and str(node.get("id", "")) == active_task_id
+                ),
+                {},
+            )
+            update.update(
+                {
+                    "user_goal": state.user_goal,
+                    "acceptance_criteria": list(state.acceptance_criteria),
+                    "active_task": active_node,
+                    "active_acceptance_contracts": [
+                        dict(contract) for contract in self._active_acceptance_contracts(state)
+                    ],
+                    "orchestrator_decision": dict(state.orchestrator_decision),
+                }
+            )
+        if relevant_memories:
+            update["relevant_memories"] = relevant_memories
+        return update
 
     def _pack_context(self, critical: str, working: str, reference: str) -> str:
         sections = [section for section in [critical, working, reference] if section.strip()]
@@ -118,7 +181,7 @@ class ContextBuilder:
         lines = [
             "# Always-on Context",
             "You are the decision model inside a long-running coding agent harness.",
-            "Return one schema-valid action. The harness owns verification and state transitions.",
+            "Choose one schema-valid action. The provider transport submits it to the harness, which owns verification and state transitions.",
             f"Current task id: {self._active_task_id(state)}",
             f"Orchestrator decision: {state.orchestrator_decision}",
             f"Required next action: {self._required_next_action(state)}",
@@ -208,8 +271,13 @@ class ContextBuilder:
         ]
         return "\n".join(lines)
 
-    def _working_context(self, state: TaskState) -> str:
+    def _working_context(self, state: TaskState, include_conversation: bool = True) -> str:
         repair_details = self._pending_repair_context(state)
+        conversation_lines = (
+            ["# User Conversation", self._conversation_context(state), ""]
+            if include_conversation
+            else []
+        )
         lines = [
             "# Working Context",
             "Use this to choose the next task-local action.",
@@ -217,9 +285,7 @@ class ContextBuilder:
             "# Active Task",
             state.user_goal,
             "",
-            "# User Conversation",
-            self._conversation_context(state),
-            "",
+            *conversation_lines,
             f"# Interaction Mode\n{state.interaction_mode or 'non-interactive'}",
             "",
             *self._interaction_mode_instruction_lines(state),
@@ -276,13 +342,16 @@ class ContextBuilder:
     def _tool_use_reference_context(self) -> str:
         lines = [
             "# Available Tools And Calling Format",
-            "Return exactly one JSON object using this schema:",
+            "Choose exactly one declared native function. The provider may expose submit_action or expose each action name directly.",
+            "The normalized harness action carries these fields:",
             '{"thought_summary":"brief non-hidden reasoning","action":"<one action>","target":"<path|command|query|task|empty>","args":{},"expected_observation":"expected result","risk":"low|medium|high"}',
-            "Callable actions:",
+            "When action names are exposed directly, the function name supplies action and its arguments contain the other fields. Never call an undeclared function.",
+            "Callable action semantics:",
             "- contract: ad-hoc tasks create an agreement with args.task_id, args.summary, args.frozen_requirements=[...], args.verification_procedure={command:'...' or commands:[...]}; generated tasks may only update verification_procedure while preserving frozen_requirements exactly.",
             "- list_files: inspect a directory or file entry; target='<path>'; args.recursive=false, args.limit=200.",
             "- search: grep-style literal text search; target='<known id|symbol|error text|filename>'; args.path='.'. Use this before read when locating T7, validation errors, functions, classes, or filenames.",
             "- read: targeted file read; target='<path>'; prefer args.query='<literal symbol/text>' after search/grep to return matching code. If has_more=true, continue with returned data.next_read args only when the needed content is beyond the returned window. Explicit args.start/args.end are allowed only for known line ranges.",
+            "- recall_memory: run one read-only full-corpus Memory QA using the main Agent model; target='<natural-language question>'; args={}. Use only when the startup result does not answer a newly relevant durable-context question.",
             "- write: create/overwrite/append file; target='<path>'; args.content='<text>', args.mode='create|overwrite|append'.",
             "- edit: exact text replacement or line-range replacement; target='<path>'; use args.old='<text>', args.new='<text>', args.count=1, args.allow_multiple=false, or use args.start=<line>, args.end=<line>, args.content='<replacement text>'.",
             "- bash: run a needed command from repository root; target='<command>'; args.timeout=30.",
@@ -291,7 +360,7 @@ class ContextBuilder:
             "- update_plan: request harness plan update; target='current_task'; args={}.",
             "- answer: final evidence-based response for inspection/explanation tasks; target='' and args.answer='<response>'.",
             "- load_skill: load one relevant Skill by metadata name before applying it.",
-            "- save_skill: submit a reusable procedure candidate; args.name, description, instruction, optional examples, evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Prefer immutable report_id references. Free-text evidence is rejected.",
+            "- save_skill: submit a reusable procedure candidate; args.name, content='<free-form Markdown>', evidence_type, evidence_refs=[{type:'verifier_report',report_id:'VR-...',task_id:'...'} or {type:'trace',path:'state/traces/...',step:N,task_id:'...'}]. Saved Skills must have matching name frontmatter; other frontmatter fields and body sections are optional. Prefer immutable report_id references. Free-text evidence is rejected.",
             "- dismiss_skill: decline the current Pending Skill Reflection; target='<report_id>'; args.reason='<why this is not reusable>'.",
             "- save_memory: store durable cross-session memory; args.name, description, type='user|feedback|project|reference', content. Feedback must include why and how_to_apply or explicit Why/How sections. Project dates must be absolute, not relative.",
             "- finish: project-level termination only after verifier/project completion evidence, including harness-created FINAL_ACCEPTANCE when scheduled; target='current_task'; args={}.",
@@ -547,7 +616,6 @@ class ContextBuilder:
         records = state.loaded_skills if isinstance(state.loaded_skills, list) else []
         if not records:
             return "# Loaded Skills\n\nNo Skill is currently loaded."
-        skill_dir = self.state_dir / "skills"
         chunks: list[str] = []
         seen: set[str] = set()
         invalidated: list[str] = []
@@ -558,16 +626,18 @@ class ContextBuilder:
             if not requested or requested in seen:
                 continue
             seen.add(requested)
-            match = None
-            for path in sorted(skill_dir.glob("*.md")):
-                skill = parse_skill(path.read_text(encoding="utf-8"), fallback_name=path.stem)
-                if skill.name == requested:
-                    match = skill
-                    break
+            match = self._find_skill_entry(requested)
             if match is None or match.content_hash != str(record.get("content_hash", "")):
                 invalidated.append(requested)
                 continue
-            chunks.append(match.content.rstrip())
+            source_path = self._rel(match.path)
+            resource_dir = self._rel(match.path.parent)
+            chunks.append(
+                f"## Skill: {match.document.name}\n"
+                f"Source: {source_path}\n"
+                f"Resolve relative Skill resource paths from: {resource_dir}\n\n"
+                f"{match.document.content.rstrip()}"
+            )
         lines = ["# Loaded Skills", "Loaded Skill contents are workflow guidance, not completion evidence."]
         if chunks:
             lines.extend(["", "\n\n".join(chunks)])
@@ -1768,13 +1838,26 @@ class ContextBuilder:
         return path.read_text(encoding="utf-8")[:max_chars]
 
     def _read_skills(self) -> str:
-        skill_dir = self.state_dir / "skills"
-        catalog = skill_catalog(skill_dir)
+        catalog = skill_catalog(self._skill_dirs())
         if not catalog:
             return "No skills available."
         return "# Available Skills\n\n" + "\n".join(
             f"- {item['name']}: {item['description']}" for item in catalog
         )
+
+    def _skill_dirs(self) -> list[Path]:
+        return [self.state_dir / "skills", self.root / "default_skills"]
+
+    def _find_skill_entry(self, requested: str) -> SkillEntry | None:
+        for skill_dir in self._skill_dirs():
+            matches = [
+                entry
+                for entry in discover_skill_entries(skill_dir)
+                if entry.document.name == requested
+            ]
+            if matches:
+                return matches[0]
+        return None
 
     def _read_memory_index(self) -> str:
         raw = self._read_optional(self.state_dir / "memory.md")

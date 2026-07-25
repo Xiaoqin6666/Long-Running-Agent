@@ -30,6 +30,130 @@ class MemoryDocument:
         return hashlib.sha256(self.rendered.encode("utf-8")).hexdigest()
 
 
+class MemoryStoreError(RuntimeError):
+    def __init__(self, message: str, data: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.data = data or {}
+
+
+class MemoryStore:
+    """Canonical typed-Memory persistence shared by the Agent and user CLI."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.memory_dir = state_dir / "memories"
+        self.index_path = state_dir / "memory.md"
+        self.legacy_dir = state_dir / "legacy_memories"
+
+    def ensure_layout(self) -> list[Path]:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        archived: list[Path] = []
+        for legacy_path in (
+            self.state_dir / "hard_memory.md",
+            self.state_dir / "soft_memory.md",
+        ):
+            if legacy_path.exists():
+                archived.append(self._archive_legacy_file(legacy_path))
+        if self.index_path.exists():
+            current = self.index_path.read_text(encoding="utf-8")
+            if not current.startswith("# Memory Index\n\nTyped memories live in `memories/`"):
+                archived.append(self._archive_legacy_file(self.index_path))
+        self.rebuild_index()
+        return archived
+
+    def save(self, memory: MemoryDocument, *, overwrite: bool = False) -> dict[str, str]:
+        self.ensure_layout()
+        errors = validate_memory(memory)
+        if errors:
+            raise MemoryStoreError(
+                "Memory rejected: " + "; ".join(errors) + ".",
+                {"errors": errors},
+            )
+
+        memory_id = safe_memory_id(memory.name)
+        memory = MemoryDocument(memory_id, memory.description.strip(), memory.type, memory.content.strip())
+        target = self.memory_dir / f"{memory_id}.md"
+        catalog = memory_catalog(self.memory_dir)
+        normalized_description = " ".join(memory.description.lower().split())
+        duplicate = next(
+            (
+                item
+                for item in catalog
+                if (
+                    safe_memory_id(item["name"]) == memory_id
+                    and (not overwrite or target.name != item["path"])
+                )
+                or (
+                    " ".join(item["description"].lower().split()) == normalized_description
+                    and target.name != item["path"]
+                )
+            ),
+            None,
+        )
+        if duplicate:
+            raise MemoryStoreError(
+                f"Memory rejected: duplicate of existing memory {duplicate['name']}.",
+                {"duplicate": duplicate},
+            )
+        semantic_duplicate = find_semantic_duplicate(
+            memory,
+            self.memory_dir,
+            exclude_name=memory_id if overwrite else "",
+        )
+        if semantic_duplicate:
+            raise MemoryStoreError(
+                f"Memory rejected: semantically similar to existing memory {semantic_duplicate['name']}.",
+                {
+                    "duplicate": semantic_duplicate,
+                    "duplicate_reason": "semantic_similarity",
+                },
+            )
+        if target.exists() and not overwrite:
+            raise MemoryStoreError(
+                f"Memory rejected: duplicate of existing memory {memory_id}.",
+                {"duplicate": {"name": memory_id, "path": target.name}},
+            )
+
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = target.with_suffix(".md.tmp")
+        temporary_path.write_text(render_memory(memory), encoding="utf-8")
+        rendered_errors = validate_memory(
+            parse_memory(temporary_path.read_text(encoding="utf-8"), fallback_name=memory_id)
+        )
+        if rendered_errors:
+            temporary_path.unlink(missing_ok=True)
+            raise MemoryStoreError(
+                "Memory rejected: rendered Memory failed validation.",
+                {"errors": rendered_errors},
+            )
+        temporary_path.replace(target)
+        self.rebuild_index()
+        return {
+            "name": memory_id,
+            "description": memory.description,
+            "type": memory.type,
+            "path": target.as_posix(),
+            "content_hash": memory.content_hash,
+        }
+
+    def rebuild_index(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.index_path.with_suffix(".md.tmp")
+        temporary_path.write_text(render_memory_index(self.memory_dir), encoding="utf-8")
+        temporary_path.replace(self.index_path)
+
+    def _archive_legacy_file(self, source: Path) -> Path:
+        self.legacy_dir.mkdir(parents=True, exist_ok=True)
+        target = self.legacy_dir / source.name
+        suffix = 1
+        while target.exists():
+            target = self.legacy_dir / f"{source.stem}-{suffix}{source.suffix}"
+            suffix += 1
+        source.replace(target)
+        return target
+
+
 def parse_memory(text: str, fallback_name: str = "") -> MemoryDocument:
     metadata: dict[str, str] = {}
     body = text

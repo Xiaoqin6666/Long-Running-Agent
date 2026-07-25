@@ -23,6 +23,18 @@ from agent.ui_runtime_validation import (
 
 
 FINAL_ACCEPTANCE_TASK_ID = "FINAL_ACCEPTANCE"
+UI_SOURCE_SUFFIXES = {
+    ".css",
+    ".htm",
+    ".html",
+    ".js",
+    ".jsx",
+    ".py",
+    ".svelte",
+    ".ts",
+    ".tsx",
+    ".vue",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,7 +263,7 @@ def _ui_source_by_requirement(
 ) -> dict[str, dict[str, Any]]:
     files_by_requirement: dict[str, list[Path]] = {}
     targets_by_requirement: dict[str, list[str]] = {}
-    fallback_files = _workspace_python_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    fallback_files = _workspace_ui_source_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
     fallback_targets = [_display_path(root, path) for path in fallback_files]
     support_files = _workspace_ui_support_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
     support_targets = [_display_path(root, path) for path in support_files]
@@ -312,12 +324,10 @@ def _task_ui_source_targets(*, root: Path, task: dict[str, Any], benchmark_id: s
                 path.relative_to(root.resolve())
             except (OSError, ValueError):
                 continue
-            if path.suffix.lower() != ".py":
-                continue
             comparable = normalized.replace("\\", "/").lower()
             if "/tests/" in comparable or Path(comparable).name.startswith("test_"):
                 continue
-            if path.suffix.lower() != ".py":
+            if path.suffix.lower() not in UI_SOURCE_SUFFIXES:
                 continue
             target = _display_path(root, path)
             if path not in paths:
@@ -349,6 +359,20 @@ def _workspace_python_files(*, root: Path, tasks: list[dict[str, Any]], benchmar
         path
         for path in workspace_path.rglob("*.py")
         if "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
+        and not path.name.startswith("test_")
+    ]
+
+
+def _workspace_ui_source_files(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> list[Path]:
+    workspace_path = _workspace_path(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    if workspace_path is None:
+        return []
+    return [
+        path
+        for path in workspace_path.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in UI_SOURCE_SUFFIXES
+        and "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
         and not path.name.startswith("test_")
     ]
 
@@ -545,12 +569,35 @@ def _has_action_control(text: str) -> bool:
             ".bind(",
             "command=",
             "<<listboxselect>>",
+            "<button",
+            "role=\"button\"",
+            "role='button'",
+            "onclick=",
+            ".addeventlistener(",
         )
     )
 
 
 def _has_container_or_navigation(text: str) -> bool:
-    return any(marker in text for marker in ("tk.frame", "ttk.frame", "tk.toplevel", "ttk.notebook", ".add(", "menu(", "tk.optionmenu"))
+    return any(
+        marker in text
+        for marker in (
+            "tk.frame",
+            "ttk.frame",
+            "tk.toplevel",
+            "ttk.notebook",
+            ".add(",
+            "menu(",
+            "tk.optionmenu",
+            "<canvas",
+            "<main",
+            "<section",
+            "<form",
+            "<nav",
+            "document.getelementbyid(",
+            "document.queryselector(",
+        )
+    )
 
 
 def _has_input_control(text: str) -> bool:
@@ -572,6 +619,17 @@ def _has_input_control(text: str) -> bool:
             "ttk.checkbutton",
             "tk.checkbutton",
             "radiobutton",
+            "<input",
+            "<select",
+            "<textarea",
+            "contenteditable",
+            "keydown",
+            "keyup",
+            "mousedown",
+            "pointerdown",
+            "touchstart",
+            "onclick=",
+            ".addeventlistener(",
         )
     )
 
@@ -589,6 +647,10 @@ def _has_dialog_or_feedback(text: str) -> bool:
             ".config(text=",
             ".configure(text=",
             "raise valueerror",
+            "<dialog",
+            "alert(",
+            "filltext(",
+            "overlay",
         )
     )
 
@@ -608,14 +670,33 @@ def _has_data_display(text: str) -> bool:
             "create_arc",
             ".create_text(",
             ".create_rectangle(",
+            "filltext(",
+            "fillrect(",
+            "textcontent",
+            "innerhtml",
         )
     )
 
 
 def _has_empty_state(text: str) -> bool:
     return _has_data_display(text) and (
-        any(marker in text for marker in ("empty", "no ", "none", "暂无", "无", "沒有", "没有"))
-        or bool(re.search(r"if\s+not\s+\w+", text))
+        any(
+            marker in text
+            for marker in (
+                "empty",
+                "no ",
+                "none",
+                "暂无",
+                "无",
+                "沒有",
+                "没有",
+                "tap to start",
+                "click to start",
+                "press space",
+                "ready",
+            )
+        )
+        or bool(re.search(r"if\s+(?:not\s+\w+|\([^)]*(?:length|size)\s*={2,3}\s*0)", text))
     )
 
 
@@ -633,6 +714,11 @@ def _has_success_refresh(text: str) -> bool:
             ".config(",
             ".configure(",
             "save_data(",
+            "requestanimationframe(",
+            "render(",
+            "redraw(",
+            "reset(",
+            "restart(",
         )
     )
 

@@ -13,19 +13,17 @@ from typing import Callable
 from agent.loop import AgentLoop, RunResult
 from agent.memory import (
     MemoryDocument,
-    find_semantic_duplicate,
+    MemoryStore,
+    MemoryStoreError,
     normalize_memory_content,
-    render_memory,
-    render_memory_index,
     safe_memory_id,
-    validate_memory,
 )
 from agent.spec_builder import build_project_spec
-from agent.skills import SkillDocument, parse_skill, render_skill
+from agent.skills import build_skill, render_skill
 
 
 UI_WIDTH = 72
-TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "search", "write"}
+TOOL_ACTIONS = {"bash", "edit", "git", "list_files", "read", "recall_memory", "search", "write"}
 HELP_TEXT = """Commands:
   /agent     Switch to agent mode; collect requirements or a project spec file path before starting work
   /send      Start work from the collected /agent requirements or /adjust directions
@@ -50,8 +48,8 @@ class ChatConfig:
     benchmark_id: str | None = None
     tasks_path: Path | None = None
     project_spec_path: Path | None = None
-    auto_resume: bool = False
-    max_sessions: int = 1
+    auto_resume: bool = True
+    max_sessions: int | None = None
     system_validation: bool = True
     ui_contract_validation: bool = True
     integration_contract_validation: bool = False
@@ -206,20 +204,14 @@ class InteractiveCLI:
             name = self._prompt_skill_field("Name", required=True)
             if name is None:
                 return
-            description = self._prompt_skill_field("Description", required=True)
-            if description is None:
-                return
-            instruction = self._prompt_skill_field("Instruction", required=True)
-            if instruction is None:
-                return
-            example = self._prompt_skill_field("Example (optional)", required=False)
-            if example is None:
+            content = self._prompt_skill_field("Markdown content (optional)", required=False)
+            if content is None:
                 return
         except (EOFError, KeyboardInterrupt):
             self.output("\nSkill setup cancelled.")
             return
 
-        self._save_user_skill(name, description, instruction, example)
+        self._save_user_skill(name, content)
 
     def _prompt_skill_field(self, label: str, required: bool) -> str | None:
         while True:
@@ -313,38 +305,23 @@ class InteractiveCLI:
             {"type": memory_type, "content": content, "why": why, "how_to_apply": how_to_apply}
         )
         memory = MemoryDocument(memory_id, description, memory_type, rendered_content)
-        errors = validate_memory(memory)
-        if errors:
-            self.output("Memory validation failed: " + "; ".join(errors))
-            return
-        semantic_duplicate = find_semantic_duplicate(memory, memory_dir, exclude_name=memory_id)
-        if semantic_duplicate:
-            self.output(
-                "Memory validation failed: semantically similar to existing Memory "
-                f"'{semantic_duplicate['name']}' ({semantic_duplicate['similarity']})."
-            )
-            return
-
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        temporary_path = memory_path.with_suffix(".md.tmp")
         try:
-            temporary_path.write_text(render_memory(memory), encoding="utf-8")
-            temporary_path.replace(memory_path)
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            (self.state_dir / "memory.md").write_text(render_memory_index(memory_dir), encoding="utf-8")
+            saved = MemoryStore(self.state_dir).save(memory, overwrite=memory_path.exists())
+        except MemoryStoreError as exc:
+            self.output("Memory validation failed: " + str(exc).removeprefix("Memory rejected: ").rstrip("."))
+            return
         except OSError as exc:
-            temporary_path.unlink(missing_ok=True)
             self.output(f"Could not save Memory: {exc}")
             return
 
         record = ChatMessage(
             "system",
-            f"User added trusted Memory '{memory_id}' at {self._relative_path(memory_path)}.",
+            f"User added trusted Memory '{memory_id}' at {self._relative_path(Path(saved['path']))}.",
         )
         self._append_history(record)
-        self.output(self._paint(f"Memory saved: {self._relative_path(memory_path)}", "green", bold=True))
+        self.output(self._paint(f"Memory saved: {self._relative_path(Path(saved['path']))}", "green", bold=True))
 
-    def _save_user_skill(self, name: str, description: str, instruction: str, example: str) -> None:
+    def _save_user_skill(self, name: str, content: str) -> None:
         skill_id = safe_skill_id(name)
         if not skill_id:
             self.output("Skill name must contain a letter, number, underscore, or dash.")
@@ -363,12 +340,11 @@ class InteractiveCLI:
                 self.output("Skill setup cancelled; existing Skill was not changed.")
                 return
 
-        skill = SkillDocument(skill_id, description, instruction, example)
-        rendered = render_skill(skill)
-        parsed = parse_skill(rendered, fallback_name=skill_id)
-        if parsed != skill:
-            self.output("Skill validation failed; no file was written.")
+        skill = build_skill(skill_id, content)
+        if safe_skill_id(skill.name) != skill_id:
+            self.output("Skill frontmatter name must match the entered name.")
             return
+        rendered = render_skill(skill)
 
         skill_dir.mkdir(parents=True, exist_ok=True)
         temporary_path = skill_path.with_suffix(".md.tmp")
@@ -404,7 +380,12 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Agent mode is active by default. Paste requirements, then /send. Use /chat, /adjust, /resume, or /help.", "dim"))
+        self.output(
+            self._paint(
+                "  Agent mode is active by default. Paste requirements, then /send. Use /chat, /adjust, /resume, or /help.",
+                "dim",
+            )
+        )
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:
@@ -652,6 +633,7 @@ class InteractiveCLI:
 
     def _reset_generated_project_state(self) -> None:
         for path in [
+            self.state_dir / "requirements.json",
             self.state_dir / "generated_tasks.json",
             self.state_dir / "init.sh",
             self.state_dir / "current_task.json",
@@ -752,6 +734,16 @@ class InteractiveCLI:
 
     def _show_event(self, event: dict[str, object]) -> None:
         event_type = str(event.get("type", "tool_result"))
+        if event_type == "session_handoff":
+            self.output(
+                self._paint(
+                    "Agent > 已达到上下文阈值，正在自动切换到新会话…",
+                    "green",
+                    bold=True,
+                )
+            )
+            return
+
         action = str(event.get("action", "unknown"))
         if action == "answer":
             return
@@ -760,14 +752,15 @@ class InteractiveCLI:
 
         thought_summary = str(event.get("thought_summary", ""))
         if thought_summary:
-            self.output(f"      {thought_summary}")
+            self.output(self._paint(f"      {thought_summary}", "gray"))
         if action == "verify":
             return
 
         target = str(event.get("target", ""))
-        detail = f" {target}" if target else ""
         verb = "calling" if action in TOOL_ACTIONS else "action"
-        self.output(self._paint(f"      {verb} {action}{detail}", "green"))
+        call = self._paint(f"      {verb} {action}", "blue")
+        detail = self._paint(f" {target}", "gray") if target else ""
+        self.output(f"{call}{detail}")
 
     def _finish_turn(self, result: RunResult) -> None:
         self.last_result = result

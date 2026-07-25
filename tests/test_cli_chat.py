@@ -167,6 +167,14 @@ class ChatCLITests(unittest.TestCase):
             output_fn=outputs.append,
             use_color=False,
         )
+        stale_requirements = (
+            root / "state" / "benchmarks" / "sample" / "requirements.json"
+        )
+        stale_requirements.parent.mkdir(parents=True, exist_ok=True)
+        stale_requirements.write_text(
+            '{"requirements":[{"id":"REQ-STALE"}]}\n',
+            encoding="utf-8",
+        )
         run_result = RunResult(
             completed=True,
             steps=1,
@@ -182,6 +190,7 @@ class ChatCLITests(unittest.TestCase):
             run_loop.assert_called_once()
             spec_path = root / "state" / "benchmarks" / "sample" / "project_spec.md"
             self.assertEqual(spec_path.read_text(encoding="utf-8"), "# Built Spec\n")
+            self.assertFalse(stale_requirements.exists())
             self.assertTrue(any("project spec saved" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -413,9 +422,14 @@ class ChatCLITests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_skill_command_collects_guided_fields(self) -> None:
+    def test_skill_command_collects_name_and_freeform_markdown(self) -> None:
         outputs: list[str] = []
-        inputs = iter(["debug-failures", "Diagnose repeat failures", "Inspect the first traceback", "Use on failing tests"])
+        inputs = iter(
+            [
+                "debug-failures",
+                "Diagnose repeat failures.\n\nInspect the first traceback.",
+            ]
+        )
         root = Path.cwd() / ".tmp_tests" / f"chat-skill-{uuid4().hex}"
         root.mkdir(parents=True)
         cli = InteractiveCLI(
@@ -431,9 +445,10 @@ class ChatCLITests(unittest.TestCase):
             skill_path = root / "state" / "skills" / "debug-failures.md"
             skill = parse_skill(skill_path.read_text(encoding="utf-8"))
             self.assertEqual(skill.name, "debug-failures")
-            self.assertEqual(skill.description, "Diagnose repeat failures")
-            self.assertEqual(skill.instruction, "Inspect the first traceback")
-            self.assertEqual(skill.examples, "Use on failing tests")
+            self.assertEqual(skill.description, "Diagnose repeat failures.")
+            self.assertIn("Inspect the first traceback.", skill.content)
+            self.assertNotIn("# Examples", skill.content)
+            self.assertTrue(skill_path.read_text(encoding="utf-8").startswith('---\nname: "debug-failures"\n'))
             self.assertTrue(any("Skill saved:" in output for output in outputs))
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -570,6 +585,7 @@ class ChatCLITests(unittest.TestCase):
     def test_make_loop_uses_only_current_session_messages(self) -> None:
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=lambda message: None,
             use_color=False,
         )
         cli.messages = [
@@ -587,6 +603,83 @@ class ChatCLITests(unittest.TestCase):
         )
 
         self.assertEqual(loop.conversation_messages, [{"role": "user", "content": "new session question"}])
+
+    def test_new_clears_cli_context_and_next_loop_gets_new_provider_session(self) -> None:
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=lambda message: None,
+            use_color=False,
+        )
+        cli.messages = [
+            ChatMessage("user", "old question"),
+            ChatMessage("assistant", "old answer"),
+        ]
+        old_loop = cli._make_loop(
+            "Old task",
+            resume=False,
+            include_conversation=True,
+            interaction_mode="question",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._handle_command("/new")
+        cli.messages.append(ChatMessage("user", "new question"))
+        new_loop = cli._make_loop(
+            "New task",
+            resume=False,
+            include_conversation=True,
+            interaction_mode="question",
+        )
+
+        self.assertEqual(
+            new_loop.conversation_messages,
+            [{"role": "user", "content": "new question"}],
+        )
+        self.assertNotEqual(new_loop.trace_path, old_loop.trace_path)
+        self.assertEqual(cli.active_mode, "idle")
+        self.assertEqual(cli.context_message_start, 0)
+
+    def test_finish_turn_records_answer_as_visible_assistant_message(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=False,
+        )
+        result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=Path.cwd() / "state" / "traces" / "run.jsonl",
+            state_path=Path.cwd() / "state" / "current_task.json",
+            message="Evidence-backed visible answer.",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._finish_turn(result)
+
+        self.assertEqual(cli.messages[-1].role, "assistant")
+        self.assertEqual(cli.messages[-1].content, "Evidence-backed visible answer.")
+        self.assertTrue(any("Evidence-backed visible answer." in line for line in outputs))
+
+    def test_finish_turn_keeps_assistant_answer_in_default_terminal_color(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+        result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=Path.cwd() / "state" / "traces" / "run.jsonl",
+            state_path=Path.cwd() / "state" / "current_task.json",
+            message="Visible answer.",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._finish_turn(result)
+
+        self.assertEqual(outputs, ["\033[1;32mAgent >\033[0m Visible answer.\n"])
 
     def test_commands_work_without_starting_agent_loop(self) -> None:
         outputs: list[str] = []
@@ -643,6 +736,44 @@ class ChatCLITests(unittest.TestCase):
         self.assertEqual(outputs[0], f"      {long_summary}")
         self.assertNotIn("thought_summary", outputs[0])
         self.assertEqual(outputs[1], "      calling search needle")
+
+    def test_tool_event_colors_call_blue_and_details_gray(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "action": "read",
+                "target": "README.md",
+                "thought_summary": "Inspect the documentation.",
+            }
+        )
+
+        self.assertEqual(outputs[0], "\033[90m      Inspect the documentation.\033[0m")
+        self.assertEqual(
+            outputs[1],
+            "\033[34m      calling read\033[0m\033[90m README.md\033[0m",
+        )
+
+    def test_session_handoff_event_renders_green_notice(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+
+        cli._show_event({"type": "session_handoff", "session": 2, "max_sessions": None})
+
+        self.assertEqual(
+            outputs,
+            ["\033[1;32mAgent > 已达到上下文阈值，正在自动切换到新会话…\033[0m"],
+        )
 
     def test_tool_event_target_is_not_truncated(self) -> None:
         outputs: list[str] = []
@@ -751,11 +882,12 @@ class ChatCLITests(unittest.TestCase):
     @patch("agent.chat.os.name", "nt")
     @patch("agent.chat.subprocess.Popen")
     def test_launch_chat_window_starts_child_console(self, popen) -> None:
-        self.assertTrue(launch_chat_window(["--chat", "--provider", "offline"], Path.cwd()))
+        with patch("agent.chat.subprocess.CREATE_NEW_CONSOLE", 0x10, create=True):
+            self.assertTrue(launch_chat_window(["--chat", "--provider", "offline"], Path.cwd()))
         command = popen.call_args.args[0]
         self.assertEqual(command[:3], [__import__("sys").executable, "-m", "agent.main"])
         self.assertIn("--chat-child", command)
-        self.assertEqual(popen.call_args.kwargs["creationflags"], __import__("subprocess").CREATE_NEW_CONSOLE)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x10)
 
 
 if __name__ == "__main__":

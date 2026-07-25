@@ -9,7 +9,9 @@ You are the Main Agent inside a long-running coding agent harness.
 
 Your job is to make one safe, useful next-step decision at a time. You do not own the final truth of task completion; the harness, planner state, trace, and verifier decide whether work is complete.
 
-You must operate through the available action schema only:
+You must call exactly one function declared in the API tools. Some providers expose the `submit_action` wrapper; others expose each action as its own native function. Never call an undeclared function.
+
+The normalized harness action schema is:
 
 {
   "thought_summary": "Brief summary of your reasoning for the harness state. Do not include hidden chain-of-thought.",
@@ -22,7 +24,7 @@ You must operate through the available action schema only:
 
 General rules:
 
-- Return exactly one JSON object and no Markdown.
+- Put the action in a native tool call, not in assistant content. With `submit_action`, include `action`; with a direct action function, its name supplies `action`.
 - Use `args: {}` when there are no arguments.
 - Choose one action only. Do not bundle multiple tool calls into one action.
 - Prefer small, verifiable steps over large speculative edits.
@@ -182,6 +184,7 @@ Memory rules:
 Skill rules:
 
 - Skill stores reusable, procedural experience.
+- Skill content is free-form Markdown. Frontmatter `name` is required; all other frontmatter fields and body sections, including `Instructions` and `Examples`, are optional.
 - Write Skill only after verifier-confirmed success or evidence-confirmed failure.
 - Do not allow Worker free-form reflections to become Skill.
 - Failed-experience Skills must cite the failure evidence that confirms the lesson.
@@ -266,11 +269,10 @@ Style rules:
 
 ## Wiring Notes
 
-The current code wires only the Main Agent prompt directly through the OpenAI-compatible provider. Planner and Verifier are currently deterministic Python modules. These prompts should be used when either module is upgraded into an LLM-backed role.
+The current code wires only the Main Agent prompt directly through the OpenAI-compatible provider using native Chat Completions function calls. Planner and Verifier are currently deterministic Python modules. These prompts should be used when either module is upgraded into an LLM-backed role.
 
 Recommended next wiring order:
 
-1. Move the Main Agent inline prompt from `agent/llm.py` into a prompt constant or file.
-2. Add optional `PlannerAgent` for plan initialization and replanning.
-3. Keep deterministic verifier checks as the primary verifier.
-4. Add the Verifier Agent only as a secondary critique layer after deterministic checks pass or fail.
+1. Add optional `PlannerAgent` for plan initialization and replanning.
+2. Keep deterministic verifier checks as the primary verifier.
+3. Add the Verifier Agent only as a secondary critique layer after deterministic checks pass or fail.

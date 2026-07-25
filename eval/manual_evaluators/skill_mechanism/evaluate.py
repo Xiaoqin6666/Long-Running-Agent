@@ -61,7 +61,7 @@ def check_skill_artifacts() -> dict[str, Any]:
             return {"name": "skill_artifacts", "ok": False, "error": "Skill or candidate missing"}
         candidate = json.loads(candidates[-1].read_text(encoding="utf-8"))
         statuses = [item.get("status") for item in candidate.get("status_history", [])]
-        expected = ["proposed", "evidence_validated", "content_validated", "approved", "promoted"]
+        expected = ["proposed", "evidence_validated", "approved", "promoted"]
         refs = candidate.get("evidence_refs", [])
         ok = (
             candidate.get("status") == "promoted"
@@ -103,7 +103,7 @@ def check_trace_protocol() -> dict[str, Any]:
             and str(event.get("action", {}).get("target", "")).replace("\\", "/").endswith("workspace/second_path.py")
         ]
         loaded_content_ok = any(
-            "# Instructions" in str(events[index].get("observation", {}).get("data", {}).get("content", ""))
+            bool(str(events[index].get("observation", {}).get("data", {}).get("content", "")).strip())
             for index in load_indexes
         )
         ordered = bool(
