@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.context import ContextBuilder
+from agent.integration_contract import write_integration_contract
 from agent.llm import create_decision_maker
 from agent.memory import (
     MemoryDocument,
@@ -91,6 +92,9 @@ class AgentLoop:
         auto_resume: bool = False,
         max_sessions: int = 1,
         system_validation: bool = True,
+        ui_contract_validation: bool = True,
+        integration_contract_validation: bool = False,
+        generate_requirements: bool = True,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
         conversation_messages: list[dict[str, str]] | None = None,
         interaction_mode: str = "",
@@ -103,6 +107,9 @@ class AgentLoop:
         self.auto_resume = auto_resume
         self.max_sessions = max(1, max_sessions)
         self.system_validation = system_validation
+        self.ui_contract_validation = ui_contract_validation
+        self.integration_contract_validation = integration_contract_validation
+        self.generate_requirements = generate_requirements
         self.event_handler = event_handler
         self.conversation_messages = self._normalize_conversation_messages(conversation_messages or [])
         self.interaction_mode = interaction_mode if interaction_mode in {"question", "work", "adjust"} else ""
@@ -140,6 +147,10 @@ class AgentLoop:
             state_dir=self.state_dir,
             git_root=benchmark_git_root,
             project_spec_path=self._active_project_spec_path(),
+            generate_requirements=self.generate_requirements,
+            ui_contract_validation=self.ui_contract_validation,
+            integration_contract_validation=self.integration_contract_validation,
+            system_validation=self.system_validation,
         )
         self.memory_retriever = MemoryRetriever.from_env(self.state_dir)
         self.orchestrator = Orchestrator(root, tasks_path=self.tasks_path, state_dir=self.state_dir)
@@ -149,6 +160,8 @@ class AgentLoop:
             benchmark_id=self.benchmark_id,
             state_dir=self.state_dir,
             final_validation_required=self.system_validation,
+            ui_contract_required=self.ui_contract_validation,
+            integration_contract_required=self.integration_contract_validation,
         )
         self.decision_maker = create_decision_maker(provider)
         self.verifier = Verifier(root, state_dir=self.state_dir)
@@ -388,6 +401,7 @@ class AgentLoop:
                 requirements_artifact=self._rel(self.requirements_path),
                 generated_tasks_artifact=self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json"),
                 init_artifact=self._rel(self.state_dir / "init.sh"),
+                generate_requirements=self.generate_requirements,
             )
         else:
             state = create_initial_state(self.task)
@@ -799,6 +813,9 @@ class AgentLoop:
                     "INIT finish rejected: only Verifier PASS may complete initialization.",
                     {"initializer_requires_verification": True, "counts_as_progress": False},
                 )
+            adjust_finish_gate = self._adjust_mode_finish_gate(state)
+            if adjust_finish_gate is not None:
+                return adjust_finish_gate
             if self.system_validation:
                 final_acceptance = self._ensure_final_acceptance_task_before_finish()
                 if final_acceptance is not None:
@@ -2157,15 +2174,17 @@ class AgentLoop:
 
     def _initializer_allowed_targets(self, state: TaskState | None = None) -> set[str]:
         targets = {
-            self._normalize_target(self._rel(self.requirements_path)),
             self._normalize_target(self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json")),
             self._normalize_target(self._rel(self.state_dir / "init.sh")),
         }
+        if self.generate_requirements:
+            targets.add(self._normalize_target(self._rel(self.requirements_path)))
         if self.project_spec_materialized_path:
             targets.add(self._normalize_target(self._rel(self.project_spec_materialized_path)))
         if state and state.initializer_repair:
             targets.add(self._normalize_target(self._rel(self.initializer_candidate_path)))
-            targets.add(self._normalize_target(self._rel(self.initializer_requirements_candidate_path)))
+            if self.generate_requirements:
+                targets.add(self._normalize_target(self._rel(self.initializer_requirements_candidate_path)))
         return targets
 
     def _validate_initializer_write_action(
@@ -2216,6 +2235,17 @@ class AgentLoop:
             )
             return None
         if target == requirements_target:
+            if not self.generate_requirements:
+                return ToolResult(
+                    False,
+                    "INIT write rejected: requirement generation is disabled for this run.",
+                    {
+                        "initializer_restricted": True,
+                        "target": target,
+                        "allowed_targets": sorted(allowed_targets),
+                        "counts_as_progress": False,
+                    },
+                )
             try:
                 data = json.loads(str(content))
             except json.JSONDecodeError as exc:
@@ -2296,6 +2326,8 @@ class AgentLoop:
                 {"initializer_validation_errors": errors, "counts_as_progress": False},
             )
         if target in {requirements_target, requirements_candidate_target}:
+            if not self.generate_requirements:
+                return None
             source_path = (
                 self.initializer_requirements_candidate_path
                 if target == requirements_candidate_target
@@ -2398,18 +2430,29 @@ class AgentLoop:
             )
         generated_path = self.generated_tasks_path or self.state_dir / "generated_tasks.json"
         try:
-            requirements_content = self.requirements_path.read_text(encoding="utf-8")
-            requirements_data = json.loads(requirements_content)
             data = json.loads(generated_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return ToolResult(
                 False,
-                f"Initializer verification failed: requirements.json or generated_tasks.json is invalid: {exc}.",
+                f"Initializer verification failed: generated_tasks.json is invalid: {exc}.",
                 {"initializer_validation_errors": [str(exc)]},
             )
+        requirements_content = ""
+        requirements_data = None
+        if self.generate_requirements:
+            try:
+                requirements_content = self.requirements_path.read_text(encoding="utf-8")
+                requirements_data = json.loads(requirements_content)
+            except (OSError, json.JSONDecodeError) as exc:
+                return ToolResult(
+                    False,
+                    f"Initializer verification failed: requirements.json is invalid: {exc}.",
+                    {"initializer_validation_errors": [str(exc)]},
+                )
         expected_workspace = self._expected_initializer_workspace_root()
-        errors = validate_requirements_matrix(requirements_data)
-        errors.extend(self._json_pretty_print_errors(requirements_content, requirements_data, "requirements.json"))
+        errors = validate_requirements_matrix(requirements_data) if self.generate_requirements else []
+        if self.generate_requirements:
+            errors.extend(self._json_pretty_print_errors(requirements_content, requirements_data, "requirements.json"))
         errors.extend(self._initializer_graph_errors(data, requirements_data=requirements_data))
         init_path = self.state_dir / "init.sh"
         try:
@@ -2428,7 +2471,7 @@ class AgentLoop:
             True,
             "Initializer artifacts passed deterministic validation.",
             {
-                "requirement_count": len(requirements_data["requirements"]),
+                "requirement_count": len(requirements_data["requirements"]) if self.generate_requirements and isinstance(requirements_data, dict) else 0,
                 "task_count": len(data["tasks"]),
                 "expected_workspace_root": expected_workspace,
             },
@@ -2537,10 +2580,11 @@ class AgentLoop:
     def _missing_initializer_artifacts(self) -> list[str]:
         paths = [
             self._active_project_spec_path(require_materialized=True) or self.state_dir / "project_spec.md",
-            self.requirements_path,
             self.generated_tasks_path or self.state_dir / "generated_tasks.json",
             self.state_dir / "init.sh",
         ]
+        if self.generate_requirements:
+            paths.insert(1, self.requirements_path)
         missing: list[str] = []
         for path in paths:
             try:
@@ -2574,7 +2618,7 @@ class AgentLoop:
         return "use only the python standard library" in spec or "standard library only" in spec
 
     def _initializer_graph_errors(self, data: object, requirements_data: object | None = None) -> list[str]:
-        if requirements_data is None:
+        if self.generate_requirements and requirements_data is None:
             try:
                 requirements_data = json.loads(self.requirements_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -2583,7 +2627,7 @@ class AgentLoop:
             data,
             self._expected_initializer_workspace_root(),
             standard_library_only=self._project_requires_standard_library(),
-            require_requirement_coverage=True,
+            require_requirement_coverage=self.generate_requirements,
             requirements_data=requirements_data,
             require_verification_plan=False,
         )
@@ -2683,7 +2727,7 @@ class AgentLoop:
             criteria = [
                 "Project acceptance test starts the application and exercises the primary user-visible workflows before finish."
             ]
-        validation_artifacts = self._ensure_final_acceptance_artifacts(criteria, requirements)
+        validation_artifacts = self._ensure_final_acceptance_artifacts(criteria, requirements, tasks)
         validation_command = self._final_acceptance_validation_command()
         dependency_ids = [
             str(task.get("id", "")).strip()
@@ -2729,11 +2773,23 @@ class AgentLoop:
         self,
         criteria: list[str],
         requirements: list[dict[str, Any]],
+        tasks: list[dict[str, Any]],
     ) -> list[str]:
         manifest = self.state_dir / "system_validation" / "final_acceptance_manifest.json"
         ui_contract_path = self.state_dir / "system_validation" / "ui_contract.json"
+        integration_contract_path = self.state_dir / "system_validation" / "integration_contract.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
-        write_ui_contract(ui_contract_path, requirements, provider=self.provider)
+        if self.ui_contract_validation:
+            write_ui_contract(ui_contract_path, requirements, provider=self.provider)
+        if self.integration_contract_validation:
+            write_integration_contract(
+                integration_contract_path,
+                tasks,
+                project_spec=self._integration_project_spec_text(),
+                requirements=requirements,
+                file_inventory=self._integration_file_inventory(),
+                provider=self.provider,
+            )
         payload = {
             "kind": "system_owned_final_acceptance",
             "validator": FINAL_ACCEPTANCE_VALIDATOR_MODULE,
@@ -2741,14 +2797,94 @@ class AgentLoop:
             "requirements": requirements,
             "tasks_path": self._rel(self.tasks_path) if self.tasks_path else "",
             "requirements_path": self._rel(self.requirements_path),
-            "ui_contract_path": self._rel(ui_contract_path),
+            "ui_contract_enabled": self.ui_contract_validation,
+            "integration_contract_enabled": self.integration_contract_validation,
             "created_by": "harness",
         }
+        if self.ui_contract_validation:
+            payload["ui_contract_path"] = self._rel(ui_contract_path)
+        if self.integration_contract_validation:
+            payload["integration_contract_path"] = self._rel(integration_contract_path)
         manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return [
-            self._normalize_target(self._rel(manifest)),
-            self._normalize_target(self._rel(ui_contract_path)),
-        ]
+        artifacts = [self._normalize_target(self._rel(manifest))]
+        if self.ui_contract_validation:
+            artifacts.append(self._normalize_target(self._rel(ui_contract_path)))
+        if self.integration_contract_validation:
+            artifacts.append(self._normalize_target(self._rel(integration_contract_path)))
+        return artifacts
+
+    def _integration_project_spec_text(self, max_chars: int = 20000) -> str:
+        candidates: list[Path] = []
+        active = self._active_project_spec_path(require_materialized=True) or self._active_project_spec_path()
+        if active:
+            candidates.append(active)
+        candidates.extend([self.state_dir / "project_spec.md", self.root / "project_spec.md"])
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path.resolve()) if path.is_absolute() else str((self.root / path).resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if path.is_file():
+                    text = path.read_text(encoding="utf-8").strip()
+                    if text:
+                        return text[:max_chars]
+            except OSError:
+                continue
+        return self.task.strip()[:max_chars]
+
+    def _integration_file_inventory(self, max_entries: int = 250) -> list[dict[str, Any]]:
+        roots: list[Path] = []
+        expected_workspace = self._expected_initializer_workspace_root()
+        if expected_workspace:
+            workspace = (self.root / expected_workspace).resolve()
+            if workspace.exists():
+                roots.append(workspace)
+        if not roots and self.benchmark_id:
+            workspace = (self.root / "eval" / "benchmarks" / self.benchmark_id / "workspace").resolve()
+            if workspace.exists():
+                roots.append(workspace)
+        if not roots:
+            roots.append(self.root.resolve())
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        ignored_parts = {
+            ".git",
+            ".agents",
+            ".codex",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tmp_tests",
+            ".venv",
+            "__pycache__",
+            "node_modules",
+            "state",
+        }
+        for base in roots:
+            try:
+                iterator = base.rglob("*")
+            except OSError:
+                continue
+            for path in sorted(iterator):
+                if len(entries) >= max_entries:
+                    return entries
+                rel = self._normalize_target(self._rel(path))
+                parts = set(Path(rel).parts)
+                if parts & ignored_parts:
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                entries.append({"path": rel, "size_bytes": size})
+        return entries
 
     def _final_acceptance_validation_command(self) -> str:
         argv = [
@@ -2763,6 +2899,10 @@ class AgentLoop:
             argv.extend(["--tasks-path", self._normalize_target(self._rel(self.tasks_path))])
         if self.benchmark_id:
             argv.extend(["--benchmark-id", self.benchmark_id])
+        if not self.ui_contract_validation:
+            argv.append("--no-ui-contract")
+        if self.integration_contract_validation:
+            argv.append("--integration-contract")
         root_literal = repr(self._normalize_target(str(self.root.resolve())))
         argv_literal = repr(argv)
         return (
@@ -3304,7 +3444,8 @@ class AgentLoop:
                 False,
                 (
                     "Write rejected: FINAL_ACCEPTANCE uses system-owned validation artifacts. "
-                    "Only implementation repair targets inferred from a failed validation run are writable."
+                    "Agents may read validation manifest, contract, and result JSON files as diagnostics, but must not manually edit them. "
+                    "Result files are regenerated by the final validation command; only implementation repair targets inferred from a failed validation run are writable."
                 ),
                 {
                     "final_acceptance_read_only": True,
@@ -3344,14 +3485,13 @@ class AgentLoop:
             return False
         if not self._has_final_acceptance_scope(state):
             return False
-        workspace_root = self._expected_initializer_workspace_root()
-        if not workspace_root:
+        workspace_path = self._adjust_workspace_root_path()
+        if workspace_path is None:
             return False
         target = self._normalize_target(action.get("target", ""))
         if not target:
             return False
         try:
-            workspace_path = (self.root / workspace_root).resolve()
             target_path = (self.root / target).resolve()
             target_path.relative_to(workspace_path)
         except (OSError, ValueError):
@@ -3393,6 +3533,229 @@ class AgentLoop:
                 "required_action": "verify_or_final_validation",
             },
         )
+
+    def _adjust_mode_finish_gate(self, state: TaskState) -> ToolResult | None:
+        if state.interaction_mode != "adjust":
+            return None
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        if repair.get("reason") == "adjust_mode_user_reported_defect":
+            return ToolResult(
+                False,
+                (
+                    "Finish rejected: adjust-mode workspace repair has not been validated. "
+                    "Run verifier or the final validation command before finishing."
+                ),
+                {
+                    "adjust_repair_pending_validation": True,
+                    "repair_targets": self._pending_repair_write_targets(state),
+                    "required_action": "verify_or_final_validation",
+                    "counts_as_progress": False,
+                },
+            )
+        created = self._ensure_adjust_repair_task(state)
+        if created is not None:
+            self._apply_orchestrator_selection(state)
+            self._write_state(state)
+            return ToolResult(
+                False,
+                "Finish rejected: adjust-mode repair task was created and selected. Implement the requested repair before finishing.",
+                {
+                    "adjust_repair_task_created": True,
+                    "task_id": created.get("id"),
+                    "repair_targets": created.get("implementation_artifacts", []),
+                    "verification_commands": created.get("verification_commands", []),
+                },
+            )
+        return ToolResult(
+            False,
+            (
+                "Finish rejected: adjust mode has an outstanding user-requested change. "
+                "Make the targeted implementation edit, run a targeted validation command, or answer with a concrete conflict before finishing."
+            ),
+            {
+                "adjust_change_not_applied": True,
+                "required_action": "write_or_edit_or_answer",
+                "counts_as_progress": False,
+            },
+        )
+
+    def _ensure_adjust_repair_task(self, state: TaskState) -> dict[str, Any] | None:
+        if not self.tasks_path:
+            return None
+        try:
+            data = json.loads(self.tasks_path.read_text(encoding="utf-8")) if self.tasks_path.exists() else {"tasks": []}
+        except (OSError, json.JSONDecodeError):
+            return None
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        if not isinstance(tasks, list):
+            return None
+        existing = next(
+            (
+                task
+                for task in tasks
+                if isinstance(task, dict)
+                and str(task.get("id", "")).startswith("ADJUST_REPAIR")
+                and self._task_status(task) in {"pending", "in_progress", "awaiting_verification"}
+            ),
+            None,
+        )
+        if isinstance(existing, dict):
+            return existing
+        targets = self._infer_adjust_repair_targets(state)
+        if not targets:
+            return None
+        completed_dependencies = [
+            str(task.get("id", "")).strip()
+            for task in tasks
+            if isinstance(task, dict)
+            and str(task.get("id", "")).strip()
+            and str(task.get("id", "")).strip() != FINAL_ACCEPTANCE_TASK_ID
+            and task.get("optional") is not True
+            and self._task_status(task) in {"completed", "done"}
+        ]
+        next_index = 1
+        existing_ids = {str(task.get("id", "")) for task in tasks if isinstance(task, dict)}
+        while f"ADJUST_REPAIR-{next_index:02d}" in existing_ids:
+            next_index += 1
+        task_id = f"ADJUST_REPAIR-{next_index:02d}"
+        title = "Repair user-requested generated application defect"
+        verification_commands = self._adjust_repair_verification_commands(targets)
+        task = {
+            "id": task_id,
+            "title": title,
+            "priority": self._next_adjust_repair_priority(tasks),
+            "depends_on": completed_dependencies,
+            "status": "pending",
+            "optional": False,
+            "adjust_repair": True,
+            "requirement_ids": [],
+            "acceptance_criteria": [
+                "The user-requested generated application defect is fixed in the real implementation code.",
+                "The repair updates actual interfaces, callbacks, service calls, persistence, or workflow behavior rather than comments or validation-shaped text.",
+                "A targeted verification command demonstrates the repaired behavior or imports the repaired module successfully.",
+            ],
+            "expected_artifacts": targets,
+            "implementation_artifacts": targets,
+            "worker_test_artifacts": [],
+            "acceptance_artifacts": [],
+            "frozen_acceptance_artifacts": [],
+            "test_policy": {
+                "worker_tests_mutable_by_worker": True,
+                "acceptance_tests_mutable_by_worker": False,
+                "acceptance_test_repair_requires_verifier_approval": True,
+            },
+            "verification_commands": verification_commands,
+            "verification_assets": [],
+            "criterion_command_map": {
+                "The user-requested generated application defect is fixed in the real implementation code.": verification_commands,
+                "The repair updates actual interfaces, callbacks, service calls, persistence, or workflow behavior rather than comments or validation-shaped text.": verification_commands,
+                "A targeted verification command demonstrates the repaired behavior or imports the repaired module successfully.": verification_commands,
+            },
+            "created_by": "harness_adjust_repair",
+        }
+        tasks.append(task)
+        data["tasks"] = tasks
+        self.tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        self.tasks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return task
+
+    def _next_adjust_repair_priority(self, tasks: list[Any]) -> int:
+        priorities: list[int] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            try:
+                priorities.append(int(task.get("priority", 0)))
+            except (TypeError, ValueError):
+                continue
+        return (max(priorities) + 1) if priorities else 1000
+
+    def _infer_adjust_repair_targets(self, state: TaskState) -> list[str]:
+        candidates: list[str] = []
+        candidates.extend(self._active_task_implementation_artifacts(state))
+        candidates.extend(self._state_node_workspace_implementation_artifacts(state))
+        repair = state.pending_repair if isinstance(state.pending_repair, dict) else {}
+        for key in ("repair_targets", "targets"):
+            values = repair.get(key, [])
+            if isinstance(values, list):
+                candidates.extend(str(item) for item in values)
+        for message in self.conversation_messages:
+            content = str(message.get("content", ""))
+            candidates.extend(self._workspace_targets_from_text(content))
+        if not candidates:
+            for message in self.conversation_messages:
+                candidates.extend(self._workspace_targets_for_filenames(str(message.get("content", ""))))
+        targets: list[str] = []
+        for target in candidates:
+            normalized = self._normalize_target(target)
+            if (
+                normalized
+                and self._is_under_adjust_workspace(normalized)
+                and Path(normalized).suffix.lower() == ".py"
+                and normalized not in targets
+            ):
+                targets.append(normalized)
+        return targets[:8]
+
+    def _state_node_workspace_implementation_artifacts(self, state: TaskState) -> list[str]:
+        targets: list[str] = []
+        for node in state.nodes:
+            if not isinstance(node, dict):
+                continue
+            for target in self._format_artifacts(node.get("implementation_artifacts", [])):
+                normalized = self._normalize_target(target)
+                if normalized and self._is_under_adjust_workspace(normalized) and normalized not in targets:
+                    targets.append(normalized)
+        return targets
+
+    def _workspace_targets_from_text(self, text: str) -> list[str]:
+        normalized_text = text.replace("\\", "/")
+        matches = re.findall(
+            r"(?:eval/benchmarks/[^/\s]+/workspace|workspace)/[A-Za-z0-9_./-]+\.py",
+            normalized_text,
+        )
+        targets = list(matches)
+        targets.extend(self._workspace_targets_for_filenames(text))
+        return targets
+
+    def _workspace_targets_for_filenames(self, text: str) -> list[str]:
+        names = list(dict.fromkeys(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b", text)))
+        if not names:
+            return []
+        workspace = self._adjust_workspace_root_path()
+        if workspace is None or not workspace.exists():
+            return []
+        targets: list[str] = []
+        for name in names:
+            for path in sorted(workspace.rglob(name)):
+                if path.is_file():
+                    targets.append(self._normalize_target(self._rel(path)))
+        return targets
+
+    def _adjust_workspace_root_path(self) -> Path | None:
+        workspace_root = self._expected_initializer_workspace_root()
+        if workspace_root:
+            return (self.root / workspace_root).resolve()
+        if self.benchmark_id:
+            return (self.root / "eval" / "benchmarks" / self.benchmark_id / "workspace").resolve()
+        return None
+
+    def _is_under_adjust_workspace(self, target: str) -> bool:
+        workspace = self._adjust_workspace_root_path()
+        if workspace is None:
+            return "/workspace/" in target or target.startswith("workspace/")
+        try:
+            (self.root / target).resolve().relative_to(workspace)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _adjust_repair_verification_commands(self, targets: list[str]) -> list[str]:
+        py_targets = [target for target in targets if target.endswith(".py")]
+        if py_targets:
+            quoted = " ".join("'" + target.replace("\\", "/").replace("'", "''") + "'" for target in py_targets)
+            return [f"python -m py_compile {quoted}"]
+        return ["python -c \"assert True\""]
 
     def _pending_managed_contract_for_active_task(self, state: TaskState) -> dict[str, Any] | None:
         active = self._active_task_id(state)
@@ -3790,14 +4153,14 @@ class AgentLoop:
             artifacts.extend(str(item) for item in active_node.get("expected_artifacts", []) if str(item).strip())
             artifacts.extend(str(item) for item in active_node.get("implementation_artifacts", []) if str(item).strip())
         if self._is_initializer_task(state):
-            artifacts.extend(
-                [
-                    self._rel(self._active_project_spec_path(require_materialized=True) or self.state_dir / "project_spec.md"),
-                    self._rel(self.requirements_path),
-                    self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json"),
-                    self._rel(self.state_dir / "init.sh"),
-                ]
-            )
+            initializer_artifacts = [
+                self._rel(self._active_project_spec_path(require_materialized=True) or self.state_dir / "project_spec.md"),
+                self._rel(self.generated_tasks_path or self.state_dir / "generated_tasks.json"),
+                self._rel(self.state_dir / "init.sh"),
+            ]
+            if self.generate_requirements:
+                initializer_artifacts.insert(1, self._rel(self.requirements_path))
+            artifacts.extend(initializer_artifacts)
 
         seen: set[str] = set()
         entries: list[dict[str, Any]] = []
@@ -3849,6 +4212,8 @@ class AgentLoop:
         return lines or ["- none"]
 
     def _handoff_requirement_summary(self) -> dict[str, Any]:
+        if not self.generate_requirements:
+            return {"path": self._rel(self.requirements_path), "status": "disabled", "requirements": [], "must_requirement_ids": []}
         path = self.requirements_path
         if not path.exists():
             return {"path": self._rel(path), "status": "missing", "requirements": [], "must_requirement_ids": []}
@@ -4064,10 +4429,19 @@ class AgentLoop:
         if not self.project_spec_path or not self.generated_tasks_path:
             return False
         init_path = self.state_dir / "init.sh"
-        if not self.requirements_path.exists() or not self.generated_tasks_path.exists() or not init_path.exists():
+        if (
+            (self.generate_requirements and not self.requirements_path.exists())
+            or not self.generated_tasks_path.exists()
+            or not init_path.exists()
+        ):
             return True
+        requirements_data = None
+        if self.generate_requirements:
+            try:
+                requirements_data = json.loads(self.requirements_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return True
         try:
-            requirements_data = json.loads(self.requirements_path.read_text(encoding="utf-8"))
             data = json.loads(self.generated_tasks_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return True
@@ -4075,11 +4449,10 @@ class AgentLoop:
             init_content = init_path.read_text(encoding="utf-8")
         except OSError:
             return True
-        return bool(
-            validate_requirements_matrix(requirements_data)
-            or self._initializer_graph_errors(data, requirements_data=requirements_data)
-            or self._initializer_script_errors(init_content)
-        )
+        errors = validate_requirements_matrix(requirements_data) if self.generate_requirements else []
+        errors.extend(self._initializer_graph_errors(data, requirements_data=requirements_data))
+        errors.extend(self._initializer_script_errors(init_content))
+        return bool(errors)
 
     @staticmethod
     def _trace_name() -> str:

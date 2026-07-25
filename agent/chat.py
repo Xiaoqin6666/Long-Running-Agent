@@ -53,6 +53,9 @@ class ChatConfig:
     auto_resume: bool = False
     max_sessions: int = 1
     system_validation: bool = True
+    ui_contract_validation: bool = True
+    integration_contract_validation: bool = False
+    generate_requirements: bool = True
     initial_message: str | None = None
 
 
@@ -732,6 +735,9 @@ class InteractiveCLI:
             auto_resume=self.config.auto_resume,
             max_sessions=self.config.max_sessions,
             system_validation=self.config.system_validation,
+            ui_contract_validation=self.config.ui_contract_validation,
+            integration_contract_validation=self.config.integration_contract_validation,
+            generate_requirements=self.config.generate_requirements,
             event_handler=self._show_event,
             conversation_messages=(
                 [
@@ -761,7 +767,7 @@ class InteractiveCLI:
         target = str(event.get("target", ""))
         detail = f" {target}" if target else ""
         verb = "calling" if action in TOOL_ACTIONS else "action"
-        self.output(self._paint(f"      {verb} {action}{detail}", "gray"))
+        self.output(self._paint(f"      {verb} {action}{detail}", "green"))
 
     def _finish_turn(self, result: RunResult) -> None:
         self.last_result = result

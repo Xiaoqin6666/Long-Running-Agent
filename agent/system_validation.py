@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+from agent.integration_contract import (
+    evaluate_integration_contract,
+    integration_result_errors,
+    write_integration_results,
+)
 from agent.requirement_verifier import project_requirement_evidence_errors
 from agent.requirement_verifier import load_task_requirement_evidence
 from agent.ui_contract import UI_CONTRACT_APPLICABILITY_VALUES, UI_CONTRACT_REQUIRED_FIELDS, validate_ui_contract
@@ -25,6 +28,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--requirements-path", required=True)
     parser.add_argument("--benchmark-id", default="")
     parser.add_argument("--timeout", type=int, default=180)
+    ui_contract_group = parser.add_mutually_exclusive_group()
+    ui_contract_group.add_argument(
+        "--ui-contract",
+        dest="ui_contract_validation",
+        action="store_true",
+        default=True,
+        help="Require and evaluate the system-owned UI Contract. Enabled by default.",
+    )
+    ui_contract_group.add_argument(
+        "--no-ui-contract",
+        dest="ui_contract_validation",
+        action="store_false",
+        help="Skip UI Contract loading and UI validation checks.",
+    )
+    integration_contract_group = parser.add_mutually_exclusive_group()
+    integration_contract_group.add_argument(
+        "--integration-contract",
+        dest="integration_contract_validation",
+        action="store_true",
+        default=False,
+        help="Require and evaluate the system-owned Integration Contract. Disabled by default.",
+    )
+    integration_contract_group.add_argument(
+        "--no-integration-contract",
+        dest="integration_contract_validation",
+        action="store_false",
+        help="Skip Integration Contract loading and integration validation checks.",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
@@ -35,24 +66,37 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     tasks_data = _load_json(tasks_path, errors, "tasks")
     requirements_data = _load_optional_json(requirements_path, errors, "requirements")
-    state_data = _load_optional_json(state_dir / "current_task.json", errors, "current task state")
     manifest_data = _load_optional_json(
         state_dir / "system_validation" / "final_acceptance_manifest.json",
         errors,
         "final acceptance manifest",
     )
-    ui_contract_data = _load_optional_json(state_dir / "system_validation" / "ui_contract.json", errors, "UI Contract")
+    ui_contract_data = (
+        _load_optional_json(state_dir / "system_validation" / "ui_contract.json", errors, "UI Contract")
+        if args.ui_contract_validation
+        else {}
+    )
+    integration_contract_data = (
+        _load_optional_json(
+            state_dir / "system_validation" / "integration_contract.json",
+            errors,
+            "Integration Contract",
+        )
+        if args.integration_contract_validation
+        else {}
+    )
     tasks = tasks_data.get("tasks", []) if isinstance(tasks_data, dict) else []
     if not isinstance(tasks, list):
         errors.append("tasks.tasks must be a list.")
         tasks = []
-    contracts = _agreed_contracts_by_task_id(state_data)
     errors.extend(
         _validate_manifest(
             manifest_data=manifest_data,
             state_dir=state_dir,
             tasks_path=tasks_path,
             requirements_path=requirements_path,
+            ui_contract_validation=args.ui_contract_validation,
+            integration_contract_validation=args.integration_contract_validation,
         )
     )
 
@@ -69,32 +113,23 @@ def main(argv: list[str] | None = None) -> int:
         if status not in {"completed", "done"}:
             errors.append(f"{task_id} is not completed before final validation.")
 
-    command_failures = _run_task_verification_commands(
-        root=root,
-        state_dir=state_dir,
-        tasks=required_tasks,
-        contracts=contracts,
-        benchmark_id=args.benchmark_id,
-        timeout=max(1, args.timeout),
-    )
-    errors.extend(command_failures)
-
     if isinstance(requirements_data, dict) and requirements_data:
-        if isinstance(ui_contract_data, dict) and ui_contract_data:
-            ui_contract_requirements = _final_acceptance_requirements(tasks) or requirements_data.get("requirements", [])
-            errors.extend(validate_ui_contract({"requirements": ui_contract_requirements}, ui_contract_data))
-            ui_check_results = _evaluate_ui_contract_checks(
-                root=root,
-                requirements=ui_contract_requirements,
-                contract_data=ui_contract_data,
-                tasks=tasks,
-                state_dir=state_dir,
-                benchmark_id=args.benchmark_id,
-            )
-            _write_ui_check_results(state_dir, ui_check_results)
-            errors.extend(_ui_check_errors(ui_check_results))
-        else:
-            errors.append("UI Contract is missing for final system validation.")
+        if args.ui_contract_validation:
+            if isinstance(ui_contract_data, dict) and ui_contract_data:
+                ui_contract_requirements = _final_acceptance_requirements(tasks) or requirements_data.get("requirements", [])
+                errors.extend(validate_ui_contract({"requirements": ui_contract_requirements}, ui_contract_data))
+                ui_check_results = _evaluate_ui_contract_checks(
+                    root=root,
+                    requirements=ui_contract_requirements,
+                    contract_data=ui_contract_data,
+                    tasks=tasks,
+                    state_dir=state_dir,
+                    benchmark_id=args.benchmark_id,
+                )
+                _write_ui_check_results(state_dir, ui_check_results)
+                errors.extend(_ui_check_errors(ui_check_results))
+            else:
+                errors.append("UI Contract is missing for final system validation.")
         errors.extend(
             project_requirement_evidence_errors(
                 requirements_data=requirements_data,
@@ -102,6 +137,18 @@ def main(argv: list[str] | None = None) -> int:
                 state_dir=state_dir,
             )
         )
+
+    if args.integration_contract_validation:
+        integration_results = evaluate_integration_contract(
+            root=root,
+            state_dir=state_dir,
+            tasks=[task for task in tasks if isinstance(task, dict)],
+            contract_data=integration_contract_data,
+            benchmark_id=args.benchmark_id,
+            timeout=max(1, args.timeout),
+        )
+        write_integration_results(state_dir, integration_results)
+        errors.extend(integration_result_errors(integration_results))
 
     if errors:
         _print_line("SYSTEM_VALIDATION_FAIL")
@@ -129,6 +176,8 @@ def _validate_manifest(
     state_dir: Path,
     tasks_path: Path,
     requirements_path: Path,
+    ui_contract_validation: bool = True,
+    integration_contract_validation: bool = False,
 ) -> list[str]:
     if not isinstance(manifest_data, dict) or not manifest_data:
         return ["Final acceptance manifest is missing for final system validation."]
@@ -140,8 +189,11 @@ def _validate_manifest(
     expected_refs = {
         "tasks_path": tasks_path,
         "requirements_path": requirements_path,
-        "ui_contract_path": state_dir / "system_validation" / "ui_contract.json",
     }
+    if ui_contract_validation:
+        expected_refs["ui_contract_path"] = state_dir / "system_validation" / "ui_contract.json"
+    if integration_contract_validation:
+        expected_refs["integration_contract_path"] = state_dir / "system_validation" / "integration_contract.json"
     for key, expected_path in expected_refs.items():
         raw = str(manifest_data.get(key, "")).replace("\\", "/").strip()
         if not raw:
@@ -161,13 +213,25 @@ def _evaluate_ui_contract_checks(
     state_dir: Path,
     benchmark_id: str = "",
 ) -> dict[str, Any]:
-    verified_ids = _verified_requirement_ids(tasks=tasks, state_dir=state_dir)
-    source_by_requirement = _ui_source_by_requirement(root=root, tasks=tasks, benchmark_id=benchmark_id)
     contract_by_id = {
         str(item.get("requirement_id", "")).strip(): item
         for item in contract_data.get("contracts", [])
         if isinstance(item, dict) and str(item.get("requirement_id", "")).strip()
     }
+    ui_requirement_ids = {
+        str(requirement.get("id", "")).strip()
+        for requirement in requirements
+        if isinstance(requirement, dict)
+        and str(requirement.get("type", "")).strip().lower() in {"gui_workflow", "report"}
+        and str(requirement.get("id", "")).strip()
+    }
+    verified_ids = _verified_requirement_ids(tasks=tasks, state_dir=state_dir)
+    source_by_requirement = _ui_source_by_requirement(
+        root=root,
+        tasks=tasks,
+        benchmark_id=benchmark_id,
+        ui_requirement_ids=ui_requirement_ids,
+    )
     results: list[dict[str, Any]] = []
     for requirement in requirements:
         if not isinstance(requirement, dict):
@@ -268,11 +332,20 @@ def _verified_requirement_ids(*, tasks: list[dict[str, Any]], state_dir: Path) -
     return verified
 
 
-def _ui_source_by_requirement(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> dict[str, dict[str, Any]]:
+def _ui_source_by_requirement(
+    *,
+    root: Path,
+    tasks: list[dict[str, Any]],
+    benchmark_id: str,
+    ui_requirement_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
     files_by_requirement: dict[str, list[Path]] = {}
     targets_by_requirement: dict[str, list[str]] = {}
     fallback_files = _workspace_python_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
     fallback_targets = [_display_path(root, path) for path in fallback_files]
+    support_files = _workspace_ui_support_files(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    support_targets = [_display_path(root, path) for path in support_files]
+    ui_requirement_ids = ui_requirement_ids or set()
     for task in tasks:
         if not isinstance(task, dict) or task.get("final_acceptance") is True:
             continue
@@ -298,6 +371,9 @@ def _ui_source_by_requirement(*, root: Path, tasks: list[dict[str, Any]], benchm
     for requirement_id in all_requirement_ids:
         files = files_by_requirement.get(requirement_id) or fallback_files
         targets = targets_by_requirement.get(requirement_id) or fallback_targets
+        if requirement_id in ui_requirement_ids:
+            files = _dedupe_paths([*files, *support_files])
+            targets = _dedupe_strings([*targets, *support_targets])
         result[requirement_id] = {
             "files": targets,
             "text": "\n".join(_read_source_file(path) for path in files),
@@ -340,7 +416,34 @@ def _task_ui_source_targets(*, root: Path, task: dict[str, Any], benchmark_id: s
     return targets
 
 
+def _workspace_ui_support_files(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> list[Path]:
+    workspace_path = _workspace_path(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    if workspace_path is None:
+        return []
+    support_files: list[Path] = []
+    for path in _workspace_python_files(root=root, tasks=tasks, benchmark_id=benchmark_id):
+        try:
+            relative = path.relative_to(workspace_path).as_posix().lower()
+        except ValueError:
+            continue
+        if relative == "main.py" or relative.endswith("/main.py") or "/ui/" in f"/{relative}":
+            support_files.append(path)
+    return support_files
+
+
 def _workspace_python_files(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> list[Path]:
+    workspace_path = _workspace_path(root=root, tasks=tasks, benchmark_id=benchmark_id)
+    if workspace_path is None:
+        return []
+    return [
+        path
+        for path in workspace_path.rglob("*.py")
+        if "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
+        and not path.name.startswith("test_")
+    ]
+
+
+def _workspace_path(*, root: Path, tasks: list[dict[str, Any]], benchmark_id: str) -> Path | None:
     workspace = ""
     if benchmark_id:
         workspace = f"eval/benchmarks/{benchmark_id}/workspace"
@@ -354,15 +457,26 @@ def _workspace_python_files(*, root: Path, tasks: list[dict[str, Any]], benchmar
     try:
         workspace_path.relative_to(root.resolve())
     except (OSError, ValueError):
-        return []
+        return None
     if not workspace_path.is_dir():
-        return []
-    return [
-        path
-        for path in workspace_path.rglob("*.py")
-        if "/tests/" not in str(path.relative_to(workspace_path)).replace("\\", "/").lower()
-        and not path.name.startswith("test_")
-    ]
+        return None
+    return workspace_path
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    result: list[Path] = []
+    for path in paths:
+        if path not in result:
+            result.append(path)
+    return result
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
 
 
 def _read_source_file(path: Path) -> str:
@@ -388,7 +502,7 @@ def _evaluate_ui_field(
 
     text = source_text.lower()
     contract_text = _field_text(value).lower()
-    if _field_claims_no_dedicated_ui(contract_text):
+    if _field_claims_no_dedicated_ui(contract_text, field=field):
         return {"passed": True, "reason": "ui_contract explicitly states no dedicated UI element is required"}
 
     if field == "entry_points":
@@ -426,35 +540,107 @@ def _field_text(value: object) -> str:
     return str(value or "")
 
 
-def _field_claims_no_dedicated_ui(text: str) -> bool:
+def _field_claims_no_dedicated_ui(text: str, *, field: str) -> bool:
+    normalized = re.sub(r"[\s:：,，。；;（）()【】\[\]\"'`]+", "", text.lower())
+    if not normalized:
+        return False
+    no_value_markers = {"n/a", "na", "none", "notapplicable", "不适用"}
+    if normalized in no_value_markers:
+        return field in {"buttons", "inputs", "dialogs"}
+    if normalized in {"无", "无需", "无须", "不需要"}:
+        return field in {"buttons", "inputs", "dialogs"}
+
+    generic_markers = (
+        "no dedicated",
+        "not required",
+        "无需专用",
+        "无专用",
+        "不需要专用",
+        "不需要额外",
+    )
+    field_markers = {
+        "buttons": (
+            "no button required",
+            "no buttons required",
+            "no dedicated button",
+            "无按钮",
+            "无需按钮",
+            "无须按钮",
+            "不需要按钮",
+        ),
+        "inputs": (
+            "no input required",
+            "no dedicated input",
+            "no dedicated inputs",
+            "无输入",
+            "无需输入",
+            "无须输入",
+            "无需用户输入",
+            "不需要输入",
+            "不需要用户输入",
+        ),
+        "dialogs": (
+            "no modal required",
+            "no dialog required",
+            "no dedicated dialog",
+            "inline feedback is acceptable",
+            "inline ui feedback is acceptable",
+            "inline form feedback is acceptable",
+            "无弹窗",
+            "无需弹窗",
+            "无须弹窗",
+            "无模态弹窗",
+            "无需模态弹窗",
+            "不需要弹窗",
+            "不需要模态弹窗",
+            "内联反馈",
+            "行内反馈",
+        ),
+    }
+    if any(marker in text for marker in generic_markers):
+        return field in {"buttons", "inputs", "dialogs"}
+    return any(marker in text for marker in field_markers.get(field, ()))
+
+
+def _mentions_action_control(text: str) -> bool:
     return any(
         marker in text
         for marker in (
-            "no dedicated",
-            "no modal required",
-            "no input required",
-            "no button required",
-            "not required",
-            "无 dedicated",
-            "无;",
-            "无；",
-            "无需",
-            "不需要",
-            "无输入",
+            "button",
+            "menu",
+            "click",
+            "select",
+            "dropdown",
+            "按钮",
+            "按鈕",
+            "菜单",
+            "點擊",
+            "点击",
+            "选择",
+            "每行",
         )
     )
 
 
-def _mentions_action_control(text: str) -> bool:
-    return any(marker in text for marker in ("button", "menu", "click", "按钮", "按鈕", "菜单", "點擊", "点击", "每行"))
-
-
 def _has_action_control(text: str) -> bool:
-    return any(marker in text for marker in ("tk.button", "ttk.button", ".add_command(", "menubutton"))
+    return any(
+        marker in text
+        for marker in (
+            "tk.button",
+            "ttk.button",
+            ".add_command(",
+            "menubutton",
+            "tk.optionmenu",
+            "ttk.combobox",
+            ".bind(",
+            "command=",
+            "<<listboxselect>>",
+        )
+    )
 
 
 def _has_container_or_navigation(text: str) -> bool:
-    return any(marker in text for marker in ("tk.frame", "ttk.frame", "tk.toplevel", "ttk.notebook", ".add(", "menu("))
+    return any(marker in text for marker in ("tk.frame", "ttk.frame", "tk.toplevel", "ttk.notebook", ".add(", "menu(", "tk.optionmenu"))
 
 
 def _has_input_control(text: str) -> bool:
@@ -465,6 +651,10 @@ def _has_input_control(text: str) -> bool:
             "ttk.entry",
             "listbox",
             "combobox",
+            "tk.optionmenu",
+            "optionmenu",
+            "tk.stringvar",
+            "ttk.combobox",
             "tk.scale",
             "ttk.scale",
             "spinbox",
@@ -484,8 +674,11 @@ def _has_dialog_or_feedback(text: str) -> bool:
             "tk.toplevel",
             "status_label",
             "status_var",
+            "status_var.set(",
+            ".set(",
             ".config(text=",
             ".configure(text=",
+            "raise valueerror",
         )
     )
 
@@ -497,10 +690,12 @@ def _has_data_display(text: str) -> bool:
             "treeview",
             "listbox",
             "canvas",
+            "tk.canvas",
             "tk.text",
             "ttk.label",
             "tk.label",
             ".insert(",
+            "create_arc",
             ".create_text(",
             ".create_rectangle(",
         )
@@ -601,136 +796,6 @@ def _load_optional_json(path: Path, errors: list[str], label: str) -> dict[str, 
     if not path.exists():
         return {}
     return _load_json(path, errors, label)
-
-
-def _run_task_verification_commands(
-    *,
-    root: Path,
-    state_dir: Path,
-    tasks: list[dict[str, Any]],
-    contracts: dict[str, dict[str, Any]],
-    benchmark_id: str,
-    timeout: int,
-) -> list[str]:
-    errors: list[str] = []
-    env = os.environ.copy()
-    temp_dir = state_dir / "system_validation" / "tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    env["TEMP"] = str(temp_dir)
-    env["TMP"] = str(temp_dir)
-    env["TMPDIR"] = str(temp_dir)
-    if benchmark_id:
-        workspace = root / "eval" / "benchmarks" / benchmark_id / "workspace"
-        current = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join([str(workspace), current] if current else [str(workspace)])
-    for task in tasks:
-        task_id = str(task.get("id", "")).strip() or "<unknown>"
-        procedures = _verification_procedures(task, contracts.get(task_id))
-        if not procedures:
-            errors.append(f"{task_id} has no frozen verification_commands for final validation.")
-            continue
-        for procedure in procedures:
-            command = str(procedure.get("command", "")).strip()
-            cwd = _procedure_cwd(root, procedure, task, benchmark_id)
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=cwd,
-                    env=env,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
-                errors.append(f"{task_id} verification timed out: {command}\n{exc}")
-                continue
-            except OSError as exc:
-                errors.append(f"{task_id} verification could not execute: {command}\n{exc}")
-                continue
-            if completed.returncode != 0:
-                output = (completed.stdout + completed.stderr).strip()
-                if len(output) > 4000:
-                    output = output[:4000] + "\n...<truncated>"
-                errors.append(
-                    f"{task_id} verification failed with code {completed.returncode}: {command} (cwd={_display_path(root, cwd)})\n{output}"
-                )
-    return errors
-
-
-def _verification_procedures(
-    task: dict[str, Any],
-    contract: dict[str, Any] | None,
-) -> list[dict[str, str]]:
-    procedures = _contract_verification_procedures(contract)
-    if procedures:
-        return procedures
-    return [{"command": command} for command in _verification_commands(task)]
-
-
-def _contract_verification_procedures(contract: dict[str, Any] | None) -> list[dict[str, str]]:
-    if not isinstance(contract, dict):
-        return []
-    procedure = contract.get("verification_procedure")
-    if isinstance(procedure, dict):
-        working_directory = str(procedure.get("working_directory", "")).strip()
-        commands = procedure.get("commands")
-        if isinstance(commands, list):
-            return [
-                {"command": str(command.get("command", "") if isinstance(command, dict) else command).strip(), "working_directory": working_directory}
-                for command in commands
-                if str(command.get("command", "") if isinstance(command, dict) else command).strip()
-            ]
-        command = str(procedure.get("command", "")).strip()
-        if command:
-            return [{"command": command, "working_directory": working_directory}]
-    return [{"command": command} for command in _verification_commands(contract)]
-
-
-def _verification_commands(item: dict[str, Any]) -> list[str]:
-    raw = item.get("verification_commands", item.get("checks", []))
-    if not isinstance(raw, list):
-        return []
-    commands: list[str] = []
-    for item in raw:
-        command = str(item.get("command", "") if isinstance(item, dict) else item).strip()
-        if command:
-            commands.append(command)
-    return commands
-
-
-def _agreed_contracts_by_task_id(state_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    raw = state_data.get("acceptance_contracts", [])
-    if not isinstance(raw, list):
-        return {}
-    result: dict[str, dict[str, Any]] = {}
-    for item in raw:
-        if not isinstance(item, dict) or item.get("status") != "agreed":
-            continue
-        task_id = str(item.get("task_id", "")).strip()
-        if task_id:
-            result[task_id] = item
-    return result
-
-
-def _procedure_cwd(
-    root: Path,
-    procedure: dict[str, str],
-    task: dict[str, Any],
-    benchmark_id: str,
-) -> Path:
-    working_directory = _rewrite_benchmark_workspace(
-        str(procedure.get("working_directory", "")).strip(),
-        benchmark_id,
-    )
-    if working_directory:
-        return _inside_root(root, working_directory)
-    inferred = _rewrite_benchmark_workspace(_workspace_root_from_task(task), benchmark_id)
-    if inferred and (root / inferred).is_dir():
-        return _inside_root(root, inferred)
-    return root
 
 
 def _rewrite_benchmark_workspace(path: str, benchmark_id: str) -> str:

@@ -60,6 +60,8 @@ Rules:
 - Set ui_applicability='required' only when this requirement has direct user-facing UI that must be checked against the fields below.
 - Set ui_applicability='indirect' when the requirement is business/service/persistence behavior that is triggered or surfaced through UI, but should not require every widget category below.
 - Set ui_applicability='not_applicable' when the requirement has no meaningful UI surface; use ui_surface='none'.
+- Set ui_surface='dialog' only when a modal dialog/pop-up is truly required; use ui_surface='widget' for inline forms, side panels, list selections, dropdowns, and inline feedback.
+- When no dedicated button, input, or modal is required, use explicit wording such as "No button required", "No dedicated input required", or "No modal required; inline feedback is acceptable".
 - Make labels and controls concrete enough for a GUI verifier or human reviewer to check.
 - If a requirement is mainly service logic or persistence, still describe the user-visible surface or explicitly state that no dedicated UI is required and where status/errors are surfaced.
 - Every required field must be present and non-empty.

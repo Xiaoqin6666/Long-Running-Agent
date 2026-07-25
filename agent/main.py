@@ -29,6 +29,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read a project specification and let the initializer generate the task graph.",
     )
     parser.add_argument(
+        "--no-requirements-generation",
+        dest="generate_requirements",
+        action="store_false",
+        default=True,
+        help="Skip generating requirements.json during project-spec initialization and generate the task graph directly.",
+    )
+    parser.add_argument(
         "--root",
         type=Path,
         default=Path.cwd(),
@@ -75,6 +82,34 @@ def build_parser() -> argparse.ArgumentParser:
         dest="system_validation",
         action="store_false",
         help="Disable the project-level final system validation task before finish.",
+    )
+    ui_contract_group = parser.add_mutually_exclusive_group()
+    ui_contract_group.add_argument(
+        "--ui-contract",
+        dest="ui_contract_validation",
+        action="store_true",
+        default=True,
+        help="Generate and enforce the UI Contract during final system validation. Enabled by default.",
+    )
+    ui_contract_group.add_argument(
+        "--no-ui-contract",
+        dest="ui_contract_validation",
+        action="store_false",
+        help="Disable UI Contract generation and final UI Contract checks while keeping other final validation enabled.",
+    )
+    integration_contract_group = parser.add_mutually_exclusive_group()
+    integration_contract_group.add_argument(
+        "--integration-contract",
+        dest="integration_contract_validation",
+        action="store_true",
+        default=False,
+        help="Generate and enforce the Integration Contract during final system validation. Disabled by default.",
+    )
+    integration_contract_group.add_argument(
+        "--no-integration-contract",
+        dest="integration_contract_validation",
+        action="store_false",
+        help="Disable Integration Contract generation and final integration checks. This is the default.",
     )
     parser.add_argument(
         "--log-file",
@@ -173,6 +208,7 @@ def main() -> int:
     print(f"Log: {log_path}", flush=True)
     logger.info(
         "Starting provider=%s benchmark=%s max_steps=%s auto_resume=%s max_sessions=%s system_validation=%s "
+        "ui_contract_validation=%s integration_contract_validation=%s generate_requirements=%s "
         "api_key_configured=%s base_url=%s model=%s",
         args.provider,
         benchmark_id or "none",
@@ -180,6 +216,9 @@ def main() -> int:
         args.auto_resume,
         args.max_sessions,
         args.system_validation,
+        args.ui_contract_validation,
+        args.integration_contract_validation,
+        args.generate_requirements,
         bool(os.environ.get("LONG_AGENT_API_KEY")),
         os.environ.get("LONG_AGENT_BASE_URL", "https://api.openai.com/v1"),
         os.environ.get("LONG_AGENT_MODEL", "gpt-4.1-mini"),
@@ -198,6 +237,9 @@ def main() -> int:
                     auto_resume=args.auto_resume,
                     max_sessions=args.max_sessions,
                     system_validation=args.system_validation,
+                    ui_contract_validation=args.ui_contract_validation,
+                    integration_contract_validation=args.integration_contract_validation,
+                    generate_requirements=args.generate_requirements,
                     initial_message=initial_message,
                 )
             ).run()
@@ -214,6 +256,9 @@ def main() -> int:
             auto_resume=args.auto_resume,
             max_sessions=args.max_sessions,
             system_validation=args.system_validation,
+            ui_contract_validation=args.ui_contract_validation,
+            integration_contract_validation=args.integration_contract_validation,
+            generate_requirements=args.generate_requirements,
         )
         result = loop.run()
         summary = result.to_human_summary()

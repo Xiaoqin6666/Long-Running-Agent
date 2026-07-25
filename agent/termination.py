@@ -41,12 +41,16 @@ class ProjectTerminator:
         benchmark_id: str | None = None,
         state_dir: Path | None = None,
         final_validation_required: bool = False,
+        ui_contract_required: bool = True,
+        integration_contract_required: bool = False,
     ) -> None:
         self.root = root
         self.tasks_path = tasks_path or root / "tasks.json"
         self.benchmark_id = benchmark_id
         self.state_dir = state_dir or root / "state"
         self.final_validation_required = final_validation_required
+        self.ui_contract_required = ui_contract_required
+        self.integration_contract_required = integration_contract_required
 
     def evaluate(self, signals: dict[str, Any] | None = None) -> TerminationResult:
         signals = signals or {}
@@ -110,34 +114,65 @@ class ProjectTerminator:
                 "summary": "FINAL_ACCEPTANCE must pass before project termination.",
             }
         ui_results_path = self.state_dir / "system_validation" / "ui_check_results.json"
-        if not ui_results_path.exists():
-            return {
-                "ok": False,
-                "reason": "ui_check_results_missing",
-                "path": str(ui_results_path),
-                "summary": "FINAL_ACCEPTANCE completed but ui_check_results.json is missing.",
-            }
-        try:
-            ui_results = json.loads(ui_results_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            return {
-                "ok": False,
-                "reason": "ui_check_results_unreadable",
-                "path": str(ui_results_path),
-                "summary": f"ui_check_results.json could not be loaded: {exc}",
-            }
-        if ui_results.get("passed") is not True:
-            return {
-                "ok": False,
-                "reason": "ui_check_results_failed",
-                "path": str(ui_results_path),
-                "summary": "ui_check_results.json shows UI/system validation has not passed.",
-            }
+        if self.ui_contract_required:
+            if not ui_results_path.exists():
+                return {
+                    "ok": False,
+                    "reason": "ui_check_results_missing",
+                    "path": str(ui_results_path),
+                    "summary": "FINAL_ACCEPTANCE completed but ui_check_results.json is missing.",
+                }
+            try:
+                ui_results = json.loads(ui_results_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return {
+                    "ok": False,
+                    "reason": "ui_check_results_unreadable",
+                    "path": str(ui_results_path),
+                    "summary": f"ui_check_results.json could not be loaded: {exc}",
+                }
+            if ui_results.get("passed") is not True:
+                return {
+                    "ok": False,
+                    "reason": "ui_check_results_failed",
+                    "path": str(ui_results_path),
+                    "summary": "ui_check_results.json shows UI/system validation has not passed.",
+                }
+        integration_results_path = self.state_dir / "system_validation" / "integration_results.json"
+        if self.integration_contract_required:
+            if not integration_results_path.exists():
+                return {
+                    "ok": False,
+                    "reason": "integration_results_missing",
+                    "path": str(integration_results_path),
+                    "summary": "FINAL_ACCEPTANCE completed but integration_results.json is missing.",
+                }
+            try:
+                integration_results = json.loads(integration_results_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return {
+                    "ok": False,
+                    "reason": "integration_results_unreadable",
+                    "path": str(integration_results_path),
+                    "summary": f"integration_results.json could not be loaded: {exc}",
+                }
+            if integration_results.get("passed") is not True:
+                return {
+                    "ok": False,
+                    "reason": "integration_results_failed",
+                    "path": str(integration_results_path),
+                    "summary": "integration_results.json shows project integration validation has not passed.",
+                }
         return {
             "ok": True,
             "task_id": "FINAL_ACCEPTANCE",
-            "ui_check_results_path": str(ui_results_path),
-            "summary": "FINAL_ACCEPTANCE and UI/system validation passed.",
+            "ui_check_results_path": str(ui_results_path) if self.ui_contract_required else "",
+            "integration_results_path": str(integration_results_path) if self.integration_contract_required else "",
+            "summary": (
+                "FINAL_ACCEPTANCE, UI validation, and integration validation passed."
+                if self.ui_contract_required and self.integration_contract_required
+                else "FINAL_ACCEPTANCE passed with configured final validation checks."
+            ),
         }
 
     def _run_regression(self) -> dict[str, Any]:

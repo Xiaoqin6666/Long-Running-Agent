@@ -180,26 +180,55 @@ def create_initializer_state(
     requirements_artifact: str = "state/requirements.json",
     generated_tasks_artifact: str = "state/generated_tasks.json",
     init_artifact: str = "state/init.sh",
+    generate_requirements: bool = True,
 ) -> TaskState:
     acceptance_criteria = [
         f"The project specification is available at {project_spec_artifact}.",
-        f"A Requirement Coverage Matrix is generated at {requirements_artifact}.",
         f"A structured task graph is generated at {generated_tasks_artifact}.",
-        "The task graph contains a requirements coverage matrix and every must requirement is assigned to one or more tasks.",
-        "The task graph contains executable tasks with ids, dependencies, priorities, statuses, requirement assignments, and owned artifacts.",
-        "The generated task graph passes deterministic schema, dependency, requirement coverage, and project workspace-boundary validation.",
+        "The task graph contains executable tasks with ids, dependencies, priorities, statuses, and owned artifacts.",
+        "The generated task graph passes deterministic schema, dependency, and project workspace-boundary validation.",
         f"A run-local POSIX shell init script is generated at {init_artifact} with repeatable setup or smoke-test commands.",
     ]
-    verification_command = (
-        "python -c \"import json, pathlib; "
-        f"requirements=json.loads(pathlib.Path('{requirements_artifact}').read_text(encoding='utf-8')); "
-        f"tasks=json.loads(pathlib.Path('{generated_tasks_artifact}').read_text(encoding='utf-8')); "
-        "assert isinstance(requirements.get('requirements'), list) and requirements['requirements']; "
-        "assert isinstance(tasks.get('tasks'), list) and tasks['tasks']; "
-        f"assert pathlib.Path('{project_spec_artifact}').is_file(); "
-        f"script=pathlib.Path('{init_artifact}').read_text(encoding='utf-8'); "
-        "assert script.startswith('#!/usr/bin/env sh\\n'); assert 'set -eu' in script.splitlines()\""
-    )
+    if generate_requirements:
+        acceptance_criteria.insert(1, f"A Requirement Coverage Matrix is generated at {requirements_artifact}.")
+        acceptance_criteria.insert(
+            3,
+            "The task graph contains a requirements coverage matrix and every must requirement is assigned to one or more tasks.",
+        )
+        acceptance_criteria[5] = (
+            "The generated task graph passes deterministic schema, dependency, requirement coverage, and project workspace-boundary validation."
+        )
+        verification_command = (
+            "python -c \"import json, pathlib; "
+            f"requirements=json.loads(pathlib.Path('{requirements_artifact}').read_text(encoding='utf-8')); "
+            f"tasks=json.loads(pathlib.Path('{generated_tasks_artifact}').read_text(encoding='utf-8')); "
+            "assert isinstance(requirements.get('requirements'), list) and requirements['requirements']; "
+            "assert isinstance(tasks.get('tasks'), list) and tasks['tasks']; "
+            f"assert pathlib.Path('{project_spec_artifact}').is_file(); "
+            f"script=pathlib.Path('{init_artifact}').read_text(encoding='utf-8'); "
+            "assert script.startswith('#!/usr/bin/env sh\\n'); assert 'set -eu' in script.splitlines()\""
+        )
+    else:
+        verification_command = (
+            "python -c \"import json, pathlib; "
+            f"tasks=json.loads(pathlib.Path('{generated_tasks_artifact}').read_text(encoding='utf-8')); "
+            "assert isinstance(tasks.get('tasks'), list) and tasks['tasks']; "
+            f"assert pathlib.Path('{project_spec_artifact}').is_file(); "
+            f"script=pathlib.Path('{init_artifact}').read_text(encoding='utf-8'); "
+            "assert script.startswith('#!/usr/bin/env sh\\n'); assert 'set -eu' in script.splitlines()\""
+        )
+    expected_artifacts = [
+        project_spec_artifact,
+        generated_tasks_artifact,
+        init_artifact,
+    ]
+    implementation_artifacts = [
+        generated_tasks_artifact,
+        init_artifact,
+    ]
+    if generate_requirements:
+        expected_artifacts.insert(1, requirements_artifact)
+        implementation_artifacts.insert(0, requirements_artifact)
     nodes = [
         {
             "id": "INIT",
@@ -208,17 +237,8 @@ def create_initializer_state(
             "evidence": [],
             "depends_on": [],
             "priority": 0,
-            "expected_artifacts": [
-                project_spec_artifact,
-                requirements_artifact,
-                generated_tasks_artifact,
-                init_artifact,
-            ],
-            "implementation_artifacts": [
-                requirements_artifact,
-                generated_tasks_artifact,
-                init_artifact,
-            ],
+            "expected_artifacts": expected_artifacts,
+            "implementation_artifacts": implementation_artifacts,
             "worker_test_artifacts": [],
             "acceptance_artifacts": [],
             "frozen_acceptance_artifacts": [],

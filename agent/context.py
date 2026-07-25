@@ -27,12 +27,20 @@ class ContextBuilder:
         state_dir: Path | None = None,
         git_root: Path | None = None,
         project_spec_path: Path | None = None,
+        generate_requirements: bool = True,
+        ui_contract_validation: bool = True,
+        integration_contract_validation: bool = False,
+        system_validation: bool = True,
     ) -> None:
         self.root = root
         del max_chars
         self.state_dir = state_dir or root / "state"
         self.git_root = git_root or root
         self.project_spec_path = project_spec_path
+        self.generate_requirements = generate_requirements
+        self.ui_contract_validation = ui_contract_validation
+        self.integration_contract_validation = integration_contract_validation
+        self.system_validation = system_validation
         self.current_trace_path: Path | None = None
 
     def build(self, state: TaskState, relevant_memories: str = "", include_handoff: bool | None = None) -> str:
@@ -258,6 +266,8 @@ class ContextBuilder:
             "- Do not restart INIT, regenerate the project spec, clear current state, or rebuild the whole task graph from scratch.",
             "- Preserve completed work, verifier evidence, handoff context, and frozen generated-task requirements.",
             "- Make targeted implementation, test, or plan updates that satisfy the requested adjustment.",
+            "- If no active worker task is writable but the requested adjustment names a generated workspace file, call finish target='current_task' so the harness can create an ADJUST_REPAIR task. Do not create a manual contract to unlock writes.",
+            "- Do not call finish for project completion before making the requested adjustment or explaining why it conflicts with existing requirements/evidence.",
             "- If FINAL_ACCEPTANCE is already completed and the user reports a real generated-app defect, inspect and repair the generated workspace files directly; the harness will reopen FINAL_ACCEPTANCE for rerun.",
             "- After any adjust-mode code edit, run verifier or the project final validation command before answering.",
             "- If the adjustment conflicts with frozen requirements or verified evidence, use answer or update_plan to explain the conflict instead of weakening prior requirements.",
@@ -457,6 +467,8 @@ class ContextBuilder:
         return f"{len(tasks)} task(s); {count_text}; next={current_text}"
 
     def _requirement_matrix_summary_context(self) -> str:
+        if not self.generate_requirements:
+            return "# Requirement Matrix Summary\n\nRequirement generation is disabled for this run."
         path = self.state_dir / "requirements.json"
         if not path.exists():
             return "# Requirement Matrix Summary\n\nNo requirements.json is available yet."
@@ -656,6 +668,9 @@ class ContextBuilder:
             inferred = self._inferred_pending_repair_targets(state)
             if inferred:
                 lines.append(f"- inferred_import_targets: {inferred}")
+            final_acceptance_guidance = self._final_acceptance_repair_guidance(state)
+            if final_acceptance_guidance:
+                lines.extend(["", final_acceptance_guidance])
         if initializer:
             errors = initializer.get("validation_errors", [])
             lines.extend(
@@ -665,6 +680,36 @@ class ContextBuilder:
                 ]
             )
         return "\n".join(lines)
+
+    def _final_acceptance_repair_guidance(self, state: TaskState) -> str:
+        if self._active_task_id(state) != "FINAL_ACCEPTANCE":
+            return ""
+        return "\n".join(
+            [
+                "FINAL_ACCEPTANCE repair guidance:",
+                f"- {self._final_acceptance_validation_artifact_policy()}",
+                "- Use failed check ids, subjects, reasons, evidence, and repair_targets to identify the real implementation gap.",
+                "- Do not repair final validation by adding comments, docstrings, unused imports, placeholder strings, or validation-shaped text.",
+                "- For UI failures, repair actual UI widgets, callbacks, disabled/enabled states, dialogs, data display, empty states, or refresh behavior.",
+                "- For integration failures when Integration Contract validation is enabled, repair real cross-module wiring: imports plus actual usage, service/storage calls, UI/service callbacks, command cwd/platform issues, or dynamic tests that genuinely exercise integrated behavior.",
+                "- If repair_targets point to a service file for a UI failure, treat that as a weak hint; search/read the UI file that implements the described surface before editing.",
+                "- Do not rerun full FINAL_ACCEPTANCE while previous validation output still contains known, unfixed failures. Continue repairing known failed checks first.",
+                "- Use smaller targeted commands to verify each repair when possible. Rerun full FINAL_ACCEPTANCE only after all known failed checks have plausible implementation fixes, or when fresh validation output is needed to identify the remaining failure set.",
+            ]
+        )
+
+    def _final_acceptance_validation_artifact_policy(self) -> str:
+        artifacts = ["final_acceptance_manifest.json", "ui_contract.json", "ui_check_results.json"]
+        result_files = ["ui_check_results.json"]
+        if self.integration_contract_validation:
+            artifacts.extend(["integration_contract.json", "integration_results.json"])
+            result_files.append("integration_results.json")
+        return (
+            "Project-level validation artifacts are system-owned diagnostics: agents may read "
+            f"{_format_sentence_list(artifacts)}, but must not manually write or edit them. "
+            "The final validation command may regenerate or overwrite result files such as "
+            f"{_format_sentence_list(result_files)}."
+        )
 
     def _recent_tool_observations_context(self, state: TaskState) -> str:
         records: list[tuple[object, dict[str, object], dict[str, object]]] = []
@@ -951,27 +996,54 @@ class ContextBuilder:
             f"Read {project_spec_ref} and transform it into a structured task graph.",
             "Required outputs:",
             spec_requirement,
-            f"- {self._rel(self.state_dir / 'requirements.json')} must contain a JSON object with a non-empty requirements list.",
-            f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list whose tasks reference requirements.json.",
+            *(
+                [
+                    f"- {self._rel(self.state_dir / 'requirements.json')} must contain a JSON object with a non-empty requirements list.",
+                    f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list whose tasks reference requirements.json.",
+                    "First extract a lightweight Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance?}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. Do not invent detailed test files, verification commands, GUI handler assertions, or exhaustive assertion_targets during INIT; those belong to the selected Worker task.",
+                    "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
+                    "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
+                    "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', requirement_ids, expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
+                    "Task planning rules after requirement capture:",
+                    "1. Preserve traceability. Each task must reference stable requirement_ids from requirements.json. Every must requirement must be covered. Do not invent new requirement ids in generated_tasks.json.",
+                ]
+                if self.generate_requirements
+                else [
+                    f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list.",
+                    "Requirement generation is disabled for this run: do not create, read, or reference requirements.json during INIT.",
+                    "Generate tasks directly in generated_tasks.json from the project specification.",
+                    "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include requirement_ids, verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
+                    "Task planning rules:",
+                    "1. Preserve traceability through clear task titles, artifact ownership, and dependency edges. Do not invent placeholder requirement ids.",
+                ]
+            ),
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
-            "First extract a lightweight Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance?}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. Do not invent detailed test files, verification commands, GUI handler assertions, or exhaustive assertion_targets during INIT; those belong to the selected Worker task.",
-            "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
-            "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
-            "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', requirement_ids, expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
-            "Task planning rules after requirement capture:",
-            "1. Preserve traceability. Each task must reference stable requirement_ids from requirements.json. Every must requirement must be covered. Do not invent new requirement ids in generated_tasks.json.",
             "2. Keep tasks small and independently verifiable. A task should usually cover 1-5 closely related requirements and own a small coherent artifact set. Avoid tasks that span many unrelated UI regions, services, dialogs, widgets, and integration flows at once.",
             "3. Split by executable verification boundary, not just by folder. A good task is one whose worker_test_artifacts can verify the task without requiring the whole application to be complete. Prefer targeted tests over full-suite tests.",
             "4. Separate foundations from integrations. Plan data models, storage, service logic, UI shell, widget/dialog primitives, panel APIs, and end-to-end integration as separate tasks with explicit depends_on edges.",
             "5. Avoid duplicate requirement ownership. Assign each requirement to one primary implementation task when possible. Only repeat a requirement_id in a later integration task when the later task verifies cross-component behavior that cannot be verified in the primary task alone.",
             "6. For GUI projects, plan non-interactive verification. UI tasks must be testable without human clicks. Generated tasks for Tkinter/PyQt/etc. must require test_mode, dependency-injected dialogs, or mocked modal functions. Worker tests must not rely on mainloop(), messagebox.askyesno(), simpledialog.askstring(), or manual window interaction.",
             "7. For UI tasks, split shell, components, dialogs/widgets, and integration. Do not create a single \"Main Window and Panels\" task that owns the entire UI. Use smaller tasks: UI shell and test_mode infrastructure; panel public APIs and widget structure; dialogs with non-blocking test adapters; custom widgets; workflow integration across panels.",
-            "When a generated task is later selected, the harness derives frozen acceptance criteria from requirements.json using frozen_acceptance when present, otherwise acceptance_intent or text. The Worker must write the selected task's worker_test_artifacts first, putting GUI handler and observable state-change assertions in those test files, then use action='contract' to provide the verification_procedure that runs those tests. Only after that may the Worker write implementation_artifacts.",
+            (
+                "When a generated task is later selected, the harness derives frozen acceptance criteria from requirements.json using frozen_acceptance when present, otherwise acceptance_intent or text. The Worker must write the selected task's worker_test_artifacts first, putting GUI handler and observable state-change assertions in those test files, then use action='contract' to provide the verification_procedure that runs those tests. Only after that may the Worker write implementation_artifacts."
+                if self.generate_requirements
+                else "When a generated task is later selected, the Worker will create an ad-hoc acceptance contract. It must write worker_test_artifacts first when they are listed, then use action='contract' to provide the verification_procedure before writing implementation_artifacts."
+            ),
             "priority MUST be an integer. Lower numbers are higher priority; use 1, 2, 3, ... and never strings such as 'high' or 'medium'.",
-            "Minimal requirements.json example:",
-            '{\n  "requirements": [\n    {\n      "id": "REQ-FEATURE-BEHAVIOR",\n      "source": "task.md:1",\n      "text": "The feature produces the requested observable behavior.",\n      "type": "service_logic",\n      "priority": "must",\n      "acceptance_intent": "A user-visible or test-visible output changes as specified."\n    }\n  ]\n}',
+            *(
+                [
+                    "Minimal requirements.json example:",
+                    '{\n  "requirements": [\n    {\n      "id": "REQ-FEATURE-BEHAVIOR",\n      "source": "task.md:1",\n      "text": "The feature produces the requested observable behavior.",\n      "type": "service_logic",\n      "priority": "must",\n      "acceptance_intent": "A user-visible or test-visible output changes as specified."\n    }\n  ]\n}',
+                ]
+                if self.generate_requirements
+                else []
+            ),
             "Minimal generated_tasks.json task example:",
-            '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","requirement_ids":["REQ-FEATURE-BEHAVIOR"],"expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_by_worker":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true}}]}',
+            (
+                '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","requirement_ids":["REQ-FEATURE-BEHAVIOR"],"expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_by_worker":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true}}]}'
+                if self.generate_requirements
+                else '{"tasks":[{"id":"T1","title":"Implement feature","priority":1,"depends_on":[],"status":"pending","expected_artifacts":["<workspace>/pkg/feature.py","<workspace>/tests/test_feature.py"],"implementation_artifacts":["<workspace>/pkg/feature.py"],"worker_test_artifacts":["<workspace>/tests/test_feature.py"],"acceptance_artifacts":[],"frozen_acceptance_artifacts":[],"test_policy":{"worker_tests_mutable_by_worker":true,"acceptance_tests_mutable_by_worker":false,"acceptance_test_repair_requires_verifier_approval":true}}]}'
+            ),
             "Implementation tasks must declare non-empty implementation_artifacts, and every owned implementation/test/acceptance artifact must also appear in expected_artifacts.",
             "Respect dependency constraints from project_spec.md (for example, standard-library-only means no pytest or package installation).",
             "INIT does not require an acceptance contract.",
@@ -999,21 +1071,26 @@ class ContextBuilder:
         init_path = self.state_dir / "init.sh"
         spec_path = self._project_spec_context_path()
         try:
-            requirements_content = requirements_path.read_text(encoding="utf-8")
-            requirements_data = json.loads(requirements_content)
             generated_data = json.loads(generated_path.read_text(encoding="utf-8"))
             init_content = init_path.read_text(encoding="utf-8")
         except (OSError, json.JSONDecodeError):
             return False
+        requirements_data = None
+        if self.generate_requirements:
+            try:
+                requirements_content = requirements_path.read_text(encoding="utf-8")
+                requirements_data = json.loads(requirements_content)
+            except (OSError, json.JSONDecodeError):
+                return False
 
         expected_workspace = self._expected_initializer_workspace_root(spec_path)
-        errors = validate_requirements_matrix(requirements_data)
+        errors = validate_requirements_matrix(requirements_data) if self.generate_requirements else []
         errors.extend(
             validate_generated_task_graph(
                 generated_data,
                 expected_workspace,
                 standard_library_only=self._project_requires_standard_library(spec_path),
-                require_requirement_coverage=True,
+                require_requirement_coverage=self.generate_requirements,
                 requirements_data=requirements_data,
                 require_verification_plan=False,
             )
@@ -1070,8 +1147,8 @@ class ContextBuilder:
                 "Next action must be save_skill with the archived verifier report evidence, or dismiss_skill with a concrete reason. "
                 "Do not continue ordinary task work until this review is resolved."
             )
-        final_gate = self._final_validation_gate_status()
-        if final_gate.get("required_action") == "finish":
+        final_gate = self._final_validation_gate_status() if self.system_validation else {"ok": True}
+        if self.system_validation and final_gate.get("required_action") == "finish":
             return (
                 "All ordinary required tasks are complete, but FINAL_ACCEPTANCE is not scheduled. "
                 "Next action must be finish target='current_task' to let the harness create the project-level UI/system validation task. "
@@ -1084,8 +1161,13 @@ class ContextBuilder:
         )
         if initializer_repair:
             if self._initializer_official_outputs_valid():
+                artifact_label = (
+                    "official requirements.json, generated_tasks.json, and init.sh"
+                    if self.generate_requirements
+                    else "official generated_tasks.json and init.sh"
+                )
                 return (
-                    "The saved INIT repair state is stale: official requirements.json, generated_tasks.json, and init.sh already pass deterministic validation. "
+                    f"The saved INIT repair state is stale: {artifact_label} already pass deterministic validation. "
                     "Next action must be verify to let the harness complete INIT and clear initializer_repair. "
                     "Do not reread or recopy rejected_candidates/generated_tasks.json."
                 )
@@ -1143,6 +1225,8 @@ class ContextBuilder:
             missing_read = self._next_pending_repair_read(state)
             output = str(state.pending_repair.get("output", "")).strip().splitlines()
             excerpt = " | ".join(output[:4])[:700] if output else state.pending_repair.get("summary", "")
+            final_acceptance_guidance = self._final_acceptance_repair_guidance(state)
+            guidance_suffix = f" {final_acceptance_guidance}" if final_acceptance_guidance else ""
             if self._pending_repair_is_timeout(state):
                 command = str(state.pending_repair.get("command", ""))
                 output_path = str(state.pending_repair.get("output_path", "") or state.pending_repair.get("stderr_path", ""))
@@ -1155,6 +1239,7 @@ class ContextBuilder:
                     "that isolates the hang. "
                     f"After evidence identifies the blocker, use write/edit on one of these implementation artifacts: {', '.join(repair_targets)}. "
                     f"Do not force-read a single repair target solely because it appears in repair_targets; do not rerun the full timed-out command '{command}' unchanged."
+                    f"{guidance_suffix}"
                 )
             if missing_read:
                 return (
@@ -1162,6 +1247,7 @@ class ContextBuilder:
                     f"Next action must be read target='{missing_read}' before any write/edit repair. "
                     "Use the failing test/source artifact to derive the required interface instead of guessing. "
                     f"Failure excerpt: {excerpt}"
+                    f"{guidance_suffix}"
                 )
             if self._pending_repair_has_attempt(state):
                 command = str(state.pending_repair.get("command", ""))
@@ -1178,12 +1264,22 @@ class ContextBuilder:
                         "Next action should be verify to rerun the agreed procedure, or bash with a smaller targeted test that directly exercises the repaired failure before full verification. "
                         f"{post_repair_read_hint} "
                         "Do not list directories or continue unrelated editing without new evidence."
+                        f"{guidance_suffix}"
+                    )
+                if self._active_task_id(state) == "FINAL_ACCEPTANCE":
+                    return (
+                        "A repair was attempted for FINAL_ACCEPTANCE. "
+                        "Next action should continue repairing any known failed UI or integration checks from the previous validation output, inspect the repaired file, or run a smaller targeted command that proves the repaired failure. "
+                        f"{post_repair_read_hint} "
+                        "Do not rerun full FINAL_ACCEPTANCE just because one repair was attempted."
+                        f"{guidance_suffix}"
                     )
                 return (
                     "A repair was attempted for the failed acceptance command. "
                     f"Next action should be bash target='{command}' to rerun the same acceptance command, or bash with a smaller targeted test that directly exercises the repaired failure before full acceptance. "
                     f"{post_repair_read_hint} "
                     "Do not list directories or continue unrelated editing without new evidence."
+                    f"{guidance_suffix}"
                 )
             if not repair_targets:
                 command = str(state.pending_repair.get("command", ""))
@@ -1193,12 +1289,14 @@ class ContextBuilder:
                         "Do not edit frozen acceptance artifacts. "
                         "If the procedure path/cwd is wrong, update only verification_procedure with action='contract'; otherwise use verify only after the implementation/environment issue is addressed. "
                         f"Failure excerpt: {excerpt}"
+                        f"{guidance_suffix}"
                     )
                 return (
                     "The last acceptance or verification command failed, but no mutable repair target is available. "
                     "Do not attempt to edit a frozen or contract-owned test artifact. "
                     f"Repair or replace the acceptance command, then rerun bash target='{command}'. "
                     f"Failure excerpt: {excerpt}"
+                    f"{guidance_suffix}"
                 )
             return (
                 "The last acceptance or verification command failed. "
@@ -1207,6 +1305,7 @@ class ContextBuilder:
                 "Worker-owned tests may be edited before contract freeze, but frozen acceptance tests must not be modified unless the harness explicitly allows syntax/import/environment repair. "
                 "Do not list directories, reread files, or rerun tests before making a repair. "
                 f"Failure excerpt: {excerpt}"
+                f"{guidance_suffix}"
             )
         if state.last_action.get("action") != "read":
             return "No forced next action."
@@ -1412,7 +1511,7 @@ class ContextBuilder:
         frozen = self._active_task_frozen_acceptance_artifacts(state)
         missing_owned = self._missing_active_owned_artifacts(state)
         policy = self._active_task_test_policy(state)
-        return [
+        lines = [
             f"- implementation_artifacts: {', '.join(implementation) if implementation else 'none'}",
             f"- worker_test_artifacts: {', '.join(worker_tests) if worker_tests else 'none'}",
             f"- acceptance_artifacts: {', '.join(acceptance) if acceptance else 'none'}",
@@ -1422,8 +1521,18 @@ class ContextBuilder:
             "- Rule: implementation artifacts are normal repair targets; verifier traceback source files under workspace are valid repair targets even when they are outside expected_artifacts.",
             "- Rule: frozen or contract acceptance tests are not repair targets by default; worker tests are repair targets only when test_policy.worker_tests_mutable_by_worker is true.",
         ]
+        if self._active_task_id(state) == "FINAL_ACCEPTANCE":
+            lines.extend(
+                [
+                    f"- Rule: {self._final_acceptance_validation_artifact_policy()}",
+                    "- Rule: Do not treat FINAL_ACCEPTANCE expected_artifacts, acceptance_artifacts, or frozen_acceptance_artifacts as editable implementation targets.",
+                ]
+            )
+        return lines
 
     def _active_ui_contract_context(self, state: TaskState) -> str:
+        if not self.ui_contract_validation:
+            return "# Active UI Contract\n\nUI Contract validation is disabled for this run."
         path = self._active_ui_contract_path(state)
         if path is None:
             return "# Active UI Contract\n\nNo active UI Contract artifact."
@@ -1737,3 +1846,11 @@ class ContextBuilder:
             if node.get("status") in {"in_progress", "pending"}:
                 return str(node.get("id", "current"))
         return "current"
+
+
+def _format_sentence_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
