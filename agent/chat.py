@@ -48,8 +48,8 @@ class ChatConfig:
     benchmark_id: str | None = None
     tasks_path: Path | None = None
     project_spec_path: Path | None = None
-    auto_resume: bool = False
-    max_sessions: int = 1
+    auto_resume: bool = True
+    max_sessions: int | None = None
     system_validation: bool = True
     initial_message: str | None = None
 
@@ -377,7 +377,12 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /agent for new project work, /adjust for changes, /resume for continue in next session, /help for commands.", "dim"))
+        self.output(
+            self._paint(
+                "  Use /agent for new project work, /adjust for changes, /resume for other unfinished runs, /help for commands.",
+                "dim",
+            )
+        )
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:
@@ -723,6 +728,16 @@ class InteractiveCLI:
 
     def _show_event(self, event: dict[str, object]) -> None:
         event_type = str(event.get("type", "tool_result"))
+        if event_type == "session_handoff":
+            self.output(
+                self._paint(
+                    "Agent > 已达到上下文阈值，正在自动切换到新会话…",
+                    "green",
+                    bold=True,
+                )
+            )
+            return
+
         action = str(event.get("action", "unknown"))
         if action == "answer":
             return
@@ -731,14 +746,15 @@ class InteractiveCLI:
 
         thought_summary = str(event.get("thought_summary", ""))
         if thought_summary:
-            self.output(f"      {thought_summary}")
+            self.output(self._paint(f"      {thought_summary}", "gray"))
         if action == "verify":
             return
 
         target = str(event.get("target", ""))
-        detail = f" {target}" if target else ""
         verb = "calling" if action in TOOL_ACTIONS else "action"
-        self.output(self._paint(f"      {verb} {action}{detail}", "gray"))
+        call = self._paint(f"      {verb} {action}", "blue")
+        detail = self._paint(f" {target}", "gray") if target else ""
+        self.output(f"{call}{detail}")
 
     def _finish_turn(self, result: RunResult) -> None:
         self.last_result = result

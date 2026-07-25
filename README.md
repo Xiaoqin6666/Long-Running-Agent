@@ -1,91 +1,137 @@
 # Long-Running Agent
 
-This repository is for a training-free long-running coding agent system.
+这是一个无需训练、面向长时间编码任务的 Agent 系统。
 
-The current design focuses on a minimal but research-friendly agent harness.
+当前设计以一个精简且便于研究的 Agent Harness 为核心，主要包括：
 
-- explicit task state management;
-- bounded context construction and handoff;
-- independent self-verification;
-- filesystem-backed Skill and Memory;
-- trace-driven experiments and ablations.
+- 显式的任务状态管理；
+- 有界的上下文构建与会话交接（handoff）；
+- 独立的自验证机制；
+- 基于文件系统的 Skill 与 Memory；
+- 由 trace 驱动的实验与消融分析。
 
-See [docs/problem3_agent_framework.md](docs/problem3_agent_framework.md) for the full framework design.
-See [docs/system_prompts.md](docs/system_prompts.md) for role-specific Main Agent, Planner, and Verifier system prompts.
-See [docs/evaluation_runbook.md](docs/evaluation_runbook.md) for the long-running evaluation task.
+完整框架设计见 [docs/problem3_agent_framework.md](docs/problem3_agent_framework.md)。
+Main Agent、Planner 和 Verifier 的角色提示词见
+[docs/system_prompts.md](docs/system_prompts.md)。
+长时间运行测评任务的说明见
+[docs/evaluation_runbook.md](docs/evaluation_runbook.md)。
 
-## Planned Milestones
+## 规划里程碑
 
-1. Build a CLI agent loop.
-2. Add minimal tools: list_files, search, read, edit, bash, git, verify.
-3. Store task state, memory, skills, and traces on disk.
-4. Add context compaction and handoff.
-5. Run long-coding-task experiments and ablations.
+1. 构建 CLI Agent 循环。
+2. 加入最小工具集：`list_files`、`search`、`read`、`edit`、`bash`、`git`、`verify`。
+3. 将任务状态、Memory、Skill 和 trace 保存到磁盘。
+4. 加入上下文压缩与 handoff。
+5. 运行长时间编码任务实验和消融实验。
 
-## Quick Start
+## 快速开始
 
-The tracked repository-root `init.sh` bootstraps the Long-Running Agent harness. An autonomous benchmark INIT generates a separate run-local script at `state/benchmarks/<benchmark_id>/init.sh`; generated application code and public tests belong under `eval/benchmarks/<benchmark_id>/workspace/`.
+仓库根目录中受版本控制的 `init.sh` 用于初始化 Long-Running Agent Harness。
+自主测评的 INIT 阶段会另外生成本次运行专用的
+`state/benchmarks/<benchmark_id>/init.sh`；生成的应用代码和公开测试应放在
+`eval/benchmarks/<benchmark_id>/workspace/` 下。
 
-### Agent 项目运行方式
+### 运行 Agent 项目
 
-方式 1：进入交互式 agent。
+方式一：进入交互式 Agent。
 
 ```powershell
 python -m agent.main --chat --benchmark MAPA --provider openai-compatible
 ```
 
-`--benchmark` 设置测评任务的名字。进入 agent 之后，使用 `/agent` 模式开启新的项目，并指定项目规格文件路径；`/adjust` 模式用来对当前项目提出修改建议；`/resume` 模式在新的会话中继续当前项目。
+`--benchmark` 用于设置测评任务名称。进入 Agent 后，使用 `/agent` 模式开始新项目并指定项目规格文件路径；使用 `/adjust` 模式对当前项目提出修改要求；`/resume` 仅用于手动继续其他原因导致的未完成运行。达到 handoff 上下文阈值时，系统默认会自动创建新会话并继续执行，无需用户输入 `/resume`。
 
-方式 2：直接指定项目规格文件启动。
+方式二：直接指定项目规格文件启动。
 
 ```powershell
 python -m agent.main --project-spec eval\benchmarks\MAPA\task.md --provider openai-compatible --benchmark MAPA
 ```
 
-`--project-spec eval\benchmarks\MAPA\task.md` 设置项目规格文件路径。`--benchmark` 设置测评任务的名字。
+`--project-spec eval\benchmarks\MAPA\task.md` 用于设置项目规格文件路径，
+`--benchmark` 用于设置测评任务名称。
 
-在交互模式中使用 `/skill` 可以直接添加受信任的用户 Skill。Skill 文件必须在 frontmatter 中声明 `name`；`description` 等其他 frontmatter 字段和正文固定章节都是可选的，缺少 `description` 时从正文第一段推导。正文仍是自由 Markdown。Agent 自主创建的 Skill 还必须引用真实的 Verifier 或 trace 证据。
+自动 handoff 默认开启且不限制会话数量。可用 `--max-sessions N` 限制一次运行最多使用的会话数，或用 `--no-auto-resume` 在写入 handoff 后停止。
 
-项目内置的默认 Skill 位于 `default_skills/<name>/SKILL.md`。当前随仓库提供 Anthropic
-`anthropics/skills` 的 17 个 Skill，并保留各目录中的 `scripts/`、`references/`、`assets/`
-和许可证文件。运行期间新增的 Skill 保存在 `state/skills/`；同名时运行状态中的 Skill
-覆盖默认 Skill。来源版本和授权说明见 `default_skills/UPSTREAM.md`。
+### Skill
 
-Typed Memory bodies live in `state/memories/*.md`; `state/memory.md` is a derived index rebuilt at startup and after writes. At Worker-session start, task transitions, and successful `save_memory` events, the harness sends the complete valid typed-Memory corpus to the main `LONG_AGENT_MODEL` in one isolated QA request and injects only its grounded answer and validated exact citations into the Main Agent context. The Main Agent can also call the read-only `recall_memory` action with a natural-language question. The full corpus is never silently truncated or replaced with keyword search: an oversized or invalid corpus produces an explicit error. Because every typed Memory body is sent to the configured main-model provider, do not store credentials or secrets in Memory.
+在交互模式中使用 `/skill` 可以直接添加受信任的用户 Skill。Skill 文件必须在
+frontmatter 中声明 `name`；`description` 等其他 frontmatter 字段和正文固定章节均为
+可选项。缺少 `description` 时，系统会从正文第一段推导。正文仍可使用自由格式的
+Markdown。Agent 自主创建的 Skill 还必须引用真实的 Verifier 或 trace 证据。
 
-Summarize a trace:
+项目内置的默认 Skill 位于 `default_skills/<name>/SKILL.md`。仓库当前包含来自
+Anthropic `anthropics/skills` 的 17 个 Skill，并保留各目录中的 `scripts/`、
+`references/`、`assets/` 和许可证文件。运行期间新增的 Skill 保存在
+`state/skills/`；同名时，运行状态中的 Skill 会覆盖默认 Skill。来源版本和授权说明见
+`default_skills/UPSTREAM.md`。
+
+### Memory
+
+类型化 Memory 的正文保存在 `state/memories/*.md` 中；`state/memory.md` 是一个派生
+索引，会在启动和写入后重新构建。
+
+在 Worker 会话开始、任务切换以及 `save_memory` 成功后，Harness 会把全部有效的类型化
+Memory 一次性发送给主模型 `LONG_AGENT_MODEL`，进行隔离的问答请求；随后只把有依据的
+回答和经过校验的精确引用注入 Main Agent 上下文。Main Agent 也可以使用只读的
+`recall_memory` action，以自然语言提问。完整 Memory 集合不会被静默截断，也不会退化为
+关键词搜索；集合过大或内容无效时，系统会明确报错。由于所有类型化 Memory 正文都会被
+发送给已配置的主模型服务商，请勿在 Memory 中保存凭据或其他秘密信息。
+
+### Trace 与模型上下文
+
+汇总 trace：
 
 ```powershell
 python eval\metrics.py state\benchmarks\issue_tracker\traces\<trace-file>.jsonl --tasks state\benchmarks\issue_tracker\runtime_tasks.json
 ```
 
-Token usage is recorded separately from the handoff budget estimate. Each trace event includes `token_usage` for that agent step, `session_token_usage` for the active session totals, and `total_token_usage` across all sessions. The durable `current_task.json` also stores `token_usage.totals`, `token_usage.sessions`, and per-turn `token_usage.turns`; `/status` shows the accumulated LLM input and output totals.
+Token 用量和 handoff 的预算估算分别记录。每个 trace 事件均包含当前 Agent 步骤的
+`token_usage`、当前会话累计值 `session_token_usage`，以及跨会话累计值
+`total_token_usage`。持久化的 `current_task.json` 还会保存
+`token_usage.totals`、`token_usage.sessions` 和逐轮的 `token_usage.turns`；
+`/status` 会显示累计的 LLM 输入与输出 Token。
 
-Inspect model context and the exact provider transcript:
+如需检查模型上下文和发送给服务商的精确对话记录：
 
-Diagnostic context snapshots are written under `state\debug_contexts\<trace-name>\step_0001.md`. The exact append-only Chat Completions request/response/tool transcript is written under `state\provider_sessions\<trace-name>.jsonl`; it includes full provider `reasoning_content`, is permissioned for the current user only, and must be treated as sensitive. Normal trace events contain only the provider transcript path, SHA-256, byte length, and current `tool_call_id`. The provider transcript is reset at Worker handoff and its reasoning is not copied into handoff, Memory, Skills, or normal CLI output.
+- 诊断上下文快照保存在
+  `state\debug_contexts\<trace-name>\step_0001.md`；
+- 只追加的 Chat Completions 请求、响应与工具调用记录保存在
+  `state\provider_sessions\<trace-name>.jsonl`。
 
-Run behavior tests:
+Provider transcript 包含完整的 `reasoning_content`，文件权限仅对当前用户开放，应按
+敏感数据处理。普通 trace 事件只记录 Provider transcript 的路径、SHA-256、字节长度和
+当前 `tool_call_id`。Worker handoff 时会重置 Provider transcript，其中的推理内容不会
+被复制到 handoff、Memory、Skill 或普通 CLI 输出中。
+
+## 测试
+
+运行 Harness 行为测试：
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-To run the optional live DeepSeek protocol smoke test, configure the provider variables and set `LONG_AGENT_RUN_LIVE_DEEPSEEK_TEST=1` before running `python -m unittest tests.test_deepseek_protocol.DeepSeekProtocolTests.test_optional_live_deepseek_smoke`.
+如需运行可选的 DeepSeek 协议在线冒烟测试，请先配置 Provider 环境变量并设置
+`LONG_AGENT_RUN_LIVE_DEEPSEEK_TEST=1`，然后执行：
 
-Run the optional manual evaluator after the autonomous run has ended:在自动运行结束后运行可选的手动评估器：
+```powershell
+python -m unittest tests.test_deepseek_protocol.DeepSeekProtocolTests.test_optional_live_deepseek_smoke
+```
+
+自主运行结束后，可以执行可选的手动评估器：
 
 ```powershell
 python eval\manual_evaluators\issue_tracker\evaluate.py
 ```
 
-The Agent Harness never invokes this script. Its result does not gate `finish` and cannot create repair tasks.
+Agent Harness 不会调用此脚本。其结果不会影响 `finish` 判定，也不能创建修复任务。
 
-The offline provider is intentionally simple. It exercises the harness loop without requiring an API key, so state management, tool execution, verifier gating, and trace writing can be tested first.
+离线 Provider 的实现刻意保持简单。它无需 API Key 即可运行 Harness 循环，便于先测试
+状态管理、工具执行、Verifier 门禁和 trace 写入。
 
-## API Provider
+## API 服务配置
 
-The real model provider uses an OpenAI-compatible chat completions API. Configure it with environment variables:
+真实模型 Provider 使用兼容 OpenAI 的 Chat Completions API。通过以下环境变量配置：
 
 ```powershell
 $env:LONG_AGENT_API_KEY="your_api_key"
@@ -98,14 +144,47 @@ $env:LONG_AGENT_CONTEXT_WINDOW_TOKENS="128000"
 $env:LONG_AGENT_TOKEN_PRICES_JSON='{"gpt-4.1-mini":{"input_per_1m":0.0,"output_per_1m":0.0,"currency":"USD"}}'
 ```
 
-`openai-compatible` requires native Chat Completions function calling. CLI history is sent as ordinary `user` and `assistant` messages; the one-time session context contains rules, task state, handoff, Skill catalog, loaded Skills, and relevant Memory. Most compatible providers receive the forced `submit_action` wrapper. DeepSeek thinking rejects `tool_choice`, so that path receives the existing actions (`read`, `write`, `bash`, `verify`, and so on) as direct native functions; their arguments are normalized back into the same validated action structure before execution. The harness appends the matching observation plus incremental task state as a `tool` result, and content-only action JSON responses are rejected. DeepSeek endpoints/models enable thinking automatically, omit sampling temperature, round-trip `reasoning_content` exactly across tool calls, and reject any function not present in the request. Because DeepSeek's standard tool loop may return final content while the harness still requires another action, the transport can append a bounded content-only correction turn. DeepSeek can also emit parallel tool calls; the harness closes every call ID with an explicit non-execution result and asks for one action at a time, preserving its per-action state/verification boundary. Neither path fabricates a successful tool execution, and usage from all correction requests is aggregated. Set `LONG_AGENT_THINKING=disabled` only when thinking must be turned off.
+`openai-compatible` 要求原生支持 Chat Completions function calling。CLI 历史会以普通
+`user` 和 `assistant` 消息发送；一次性会话上下文则包含规则、任务状态、handoff、
+Skill 目录、已加载的 Skill 以及相关 Memory。
 
-If the API response includes cost or billing fields, that provider-returned cost is recorded first with `price_source="api"`. Cache hit/miss/write and reasoning-token details are retained when the provider reports them, and the original provider `usage` object is preserved on the turn as `provider_usage`. Otherwise, set `LONG_AGENT_TOKEN_PRICES_JSON` to the current price you want to use, expressed per 1M tokens; replace the `0.0` example values before relying on cost output. You can also put the same JSON object in a file and set `LONG_AGENT_TOKEN_PRICES_FILE=path\to\prices.json`. When pricing is available for the active model, each trace step's `token_usage.cost` includes input, output, and total cost. Session cost aggregates live under `token_usage.sessions[session_id].costs_by_currency`; all-session aggregates live under `token_usage.totals.costs_by_currency`. If neither API cost nor a configured model price is available, the turn is counted under `unpriced_turn_count`.
+大多数兼容 Provider 会收到强制使用的 `submit_action` 包装器。DeepSeek thinking 不接受
+`tool_choice`，因此该路径会把现有 action（如 `read`、`write`、`bash`、`verify`）直接
+作为原生 function 提供；function 参数在执行前仍会被归一化为同一套经过校验的 action
+结构。Harness 会把匹配的 observation 和增量任务状态追加为 `tool` 结果，并拒绝只在
+普通文本中返回 action JSON 的响应。
 
-When a session reaches the handoff threshold, the harness writes `handoff.md`, resets the model transcript and per-session budget flags, starts a fresh trace, and rebuilds context from durable state, handoff, loaded Skills, and relevant Memory without requiring a manual `--resume` restart.
+DeepSeek endpoint 或模型会自动开启 thinking、省略采样温度，并在工具调用之间原样回传
+`reasoning_content`；模型调用请求中不存在的 function 会被拒绝。由于 DeepSeek 的标准
+工具循环可能在 Harness 仍要求下一步 action 时返回最终文本，传输层可以追加一次有上限
+的纯文本纠正轮次。DeepSeek 也可能并行发出多个工具调用；Harness 会为每个调用 ID 返回
+明确的“未执行”结果，并要求模型每次只提交一个 action，从而保留逐 action 的状态与验证
+边界。两条路径都不会伪造成功的工具执行，所有纠正请求产生的用量都会计入总量。仅当确实
+需要关闭 thinking 时，才设置 `LONG_AGENT_THINKING=disabled`。
 
-Each run writes a diagnostic log under `state/benchmarks/<benchmark_id>/logs/`. The terminal prints the exact path before provider initialization, so startup failures are recorded too. Use `--log-file path\to\run.log` to override it.
+如果 API 响应包含费用或账单字段，系统会优先记录 Provider 返回的费用，并设置
+`price_source="api"`。Provider 返回的缓存命中、未命中、写入和推理 Token 明细会被保留，
+原始 `usage` 对象也会保存在对应轮次中。
 
-For DeepSeek or another OpenAI-compatible endpoint with native function calling, keep the same command and change `LONG_AGENT_BASE_URL` plus `LONG_AGENT_MODEL`.
+否则，请通过 `LONG_AGENT_TOKEN_PRICES_JSON` 配置当前使用的价格，单位为每 100 万
+Token；在依赖费用输出前，请替换示例中的 `0.0`。也可以把同一 JSON 对象保存到文件，并
+设置 `LONG_AGENT_TOKEN_PRICES_FILE=path\to\prices.json`。当活动模型存在定价信息时，
+每个 trace 步骤的 `token_usage.cost` 会包含输入、输出和总费用。会话费用汇总保存在
+`token_usage.sessions[session_id].costs_by_currency`，跨会话汇总保存在
+`token_usage.totals.costs_by_currency`。如果 API 没有返回费用且模型价格也未配置，该
+轮次会计入 `unpriced_turn_count`。
 
-Inspection or recommendation tasks may finish with an `answer` action instead of `finish`. Coding tasks still rely on verifier-gated `finish`.
+当会话达到 handoff 阈值时，Harness 会写入 `handoff.md`，重置模型 transcript 和当前
+会话的预算标志，启动新的 trace，并根据持久化状态、handoff、已加载 Skill 和相关 Memory
+重新构建上下文。默认情况下，这一过程会自动完成，不需要用户输入 `/resume` 或重新使用
+`--resume` 启动。
+
+每次运行都会在 `state/benchmarks/<benchmark_id>/logs/` 下写入诊断日志。终端会在
+Provider 初始化前打印准确路径，因此启动失败也会被记录。可用
+`--log-file path\to\run.log` 覆盖默认位置。
+
+对于 DeepSeek 或其他原生支持 function calling 的 OpenAI 兼容 endpoint，保持启动命令
+不变，只需修改 `LONG_AGENT_BASE_URL` 和 `LONG_AGENT_MODEL`。
+
+检查或建议类任务可以通过 `answer` action 结束；编码任务仍必须通过 Verifier 门禁后才能
+执行 `finish`。

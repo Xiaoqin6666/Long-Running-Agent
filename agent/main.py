@@ -51,16 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume from the active state directory's current_task.json if it exists.",
     )
-    parser.add_argument(
+    auto_resume_group = parser.add_mutually_exclusive_group()
+    auto_resume_group.add_argument(
         "--auto-resume",
+        dest="auto_resume",
         action="store_true",
-        help="Automatically start a fresh resumed session after writing a handoff.",
+        default=True,
+        help="Automatically start a fresh resumed session after writing a handoff. Enabled by default.",
+    )
+    auto_resume_group.add_argument(
+        "--no-auto-resume",
+        dest="auto_resume",
+        action="store_false",
+        help="Stop after writing a handoff instead of continuing automatically.",
     )
     parser.add_argument(
         "--max-sessions",
         type=int,
-        default=1,
-        help="Maximum sessions to run when --auto-resume is enabled.",
+        default=None,
+        help="Maximum sessions to run when automatic resume is enabled. Defaults to unlimited.",
     )
     validation_group = parser.add_mutually_exclusive_group()
     validation_group.add_argument(

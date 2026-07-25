@@ -924,6 +924,19 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(args.auto_resume)
         self.assertEqual(args.max_sessions, 3)
 
+    def test_cli_enables_unlimited_auto_resume_by_default(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task"])
+
+        self.assertTrue(args.auto_resume)
+        self.assertIsNone(args.max_sessions)
+
+    def test_cli_can_disable_auto_resume(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["Task", "--no-auto-resume"])
+
+        self.assertFalse(args.auto_resume)
+
     def test_cli_can_disable_system_validation(self) -> None:
         parser = build_parser()
         default_args = parser.parse_args(["Task"])
@@ -6444,6 +6457,43 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(result.steps, 2)
         self.assertEqual(len(trace_files), 2)
         self.assertIn("Session handoff threshold reached", result.message)
+
+    def test_auto_resume_without_session_limit_continues_until_completion(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(
+                root=root,
+                task="Complete task",
+                max_steps=1,
+                auto_resume=True,
+                max_sessions=None,
+            )
+            first_state = create_initial_state("Complete task")
+            first_state.handoff_ready = True
+            resumed_state = create_initial_state("Complete task")
+            completed_state = create_initial_state("Complete task")
+            sessions = [
+                AgentLoop._SessionResult(False, True, 1, first_state, "Handoff written."),
+                AgentLoop._SessionResult(True, False, 1, completed_state, "Done."),
+            ]
+
+            events: list[dict[str, object]] = []
+            loop.event_handler = events.append
+            with (
+                patch.object(loop, "_load_or_create_state", return_value=first_state),
+                patch.object(loop, "_run_one_session", side_effect=sessions),
+                patch.object(loop, "_prepare_auto_resume_session", return_value=resumed_state),
+            ):
+                result = loop.run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.sessions, 2)
+        self.assertEqual(result.steps, 2)
+        self.assertEqual(result.message, "Done.")
+        self.assertEqual(
+            events,
+            [{"type": "session_handoff", "session": 2, "max_sessions": None}],
+        )
 
     def test_handoff_contains_session_budget_and_resume_sections(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

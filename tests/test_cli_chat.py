@@ -659,6 +659,26 @@ class ChatCLITests(unittest.TestCase):
         self.assertEqual(cli.messages[-1].content, "Evidence-backed visible answer.")
         self.assertTrue(any("Evidence-backed visible answer." in line for line in outputs))
 
+    def test_finish_turn_keeps_assistant_answer_in_default_terminal_color(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+        result = RunResult(
+            completed=True,
+            steps=1,
+            trace_path=Path.cwd() / "state" / "traces" / "run.jsonl",
+            state_path=Path.cwd() / "state" / "current_task.json",
+            message="Visible answer.",
+        )
+
+        with patch.object(cli, "_append_history"):
+            cli._finish_turn(result)
+
+        self.assertEqual(outputs, ["\033[1;32mAgent >\033[0m Visible answer.\n"])
+
     def test_commands_work_without_starting_agent_loop(self) -> None:
         outputs: list[str] = []
         inputs = iter(["/status", "/history", "/new", "/exit"])
@@ -714,6 +734,44 @@ class ChatCLITests(unittest.TestCase):
         self.assertEqual(outputs[0], f"      {long_summary}")
         self.assertNotIn("thought_summary", outputs[0])
         self.assertEqual(outputs[1], "      calling search needle")
+
+    def test_tool_event_colors_call_blue_and_details_gray(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+
+        cli._show_event(
+            {
+                "type": "tool_start",
+                "action": "read",
+                "target": "README.md",
+                "thought_summary": "Inspect the documentation.",
+            }
+        )
+
+        self.assertEqual(outputs[0], "\033[90m      Inspect the documentation.\033[0m")
+        self.assertEqual(
+            outputs[1],
+            "\033[34m      calling read\033[0m\033[90m README.md\033[0m",
+        )
+
+    def test_session_handoff_event_renders_green_notice(self) -> None:
+        outputs: list[str] = []
+        cli = InteractiveCLI(
+            ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
+            output_fn=outputs.append,
+            use_color=True,
+        )
+
+        cli._show_event({"type": "session_handoff", "session": 2, "max_sessions": None})
+
+        self.assertEqual(
+            outputs,
+            ["\033[1;32mAgent > 已达到上下文阈值，正在自动切换到新会话…\033[0m"],
+        )
 
     def test_tool_event_target_is_not_truncated(self) -> None:
         outputs: list[str] = []

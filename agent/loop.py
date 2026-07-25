@@ -87,8 +87,8 @@ class AgentLoop:
         project_spec_path: Path | None = None,
         materialize_project_spec: bool = True,
         benchmark_id: str | None = None,
-        auto_resume: bool = False,
-        max_sessions: int = 1,
+        auto_resume: bool = True,
+        max_sessions: int | None = None,
         system_validation: bool = True,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
         conversation_messages: list[dict[str, str]] | None = None,
@@ -100,7 +100,7 @@ class AgentLoop:
         self.provider = provider
         self.resume = resume
         self.auto_resume = auto_resume
-        self.max_sessions = max(1, max_sessions)
+        self.max_sessions = max(1, max_sessions) if max_sessions is not None else None
         self.system_validation = system_validation
         self.event_handler = event_handler
         self.conversation_messages = self._normalize_conversation_messages(conversation_messages or [])
@@ -197,7 +197,7 @@ class AgentLoop:
         message = "Reached max steps before completion."
         sessions = 1
 
-        while sessions <= self.max_sessions:
+        while self.max_sessions is None or sessions <= self.max_sessions:
             LOGGER.info(
                 "Session %s/%s started task_id=%s trace=%s",
                 sessions,
@@ -214,9 +214,18 @@ class AgentLoop:
                 break
             if not session.handoff_ready:
                 break
-            if not self.auto_resume or sessions >= self.max_sessions:
+            if not self.auto_resume or (
+                self.max_sessions is not None and sessions >= self.max_sessions
+            ):
                 break
             sessions += 1
+            self._emit_event(
+                {
+                    "type": "session_handoff",
+                    "session": sessions,
+                    "max_sessions": self.max_sessions,
+                }
+            )
             LOGGER.info("Auto-resuming from handoff into session %s/%s", sessions, self.max_sessions)
             state = self._prepare_auto_resume_session()
 
