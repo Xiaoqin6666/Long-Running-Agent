@@ -14,7 +14,12 @@ from agent.integration_contract import (
 )
 from agent.requirement_verifier import project_requirement_evidence_errors
 from agent.requirement_verifier import load_task_requirement_evidence
-from agent.ui_contract import UI_CONTRACT_APPLICABILITY_VALUES, UI_CONTRACT_REQUIRED_FIELDS, validate_ui_contract
+from agent.ui_contract import UI_CONTRACT_APPLICABILITY_VALUES, validate_ui_contract
+from agent.ui_runtime_validation import (
+    evaluate_runtime_ui_contract,
+    runtime_ui_result_errors,
+    write_runtime_ui_results,
+)
 
 
 FINAL_ACCEPTANCE_TASK_ID = "FINAL_ACCEPTANCE"
@@ -34,13 +39,13 @@ def main(argv: list[str] | None = None) -> int:
         dest="ui_contract_validation",
         action="store_true",
         default=True,
-        help="Require and evaluate the system-owned UI Contract. Enabled by default.",
+        help="Require the system-owned UI Contract and run runtime UI validation. Enabled by default.",
     )
     ui_contract_group.add_argument(
         "--no-ui-contract",
         dest="ui_contract_validation",
         action="store_false",
-        help="Skip UI Contract loading and UI validation checks.",
+        help="Skip UI Contract loading and runtime UI validation checks.",
     )
     integration_contract_group = parser.add_mutually_exclusive_group()
     integration_contract_group.add_argument(
@@ -118,16 +123,16 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(ui_contract_data, dict) and ui_contract_data:
                 ui_contract_requirements = _final_acceptance_requirements(tasks) or requirements_data.get("requirements", [])
                 errors.extend(validate_ui_contract({"requirements": ui_contract_requirements}, ui_contract_data))
-                ui_check_results = _evaluate_ui_contract_checks(
+                _remove_legacy_ui_check_results(state_dir)
+                runtime_ui_results = evaluate_runtime_ui_contract(
                     root=root,
-                    requirements=ui_contract_requirements,
-                    contract_data=ui_contract_data,
-                    tasks=tasks,
                     state_dir=state_dir,
+                    tasks=[task for task in tasks if isinstance(task, dict)],
+                    contract_data=ui_contract_data,
                     benchmark_id=args.benchmark_id,
                 )
-                _write_ui_check_results(state_dir, ui_check_results)
-                errors.extend(_ui_check_errors(ui_check_results))
+                write_runtime_ui_results(state_dir, runtime_ui_results)
+                errors.extend(runtime_ui_result_errors(runtime_ui_results))
             else:
                 errors.append("UI Contract is missing for final system validation.")
         errors.extend(
@@ -202,101 +207,6 @@ def _validate_manifest(
         if Path(raw).name != expected_path.name:
             errors.append(f"Final acceptance manifest {key} should reference {expected_path.name}.")
     return errors
-
-
-def _evaluate_ui_contract_checks(
-    *,
-    root: Path,
-    requirements: list[Any],
-    contract_data: dict[str, Any],
-    tasks: list[dict[str, Any]],
-    state_dir: Path,
-    benchmark_id: str = "",
-) -> dict[str, Any]:
-    contract_by_id = {
-        str(item.get("requirement_id", "")).strip(): item
-        for item in contract_data.get("contracts", [])
-        if isinstance(item, dict) and str(item.get("requirement_id", "")).strip()
-    }
-    ui_requirement_ids = {
-        str(requirement.get("id", "")).strip()
-        for requirement in requirements
-        if isinstance(requirement, dict)
-        and str(requirement.get("type", "")).strip().lower() in {"gui_workflow", "report"}
-        and str(requirement.get("id", "")).strip()
-    }
-    verified_ids = _verified_requirement_ids(tasks=tasks, state_dir=state_dir)
-    source_by_requirement = _ui_source_by_requirement(
-        root=root,
-        tasks=tasks,
-        benchmark_id=benchmark_id,
-        ui_requirement_ids=ui_requirement_ids,
-    )
-    results: list[dict[str, Any]] = []
-    for requirement in requirements:
-        if not isinstance(requirement, dict):
-            continue
-        requirement_id = str(requirement.get("id", "")).strip()
-        if not requirement_id:
-            continue
-        contract = contract_by_id.get(requirement_id, {})
-        ui_contract = contract.get("ui_contract", {}) if isinstance(contract, dict) else {}
-        source_info = source_by_requirement.get(requirement_id, {})
-        source_text = str(source_info.get("text", "")) if isinstance(source_info, dict) else ""
-        source_files = source_info.get("files", []) if isinstance(source_info, dict) else []
-        if not isinstance(source_files, list):
-            source_files = []
-        source_files = [str(item) for item in source_files if str(item).strip()]
-        requirement_type = str(requirement.get("type", "")).strip().lower()
-        ui_applicability = _contract_ui_applicability(contract)
-        ui_surface = _contract_ui_surface(contract)
-        ui_applicable = ui_applicability == "required"
-        if ui_applicable:
-            check_details = {
-                field: _evaluate_ui_field(
-                    field=field,
-                    value=ui_contract.get(field) if isinstance(ui_contract, dict) else None,
-                    source_text=source_text,
-                    has_verified_evidence=requirement_id in verified_ids,
-                )
-                for field in UI_CONTRACT_REQUIRED_FIELDS
-            }
-        else:
-            check_details = {
-                field: {
-                    "passed": True,
-                    "reason": (
-                        f"UI widget check is {ui_applicability} for "
-                        f"surface {ui_surface}; full UI field checks apply only when ui_applicability is required"
-                    ),
-                }
-                for field in UI_CONTRACT_REQUIRED_FIELDS
-            }
-        checks = {field: detail["passed"] for field, detail in check_details.items()}
-        results.append(
-            {
-                "requirement_id": requirement_id,
-                "requirement_type": requirement_type,
-                "ui_applicability": ui_applicability,
-                "ui_surface": ui_surface,
-                "ui_check_applicable": ui_applicable,
-                "source_files": source_files,
-                "repair_targets": source_files if ui_applicable and not all(checks.values()) else [],
-                "required_action": (
-                    "inspect_and_repair_generated_code" if ui_applicable and not all(checks.values()) else ""
-                ),
-                "checks": checks,
-                "details": check_details,
-                "passed": all(checks.values()),
-            }
-        )
-    return {
-        "kind": "ui_check_results",
-        "version": 1,
-        "source": "system_validation",
-        "results": results,
-        "passed": all(item.get("passed") is True for item in results) if results else False,
-    }
 
 
 def _contract_ui_applicability(contract: object) -> str:
@@ -727,44 +637,13 @@ def _has_success_refresh(text: str) -> bool:
     )
 
 
-def _write_ui_check_results(state_dir: Path, results: dict[str, Any]) -> None:
+def _remove_legacy_ui_check_results(state_dir: Path) -> None:
     path = state_dir / "system_validation" / "ui_check_results.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _ui_check_errors(results: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    for item in results.get("results", []):
-        if not isinstance(item, dict):
-            continue
-        if item.get("passed") is True:
-            continue
-        requirement_id = str(item.get("requirement_id", "")).strip() or "<unknown>"
-        checks = item.get("checks", {})
-        failed_fields = [
-            field
-            for field, passed in checks.items()
-            if passed is not True
-        ] if isinstance(checks, dict) else list(UI_CONTRACT_REQUIRED_FIELDS)
-        repair_targets = [
-            str(target)
-            for target in item.get("repair_targets", [])
-            if str(target).strip()
-        ] if isinstance(item.get("repair_targets", []), list) else []
-        target_text = " repair_targets: " + ", ".join(repair_targets) if repair_targets else ""
-        errors.append(
-            f"UI check failed for {requirement_id}: "
-            + ", ".join(failed_fields)
-            + ". Inspect and repair generated code files."
-            + target_text
-        )
-    if results.get("passed") is not True:
-        errors.append(
-            "Final UI validation requires every UI Contract check for every requirement to pass; "
-            "when a field is false, inspect and repair the listed generated workspace code before retrying."
-        )
-    return errors
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _print_line(text: str) -> None:

@@ -69,9 +69,9 @@ class ChatCLITests(unittest.TestCase):
         self.assertNotIn("/ask", outputs[-1])
         self.assertIn("project spec file", outputs[-1])
 
-    def test_plain_message_requires_selected_mode(self) -> None:
+    def test_plain_message_defaults_to_agent_mode(self) -> None:
         outputs: list[str] = []
-        inputs = iter(["show status", "/exit"])
+        inputs = iter(["build a budget app", "/send", "/exit"])
         cli = InteractiveCLI(
             ChatConfig(root=Path.cwd(), provider="offline", max_steps=1),
             input_fn=lambda prompt: next(inputs),
@@ -80,8 +80,10 @@ class ChatCLITests(unittest.TestCase):
         )
         with patch.object(cli, "_run_agent_project_flow") as run_agent:
             self.assertEqual(cli.run(), 0)
-        run_agent.assert_not_called()
-        self.assertIn("Choose /chat for conversation, /agent for new project work, or /adjust to modify an existing run.", outputs)
+        run_agent.assert_called_once_with("build a budget app")
+        self.assertEqual(cli.active_mode, "agent")
+        self.assertTrue(any("Agent mode is active by default" in output for output in outputs))
+        self.assertTrue(any("Added to agent requirements draft" in output for output in outputs))
 
     def test_plain_message_uses_active_mode(self) -> None:
         outputs: list[str] = []

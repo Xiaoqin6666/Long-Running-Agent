@@ -699,8 +699,12 @@ class ContextBuilder:
         )
 
     def _final_acceptance_validation_artifact_policy(self) -> str:
-        artifacts = ["final_acceptance_manifest.json", "ui_contract.json", "ui_check_results.json"]
-        result_files = ["ui_check_results.json"]
+        artifacts = [
+            "final_acceptance_manifest.json",
+            "ui_contract.json",
+            "runtime_ui_results.json",
+        ]
+        result_files = ["runtime_ui_results.json"]
         if self.integration_contract_validation:
             artifacts.extend(["integration_contract.json", "integration_results.json"])
             result_files.append("integration_results.json")
@@ -1002,10 +1006,8 @@ class ContextBuilder:
                     f"- {self._rel(self.state_dir / 'generated_tasks.json')} must contain a JSON object with a non-empty tasks list whose tasks reference requirements.json.",
                     "First extract a lightweight Requirement Coverage Matrix to requirements.json as {\"requirements\":[{id, source, text, type, priority, acceptance_intent?, frozen_acceptance?}]}, where priority is must|should|could|won't. Use stable ids such as REQ-EMP-ADD, source references like task.md:3.1, and type values such as gui_workflow, service_logic, persistence, report, or reference. Do not invent detailed test files, verification commands, GUI handler assertions, or exhaustive assertion_targets during INIT; those belong to the selected Worker task.",
                     "requirements.json must be pretty-printed exactly like json.dumps(payload, ensure_ascii=False, indent=2) plus a trailing newline. Do not write requirements.json as single-line JSON.",
-                    "Then generate tasks in generated_tasks.json. Every must requirement from requirements.json must be covered by at least one generated task.",
+                    "Then generate tasks in generated_tasks.json.",
                     "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', requirement_ids, expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
-                    "Task planning rules after requirement capture:",
-                    "1. Preserve traceability. Each task must reference stable requirement_ids from requirements.json. Every must requirement must be covered. Do not invent new requirement ids in generated_tasks.json.",
                 ]
                 if self.generate_requirements
                 else [
@@ -1013,17 +1015,9 @@ class ContextBuilder:
                     "Requirement generation is disabled for this run: do not create, read, or reference requirements.json during INIT.",
                     "Generate tasks directly in generated_tasks.json from the project specification.",
                     "Keep generated_tasks.json lightweight. Each generated task must include id, title, integer priority, depends_on, status='pending', expected_artifacts, and implementation_artifacts when applicable. Include worker_test_artifacts for the test files the Worker should write first, but do not include requirement_ids, verification_assets, verification_commands, criterion_command_map, or copied requirement snapshots during INIT.",
-                    "Task planning rules:",
-                    "1. Preserve traceability through clear task titles, artifact ownership, and dependency edges. Do not invent placeholder requirement ids.",
                 ]
             ),
             f"- {self._rel(self.state_dir / 'init.sh')} is the run-local initializer entrypoint. It must be a POSIX shell script beginning with '#!/usr/bin/env sh' and 'set -eu'; it may invoke Python commands but must not contain Python source code.",
-            "2. Keep tasks small and independently verifiable. A task should usually cover 1-5 closely related requirements and own a small coherent artifact set. Avoid tasks that span many unrelated UI regions, services, dialogs, widgets, and integration flows at once.",
-            "3. Split by executable verification boundary, not just by folder. A good task is one whose worker_test_artifacts can verify the task without requiring the whole application to be complete. Prefer targeted tests over full-suite tests.",
-            "4. Separate foundations from integrations. Plan data models, storage, service logic, UI shell, widget/dialog primitives, panel APIs, and end-to-end integration as separate tasks with explicit depends_on edges.",
-            "5. Avoid duplicate requirement ownership. Assign each requirement to one primary implementation task when possible. Only repeat a requirement_id in a later integration task when the later task verifies cross-component behavior that cannot be verified in the primary task alone.",
-            "6. For GUI projects, plan non-interactive verification. UI tasks must be testable without human clicks. Generated tasks for Tkinter/PyQt/etc. must require test_mode, dependency-injected dialogs, or mocked modal functions. Worker tests must not rely on mainloop(), messagebox.askyesno(), simpledialog.askstring(), or manual window interaction.",
-            "7. For UI tasks, split shell, components, dialogs/widgets, and integration. Do not create a single \"Main Window and Panels\" task that owns the entire UI. Use smaller tasks: UI shell and test_mode infrastructure; panel public APIs and widget structure; dialogs with non-blocking test adapters; custom widgets; workflow integration across panels.",
             (
                 "When a generated task is later selected, the harness derives frozen acceptance criteria from requirements.json using frozen_acceptance when present, otherwise acceptance_intent or text. The Worker must write the selected task's worker_test_artifacts first, putting GUI handler and observable state-change assertions in those test files, then use action='contract' to provide the verification_procedure that runs those tests. Only after that may the Worker write implementation_artifacts."
                 if self.generate_requirements

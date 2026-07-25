@@ -93,7 +93,7 @@ class InteractiveCLI:
         self.messages: list[ChatMessage] = []
         self.last_task = ""
         self.last_result: RunResult | None = None
-        self.active_mode = "idle"
+        self.active_mode = "agent"
         self.agent_draft: list[str] = []
         self.context_message_start = 0
 
@@ -191,10 +191,10 @@ class InteractiveCLI:
             self.context_message_start = 0
             self.last_task = ""
             self.last_result = None
-            self.active_mode = "idle"
+            self.active_mode = "agent"
             self.agent_draft.clear()
             self._append_history(ChatMessage("system", "Conversation context reset."))
-            self.output("Started a new conversation context.")
+            self.output("Started a new conversation context. Agent mode is active.")
         else:
             self.output(f"Unknown command: {command}. Type /help for commands.")
         return False
@@ -404,7 +404,7 @@ class InteractiveCLI:
             f"    Provider: {self._paint(self.config.provider, 'green')}"
         )
         self.output(f"  Workspace: {compact_text(self.config.root, UI_WIDTH - 15)}")
-        self.output(self._paint("  Use /agent for new project work, /adjust for changes, /resume for continue in next session, /help for commands.", "dim"))
+        self.output(self._paint("  Agent mode is active by default. Paste requirements, then /send. Use /chat, /adjust, /resume, or /help.", "dim"))
         self.output("")
 
     def _paint(self, text: object, color: str, bold: bool = False) -> str:

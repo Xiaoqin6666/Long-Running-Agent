@@ -89,13 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ui_contract_validation",
         action="store_true",
         default=True,
-        help="Generate and enforce the UI Contract during final system validation. Enabled by default.",
+        help="Generate the UI Contract and enforce runtime UI validation during final system validation. Enabled by default.",
     )
     ui_contract_group.add_argument(
         "--no-ui-contract",
         dest="ui_contract_validation",
         action="store_false",
-        help="Disable UI Contract generation and final UI Contract checks while keeping other final validation enabled.",
+        help="Disable UI Contract generation and final runtime UI validation while keeping other final validation enabled.",
     )
     integration_contract_group = parser.add_mutually_exclusive_group()
     integration_contract_group.add_argument(

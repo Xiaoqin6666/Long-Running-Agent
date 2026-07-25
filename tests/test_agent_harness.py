@@ -28,7 +28,11 @@ from agent.planner import (
 )
 from agent.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from agent.requirement_verifier import validate_task_requirement_closeout
-from agent.system_validation import main as system_validation_main
+from agent.system_validation import (
+    _evaluate_ui_field,
+    _ui_source_by_requirement,
+    main as system_validation_main,
+)
 from agent.termination import ProjectTerminator, decide_termination, evaluate_task_graph
 from agent.tools import ToolResult
 from agent.tools.bash import BashTool
@@ -37,7 +41,14 @@ from agent.tools.git import GitTool
 from agent.tools.list_files import ListFilesTool
 from agent.tools.read import ReadTool
 from agent.tools.search import SearchTool
+from agent.integration_contract import (
+    OpenAICompatibleIntegrationContractBuilder,
+    OpenAICompatibleIntegrationResultJudge,
+    evaluate_integration_contract,
+    validate_integration_contract,
+)
 from agent.ui_contract import OpenAICompatibleUIContractBuilder, build_ui_contract, validate_ui_contract
+from agent.ui_runtime_validation import evaluate_runtime_ui_contract
 from agent.verifier import Verifier
 from eval.metrics import load_events, summarize
 
@@ -141,12 +152,6 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn('"worker_test_artifacts"', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("verification_procedure", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("write the task's worker_test_artifacts first", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("1-5 closely related requirements", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("independently verifiable", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("targeted tests are preferred over full-suite tests", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("test_mode, dependency-injected dialogs, or mocked modal functions", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn("must not rely on mainloop()", MAIN_AGENT_SYSTEM_PROMPT)
-        self.assertIn('do not create a single "Main Window and Panels" task', MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Read narrowly instead of preloading the repository", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("continue read has_more pages", MAIN_AGENT_SYSTEM_PROMPT)
         self.assertIn("Avoid Unix-only commands", MAIN_AGENT_SYSTEM_PROMPT)
@@ -935,6 +940,26 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertFalse(disabled_args.system_validation)
         self.assertTrue(enabled_args.system_validation)
 
+    def test_cli_can_disable_ui_contract_validation(self) -> None:
+        parser = build_parser()
+        default_args = parser.parse_args(["Task"])
+        disabled_args = parser.parse_args(["Task", "--no-ui-contract"])
+        enabled_args = parser.parse_args(["Task", "--ui-contract"])
+
+        self.assertTrue(default_args.ui_contract_validation)
+        self.assertFalse(disabled_args.ui_contract_validation)
+        self.assertTrue(enabled_args.ui_contract_validation)
+
+    def test_cli_can_enable_integration_contract_validation(self) -> None:
+        parser = build_parser()
+        default_args = parser.parse_args(["Task"])
+        disabled_args = parser.parse_args(["Task", "--no-integration-contract"])
+        enabled_args = parser.parse_args(["Task", "--integration-contract"])
+
+        self.assertFalse(default_args.integration_contract_validation)
+        self.assertFalse(disabled_args.integration_contract_validation)
+        self.assertTrue(enabled_args.integration_contract_validation)
+
     def test_cli_defaults_to_unlimited_steps_per_session(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["Task"])
@@ -1080,13 +1105,103 @@ class HarnessBehaviorTests(unittest.TestCase):
             self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "project_spec.md").exists())
             self.assertIn("Read specs/user_project_spec.md", context)
             self.assertIn("do not rewrite or regenerate it", context)
-            self.assertIn("Task planning rules after requirement capture", context)
-            self.assertIn("1-5 closely related requirements", context)
-            self.assertIn("Prefer targeted tests over full-suite tests", context)
-            self.assertIn("test_mode, dependency-injected dialogs, or mocked modal functions", context)
-            self.assertIn("Do not create a single \"Main Window and Panels\" task", context)
+            self.assertIn("priority MUST be an integer", context)
+            self.assertIn("Do not create application code", context)
             self.assertNotIn("state/benchmarks/todo_counter/project_spec.md must exist", context)
             self.assertNotIn("state/benchmarks/todo_counter/project_spec.md", loop._initializer_allowed_targets(state))
+
+    def test_project_spec_initializer_can_skip_requirements_generation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+                generate_requirements=False,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+
+            state = loop._load_or_create_state()
+            context = loop.context_builder.build(state)
+            allowed_targets = loop._initializer_allowed_targets(state)
+
+            self.assertEqual(state.task_id, "INIT")
+            self.assertNotIn("requirements.json", "\n".join(state.acceptance_criteria))
+            self.assertNotIn("state/benchmarks/todo_counter/requirements.json", state.nodes[0]["expected_artifacts"])
+            self.assertNotIn("state/benchmarks/todo_counter/requirements.json", allowed_targets)
+            self.assertIn("Requirement generation is disabled for this run", context)
+            self.assertIn("Generate tasks directly in generated_tasks.json", context)
+            self.assertNotIn("Minimal requirements.json example", context)
+
+    def test_initializer_verify_accepts_direct_task_plan_without_requirements(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "eval" / "benchmarks" / "todo_counter" / "project_spec.md"
+            spec.parent.mkdir(parents=True)
+            spec.write_text(
+                "The generated application should live under `eval/benchmarks/todo_counter/workspace`.\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task=spec.read_text(encoding="utf-8"),
+                max_steps=1,
+                project_spec_path=spec,
+                benchmark_id="todo_counter",
+                generate_requirements=False,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initializer_state(
+                spec.read_text(encoding="utf-8"),
+                project_spec_artifact="eval/benchmarks/todo_counter/project_spec.md",
+                generated_tasks_artifact="state/benchmarks/todo_counter/generated_tasks.json",
+                init_artifact="state/benchmarks/todo_counter/init.sh",
+                generate_requirements=False,
+            )
+            graph = {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "title": "Implement counter",
+                        "priority": 1,
+                        "depends_on": [],
+                        "status": "pending",
+                        "expected_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "implementation_artifacts": [
+                            "eval/benchmarks/todo_counter/workspace/todo_counter/core.py"
+                        ],
+                        "worker_test_artifacts": [],
+                    }
+                ]
+            }
+            loop.generated_tasks_path.write_text(
+                json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (loop.state_dir / "init.sh").write_text(
+                "#!/usr/bin/env sh\nset -eu\npython -c \"assert True\"\n",
+                encoding="utf-8",
+            )
+
+            initializer_validation = loop._validate_initializer_outputs()
+            observation = loop._execute_action({"action": "verify", "target": "default", "args": {}}, state)
+
+        self.assertTrue(observation.ok)
+        self.assertTrue(initializer_validation.ok)
+        self.assertEqual(initializer_validation.data["requirement_count"], 0)
+        self.assertFalse((root / "state" / "benchmarks" / "todo_counter" / "requirements.json").exists())
 
     def test_initializer_update_plan_does_not_complete_init(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -1841,10 +1956,15 @@ class HarnessBehaviorTests(unittest.TestCase):
 
             result = terminator.evaluate()
 
-            ui_results = state_dir / "system_validation" / "ui_check_results.json"
-            ui_results.parent.mkdir(parents=True)
-            ui_results.write_text(
-                json.dumps({"kind": "ui_check_results", "passed": True}, indent=2) + "\n",
+            runtime_ui_results = state_dir / "system_validation" / "runtime_ui_results.json"
+            runtime_ui_results.parent.mkdir(parents=True)
+            runtime_ui_results.write_text(
+                json.dumps({"kind": "runtime_ui_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            integration_results = state_dir / "system_validation" / "integration_results.json"
+            integration_results.write_text(
+                json.dumps({"kind": "integration_check_results", "passed": True}, indent=2) + "\n",
                 encoding="utf-8",
             )
             tasks_path.write_text(
@@ -1871,6 +1991,99 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("final_validation_not_passing", result.reasons)
         self.assertEqual(result.checks["final_validation"]["reason"], "final_acceptance_not_scheduled")
         self.assertEqual(completed.status, "completed")
+
+    def test_termination_can_disable_ui_contract_result_requirement(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            tasks_path = state_dir / "generated_tasks.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "priority": 1, "depends_on": []},
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "status": "completed",
+                                "priority": 2,
+                                "depends_on": ["T1"],
+                            },
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            terminator = ProjectTerminator(
+                root,
+                tasks_path=tasks_path,
+                benchmark_id="sample",
+                state_dir=state_dir,
+                final_validation_required=True,
+                ui_contract_required=False,
+            )
+
+            result = terminator.evaluate()
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.checks["final_validation"]["runtime_ui_results_path"], "")
+        self.assertEqual(result.checks["final_validation"]["integration_results_path"], "")
+        self.assertIn("configured final validation checks", result.checks["final_validation"]["summary"])
+
+    def test_termination_requires_integration_results_only_when_enabled(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            tasks_path = state_dir / "generated_tasks.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "priority": 1, "depends_on": []},
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "status": "completed",
+                                "priority": 2,
+                                "depends_on": ["T1"],
+                            },
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime_ui_results = state_dir / "system_validation" / "runtime_ui_results.json"
+            runtime_ui_results.parent.mkdir(parents=True)
+            runtime_ui_results.write_text(
+                json.dumps({"kind": "runtime_ui_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            terminator = ProjectTerminator(
+                root,
+                tasks_path=tasks_path,
+                benchmark_id="sample",
+                state_dir=state_dir,
+                final_validation_required=True,
+                integration_contract_required=True,
+            )
+
+            result = terminator.evaluate()
+
+            integration_results = state_dir / "system_validation" / "integration_results.json"
+            integration_results.write_text(
+                json.dumps({"kind": "integration_check_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            completed = terminator.evaluate()
+
+        self.assertEqual(result.status, "continue_running")
+        self.assertEqual(result.checks["final_validation"]["reason"], "integration_results_missing")
+        self.assertEqual(completed.status, "completed")
+        self.assertTrue(completed.checks["final_validation"]["integration_results_path"].endswith("integration_results.json"))
 
     def test_termination_reports_failure_instead_of_fake_completion(self) -> None:
         checks = {
@@ -3923,6 +4136,9 @@ class HarnessBehaviorTests(unittest.TestCase):
             current_task_data = json.loads(loop.state_path.read_text(encoding="utf-8"))
             ui_contract_path = root / "state" / "benchmarks" / "sample" / "system_validation" / "ui_contract.json"
             ui_contract_exists = ui_contract_path.exists()
+            integration_contract_exists = (
+                root / "state" / "benchmarks" / "sample" / "system_validation" / "integration_contract.json"
+            ).exists()
 
         self.assertFalse(result.ok)
         self.assertIn("final acceptance task was created", result.summary)
@@ -3941,7 +4157,9 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(result.data["validation_artifacts"], final_task["frozen_acceptance_artifacts"])
         self.assertIn("state/benchmarks/sample/system_validation/final_acceptance_manifest.json", final_task["frozen_acceptance_artifacts"])
         self.assertIn("state/benchmarks/sample/system_validation/ui_contract.json", final_task["frozen_acceptance_artifacts"])
+        self.assertNotIn("state/benchmarks/sample/system_validation/integration_contract.json", final_task["frozen_acceptance_artifacts"])
         self.assertTrue(ui_contract_exists)
+        self.assertFalse(integration_contract_exists)
         self.assertEqual(state.task_id, "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["id"], "FINAL_ACCEPTANCE")
         self.assertEqual(state.nodes[0]["status"], "in_progress")
@@ -3949,6 +4167,113 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertEqual(current_task_data["task_id"], "FINAL_ACCEPTANCE")
         self.assertEqual(current_task_data["nodes"][0]["id"], "FINAL_ACCEPTANCE")
         self.assertEqual(current_task_data["nodes"][0]["status"], "in_progress")
+
+    def test_final_acceptance_can_enable_integration_contract_artifacts(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "source_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implemented",
+                                "priority": 1,
+                                "status": "completed",
+                                "depends_on": [],
+                                "expected_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                                "implementation_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark project",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+                integration_contract_validation=True,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Implemented", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+            system_validation_dir = root / "state" / "benchmarks" / "sample" / "system_validation"
+            manifest = json.loads((system_validation_dir / "final_acceptance_manifest.json").read_text(encoding="utf-8"))
+            integration_contract = json.loads((system_validation_dir / "integration_contract.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(result.ok)
+        final_task = data["tasks"][1]
+        self.assertIn(
+            "state/benchmarks/sample/system_validation/integration_contract.json",
+            final_task["frozen_acceptance_artifacts"],
+        )
+        self.assertIn("--integration-contract", final_task["verification_commands"][0])
+        self.assertTrue(manifest["integration_contract_enabled"])
+        self.assertEqual(integration_contract["kind"], "system_owned_integration_contract")
+
+    def test_final_acceptance_can_disable_ui_contract_artifacts(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "source_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Implemented",
+                                "priority": 1,
+                                "status": "completed",
+                                "depends_on": [],
+                                "expected_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                                "implementation_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                                "worker_test_artifacts": [],
+                                "verification_commands": ["python -c \"assert True\""],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Benchmark project",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+                ui_contract_validation=False,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Benchmark project")
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Implemented", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+            system_validation_dir = root / "state" / "benchmarks" / "sample" / "system_validation"
+            manifest = json.loads((system_validation_dir / "final_acceptance_manifest.json").read_text(encoding="utf-8"))
+            ui_contract_exists = (system_validation_dir / "ui_contract.json").exists()
+
+        self.assertFalse(result.ok)
+        final_task = data["tasks"][1]
+        self.assertNotIn(
+            "state/benchmarks/sample/system_validation/ui_contract.json",
+            final_task["frozen_acceptance_artifacts"],
+        )
+        self.assertIn("--no-ui-contract", final_task["verification_commands"][0])
+        self.assertFalse(ui_contract_exists)
+        self.assertFalse(manifest["ui_contract_enabled"])
+        self.assertNotIn("ui_contract_path", manifest)
 
     def test_ui_contract_generated_for_gui_requirement_shape(self) -> None:
         requirement = {
@@ -3975,6 +4300,370 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertTrue(entry["empty_state"])
         self.assertTrue(entry["success_refresh"])
 
+    def test_ui_contract_field_checks_accept_tkinter_dropdowns_and_chinese_no_ui(self) -> None:
+        source_text = (
+            "import tkinter as tk\n"
+            "root = tk.Frame()\n"
+            "role_var = tk.StringVar(value='pm')\n"
+            "menu = tk.OptionMenu(root, role_var, 'pm', 'finance', command=lambda value: None)\n"
+            "todo_list = tk.Listbox(root)\n"
+            "todo_list.bind('<<ListboxSelect>>', lambda event: None)\n"
+            "status_var = tk.StringVar(value='ready')\n"
+            "status_var.set('updated')\n"
+            "label = tk.Label(root, text='暂无待办')\n"
+            "todo_list.insert(tk.END, 'item')\n"
+        )
+
+        self.assertTrue(
+            _evaluate_ui_field(
+                field="entry_points",
+                value=["底部状态栏角色下拉菜单"],
+                source_text=source_text,
+                has_verified_evidence=True,
+            )["passed"]
+        )
+        self.assertTrue(
+            _evaluate_ui_field(
+                field="inputs",
+                value=["角色选择下拉列表"],
+                source_text=source_text,
+                has_verified_evidence=True,
+            )["passed"]
+        )
+        self.assertTrue(
+            _evaluate_ui_field(
+                field="buttons",
+                value=["无"],
+                source_text=source_text,
+                has_verified_evidence=True,
+            )["passed"]
+        )
+        self.assertTrue(
+            _evaluate_ui_field(
+                field="dialogs",
+                value=["无模态弹窗"],
+                source_text=source_text,
+                has_verified_evidence=True,
+            )["passed"]
+        )
+
+    def test_ui_contract_sources_include_workspace_ui_support_for_gui_requirements(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            left_panel = workspace / "sample_app" / "ui" / "panels" / "left_panel.py"
+            main_py = workspace / "main.py"
+            service = workspace / "sample_app" / "services" / "workflow.py"
+            left_panel.parent.mkdir(parents=True)
+            service.parent.mkdir(parents=True)
+            main_py.write_text("import tkinter as tk\nroot = tk.Frame()\n", encoding="utf-8")
+            left_panel.write_text("import tkinter as tk\nitems = tk.Listbox()\n", encoding="utf-8")
+            service.write_text("class Workflow: pass\n", encoding="utf-8")
+            tasks = [
+                {
+                    "id": "T1",
+                    "requirement_ids": ["REQ-AP-01"],
+                    "expected_artifacts": [
+                        "eval/benchmarks/sample/workspace/sample_app/services/workflow.py"
+                    ],
+                },
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "final_acceptance": True,
+                    "requirements": [
+                        {"id": "REQ-AP-01", "type": "gui_workflow"},
+                    ],
+                },
+            ]
+
+            sources = _ui_source_by_requirement(
+                root=root,
+                tasks=tasks,
+                benchmark_id="sample",
+                ui_requirement_ids={"REQ-AP-01"},
+            )
+
+        files = sources["REQ-AP-01"]["files"]
+        self.assertIn("eval/benchmarks/sample/workspace/sample_app/services/workflow.py", files)
+        self.assertIn("eval/benchmarks/sample/workspace/main.py", files)
+        self.assertIn("eval/benchmarks/sample/workspace/sample_app/ui/panels/left_panel.py", files)
+        self.assertIn("tk.Listbox", sources["REQ-AP-01"]["text"])
+
+    def test_system_validation_does_not_require_task_verification_commands(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            tasks_path = state_dir / "generated_tasks.json"
+            requirements_path = state_dir / "requirements.json"
+            manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
+            integration_contract_path = state_dir / "system_validation" / "integration_contract.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "Completed task without frozen command in task graph",
+                                "status": "completed",
+                                "depends_on": [],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "title": "Run project-level final acceptance",
+                                "status": "in_progress",
+                                "depends_on": ["T1"],
+                                "final_acceptance": True,
+                            },
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_final_acceptance",
+                        "validator": "agent.system_validation",
+                        "tasks_path": "state/benchmarks/sample/generated_tasks.json",
+                        "requirements_path": "state/benchmarks/sample/requirements.json",
+                        "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                        "integration_contract_path": "state/benchmarks/sample/system_validation/integration_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            integration_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_integration_contract",
+                        "version": 1,
+                        "entry_points": [],
+                        "module_edges": [],
+                        "required_scenarios": [],
+                        "static_checks": [],
+                        "dynamic_checks": [],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (state_dir / "current_task.json").write_text("{not json", encoding="utf-8")
+
+            result = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    str(requirements_path.relative_to(root)),
+                    "--benchmark-id",
+                    "sample",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_system_validation_can_disable_ui_contract_checks(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            workspace.mkdir(parents=True)
+            requirement = {
+                "id": "REQ-GUI",
+                "source": "task.md:1",
+                "text": "The GUI adds a record and refreshes the visible list.",
+                "type": "gui_workflow",
+                "priority": "must",
+            }
+            command = "python -c \"assert True\""
+            tasks_path = state_dir / "generated_tasks.json"
+            requirements_path = state_dir / "requirements.json"
+            manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
+            integration_contract_path = state_dir / "system_validation" / "integration_contract.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "GUI",
+                                "status": "completed",
+                                "depends_on": [],
+                                "requirement_ids": ["REQ-GUI"],
+                                "expected_artifacts": ["eval/benchmarks/sample/workspace/app.py"],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "title": "Run project-level final acceptance",
+                                "status": "in_progress",
+                                "depends_on": ["T1"],
+                                "requirements": [requirement],
+                                "final_acceptance": True,
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            requirements_path.write_text(
+                json.dumps({"requirements": [requirement]}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_final_acceptance",
+                        "validator": "agent.system_validation",
+                        "tasks_path": "state/benchmarks/sample/generated_tasks.json",
+                        "requirements_path": "state/benchmarks/sample/requirements.json",
+                        "ui_contract_enabled": False,
+                        "integration_contract_path": "state/benchmarks/sample/system_validation/integration_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            integration_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_integration_contract",
+                        "version": 1,
+                        "entry_points": [],
+                        "module_edges": [],
+                        "required_scenarios": [],
+                        "static_checks": [],
+                        "dynamic_checks": [],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (state_dir / "task_evidence").mkdir()
+            (state_dir / "task_evidence" / "T1.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T1",
+                        "requirements": [
+                            {
+                                "id": "REQ-GUI",
+                                "status": "verified",
+                                "evidence": [
+                                    {
+                                        "type": "automated_test",
+                                        "command": command,
+                                        "test_files": ["eval/benchmarks/sample/workspace/tests/test_gui.py"],
+                                        "result": "passed",
+                                        "assertion_targets": ["visible list refreshes"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                    "--no-ui-contract",
+                ]
+            )
+            ui_results_exists = (state_dir / "system_validation" / "ui_check_results.json").exists()
+            runtime_ui_results_exists = (state_dir / "system_validation" / "runtime_ui_results.json").exists()
+            integration_results_exists = (state_dir / "system_validation" / "integration_results.json").exists()
+
+        self.assertEqual(result, 0)
+        self.assertFalse(ui_results_exists)
+        self.assertFalse(runtime_ui_results_exists)
+        self.assertFalse(integration_results_exists)
+
+    def test_runtime_ui_validation_rejects_button_bound_to_noop_handler(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "eval" / "benchmarks" / "sample" / "workspace"
+            ui_file = workspace / "mapa" / "ui" / "main_window.py"
+            ui_file.parent.mkdir(parents=True)
+            ui_file.write_text(
+                "import tkinter as tk\n"
+                "from tkinter import ttk\n\n"
+                "class MainWindow(tk.Tk):\n"
+                "    def __init__(self):\n"
+                "        super().__init__()\n"
+                "        self.btn_create_project = ttk.Button(self, text='新建项目', command=self._on_create_project)\n"
+                "        self.btn_create_project.pack()\n\n"
+                "    def _on_create_project(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            tasks = [
+                {
+                    "id": "T1",
+                    "requirement_ids": ["REQ-PM-01"],
+                    "implementation_artifacts": [
+                        "eval/benchmarks/sample/workspace/mapa/ui/main_window.py"
+                    ],
+                }
+            ]
+            contract = {
+                "kind": "ui_contract",
+                "contracts": [
+                    {
+                        "requirement_id": "REQ-PM-01",
+                        "type": "gui_workflow",
+                        "ui_applicability": "required",
+                        "ui_surface": "dialog",
+                        "ui_contract": {
+                            "entry_points": ["新建项目"],
+                            "buttons": ["新建项目"],
+                        },
+                    }
+                ],
+            }
+
+            result = evaluate_runtime_ui_contract(
+                root=root,
+                state_dir=root / "state" / "benchmarks" / "sample",
+                tasks=tasks,
+                contract_data=contract,
+                benchmark_id="sample",
+            )
+
+        self.assertFalse(result["passed"])
+        wiring_check = next(item for item in result["checks"] if item["id"] == "button_command_wiring")
+        self.assertFalse(wiring_check["passed"])
+        self.assertEqual(wiring_check["issues"][0]["handler"], "_on_create_project")
+        self.assertEqual(result["results"][0]["repair_targets"], ["eval/benchmarks/sample/workspace/mapa/ui/main_window.py"])
+
     def test_system_validation_requires_per_requirement_ui_checks(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3993,6 +4682,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             requirements_path = state_dir / "requirements.json"
             manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
             ui_contract_path = state_dir / "system_validation" / "ui_contract.json"
+            integration_contract_path = state_dir / "system_validation" / "integration_contract.json"
             tasks_path.parent.mkdir(parents=True)
             tasks_payload = {
                 "tasks": [
@@ -4029,6 +4719,23 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "tasks_path": "state/benchmarks/sample/generated_tasks.json",
                         "requirements_path": "state/benchmarks/sample/requirements.json",
                         "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                        "integration_contract_path": "state/benchmarks/sample/system_validation/integration_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            integration_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_integration_contract",
+                        "version": 1,
+                        "entry_points": [],
+                        "module_edges": [],
+                        "required_scenarios": [],
+                        "static_checks": [],
+                        "dynamic_checks": [],
                     },
                     indent=2,
                 )
@@ -4083,7 +4790,7 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "sample",
                 ]
             )
-            failed_results = json.loads((state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8"))
+            failed_results = json.loads((state_dir / "system_validation" / "runtime_ui_results.json").read_text(encoding="utf-8"))
             (state_dir / "task_evidence").mkdir()
             (state_dir / "task_evidence" / "T1.json").write_text(
                 json.dumps(
@@ -4126,7 +4833,7 @@ class HarnessBehaviorTests(unittest.TestCase):
                 ]
             )
             verified_but_no_ui_results = json.loads(
-                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+                (state_dir / "system_validation" / "runtime_ui_results.json").read_text(encoding="utf-8")
             )
             (workspace / "app.py").write_text(
                 "import tkinter as tk\n"
@@ -4163,25 +4870,135 @@ class HarnessBehaviorTests(unittest.TestCase):
                     "sample",
                 ]
             )
-            passed_results = json.loads((state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8"))
+            passed_results = json.loads(
+                (state_dir / "system_validation" / "runtime_ui_results.json").read_text(encoding="utf-8")
+            )
+            legacy_ui_results_exists = (state_dir / "system_validation" / "ui_check_results.json").exists()
 
         self.assertEqual(failed, 1)
-        self.assertFalse(failed_results["results"][0]["passed"])
-        self.assertFalse(failed_results["results"][0]["checks"]["entry_points"])
-        self.assertEqual(failed_results["results"][0]["source_files"], ["eval/benchmarks/sample/workspace/app.py"])
-        self.assertEqual(failed_results["results"][0]["repair_targets"], ["eval/benchmarks/sample/workspace/app.py"])
-        self.assertEqual(failed_results["results"][0]["required_action"], "inspect_and_repair_generated_code")
+        self.assertFalse(failed_results["passed"])
+        self.assertFalse(next(item for item in failed_results["checks"] if item["id"] == "workspace_ui_sources")["passed"])
         self.assertEqual(verified_but_no_ui, 1)
-        self.assertFalse(verified_but_no_ui_results["results"][0]["passed"])
-        self.assertFalse(verified_but_no_ui_results["results"][0]["checks"]["buttons"])
-        self.assertEqual(
-            verified_but_no_ui_results["results"][0]["repair_targets"],
-            ["eval/benchmarks/sample/workspace/app.py"],
-        )
+        self.assertFalse(verified_but_no_ui_results["passed"])
+        self.assertFalse(next(item for item in verified_but_no_ui_results["checks"] if item["id"] == "workspace_ui_sources")["passed"])
         self.assertEqual(passed, 0)
         self.assertTrue(passed_results["passed"])
-        self.assertTrue(all(passed_results["results"][0]["checks"].values()))
-        self.assertEqual(passed_results["results"][0]["required_action"], "")
+        self.assertTrue(next(item for item in passed_results["checks"] if item["id"] == "button_command_wiring")["passed"])
+        self.assertFalse(legacy_ui_results_exists)
+
+    def test_system_validation_runs_integration_contract_checks(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            tasks_path = state_dir / "generated_tasks.json"
+            requirements_path = state_dir / "requirements.json"
+            manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
+            integration_contract_path = state_dir / "system_validation" / "integration_contract.json"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "title": "CLI",
+                                "status": "completed",
+                                "depends_on": [],
+                                "verification_commands": ["python -c \"assert True\""],
+                            },
+                            {
+                                "id": "FINAL_ACCEPTANCE",
+                                "status": "in_progress",
+                                "depends_on": ["T1"],
+                                "final_acceptance": True,
+                            },
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_final_acceptance",
+                        "validator": "agent.system_validation",
+                        "tasks_path": "state/benchmarks/sample/generated_tasks.json",
+                        "requirements_path": "state/benchmarks/sample/requirements.json",
+                        "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                        "integration_contract_path": "state/benchmarks/sample/system_validation/integration_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            integration_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_integration_contract",
+                        "version": 1,
+                        "entry_points": ["sample.cli:main"],
+                        "module_edges": [
+                            {"id": "cli-core", "from": "sample.cli:main", "to": "sample.core.run", "covered_by": ["smoke"]}
+                        ],
+                        "required_scenarios": [],
+                        "static_checks": [],
+                        "dynamic_checks": [
+                            {"id": "smoke", "command": "python -c \"assert False\""}
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            failed = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                    "--integration-contract",
+                ]
+            )
+            failed_results = json.loads((state_dir / "system_validation" / "integration_results.json").read_text(encoding="utf-8"))
+            contract = json.loads(integration_contract_path.read_text(encoding="utf-8"))
+            contract["dynamic_checks"][0]["command"] = "python -c \"assert True\""
+            integration_contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+
+            passed = system_validation_main(
+                [
+                    "--root",
+                    str(root),
+                    "--state-dir",
+                    "state/benchmarks/sample",
+                    "--tasks-path",
+                    "state/benchmarks/sample/generated_tasks.json",
+                    "--requirements-path",
+                    "state/benchmarks/sample/requirements.json",
+                    "--benchmark-id",
+                    "sample",
+                    "--integration-contract",
+                ]
+            )
+            passed_results = json.loads((state_dir / "system_validation" / "integration_results.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(failed, 1)
+        self.assertFalse(failed_results["passed"])
+        self.assertFalse(next(item for item in failed_results["checks"] if item["id"] == "smoke")["passed"])
+        self.assertEqual(passed, 0)
+        self.assertTrue(passed_results["passed"])
+        self.assertTrue(next(item for item in passed_results["checks"] if item["id"] == "cli-core")["passed"])
 
     def test_system_validation_skips_non_ui_requirement_widget_checks(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -4208,6 +5025,7 @@ class HarnessBehaviorTests(unittest.TestCase):
             requirements_path = state_dir / "requirements.json"
             manifest_path = state_dir / "system_validation" / "final_acceptance_manifest.json"
             ui_contract_path = state_dir / "system_validation" / "ui_contract.json"
+            integration_contract_path = state_dir / "system_validation" / "integration_contract.json"
             tasks_path.parent.mkdir(parents=True)
             tasks_path.write_text(
                 json.dumps(
@@ -4253,6 +5071,23 @@ class HarnessBehaviorTests(unittest.TestCase):
                         "tasks_path": "state/benchmarks/sample/generated_tasks.json",
                         "requirements_path": "state/benchmarks/sample/requirements.json",
                         "ui_contract_path": "state/benchmarks/sample/system_validation/ui_contract.json",
+                        "integration_contract_path": "state/benchmarks/sample/system_validation/integration_contract.json",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            integration_contract_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "system_owned_integration_contract",
+                        "version": 1,
+                        "entry_points": [],
+                        "module_edges": [],
+                        "required_scenarios": [],
+                        "static_checks": [],
+                        "dynamic_checks": [],
                     },
                     indent=2,
                 )
@@ -4334,8 +5169,9 @@ class HarnessBehaviorTests(unittest.TestCase):
                 ]
             )
             check_results = json.loads(
-                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+                (state_dir / "system_validation" / "runtime_ui_results.json").read_text(encoding="utf-8")
             )
+            legacy_results_exists = (state_dir / "system_validation" / "ui_check_results.json").exists()
             contract_data = json.loads(ui_contract_path.read_text(encoding="utf-8"))
             contract_data["contracts"][0]["ui_applicability"] = "required"
             contract_data["contracts"][0]["ui_surface"] = "widget"
@@ -4355,26 +5191,16 @@ class HarnessBehaviorTests(unittest.TestCase):
                 ]
             )
             required_check_results = json.loads(
-                (state_dir / "system_validation" / "ui_check_results.json").read_text(encoding="utf-8")
+                (state_dir / "system_validation" / "runtime_ui_results.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(result, 0)
-        entry = check_results["results"][0]
-        self.assertTrue(entry["passed"])
-        self.assertEqual(entry["ui_applicability"], "not_applicable")
-        self.assertEqual(entry["ui_surface"], "none")
-        self.assertFalse(entry["ui_check_applicable"])
-        self.assertEqual(entry["repair_targets"], [])
-        self.assertTrue(all(entry["checks"].values()))
-        self.assertEqual(required_result, 1)
-        required_entry = required_check_results["results"][0]
-        self.assertFalse(required_entry["passed"])
-        self.assertEqual(required_entry["ui_applicability"], "required")
-        self.assertTrue(required_entry["ui_check_applicable"])
-        self.assertEqual(
-            required_entry["repair_targets"],
-            ["eval/benchmarks/sample/workspace/mprs/services/scheduler.py"],
-        )
+        self.assertTrue(check_results["passed"])
+        self.assertFalse(legacy_results_exists)
+        self.assertEqual(check_results["results"], [])
+        self.assertEqual(required_result, 0)
+        self.assertTrue(required_check_results["passed"])
+        self.assertTrue(next(item for item in required_check_results["checks"] if item["id"] == "button_command_wiring")["passed"])
 
     def test_ui_contract_openai_provider_uses_schema_prompt(self) -> None:
         requirement = {
@@ -4432,6 +5258,192 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Required top-level shape", captured_payload["messages"][0]["content"])
         self.assertIn("REQ-EMP-ADD", captured_payload["messages"][1]["content"])
 
+    def test_integration_contract_openai_provider_uses_project_context(self) -> None:
+        tasks = [
+            {
+                "id": "T1",
+                "title": "Implement scheduler service and CLI",
+                "status": "completed",
+                "requirement_ids": ["REQ-SCHEDULE"],
+                "implementation_artifacts": [
+                    "eval/benchmarks/sample/workspace/mprs/services/scheduler.py",
+                    "eval/benchmarks/sample/workspace/mprs/cli.py",
+                ],
+            }
+        ]
+        requirements = [
+            {
+                "id": "REQ-SCHEDULE",
+                "source": "project_spec.md:4",
+                "text": "Scheduling through the CLI must persist allocations.",
+                "type": "workflow",
+                "priority": "must",
+            }
+        ]
+        file_inventory = [
+            {"path": "eval/benchmarks/sample/workspace/mprs/services/scheduler.py", "size_bytes": 1200},
+            {"path": "eval/benchmarks/sample/workspace/mprs/cli.py", "size_bytes": 800},
+            {"path": "eval/benchmarks/sample/workspace/tests/test_cli_scheduler.py", "size_bytes": 500},
+        ]
+        builder = OpenAICompatibleIntegrationContractBuilder(
+            api_key="test",
+            base_url="https://example.invalid/v1",
+            model="test",
+        )
+        captured_payload = {}
+
+        def fake_post(payload: dict) -> dict:
+            captured_payload.update(payload)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "entry_points": ["mprs.cli schedule command"],
+                                    "module_edges": [
+                                        {
+                                            "from": "mprs.cli",
+                                            "to": "mprs.services.scheduler",
+                                            "covered_by": "dynamic-1",
+                                            "reason": "CLI delegates scheduling to the service.",
+                                        }
+                                    ],
+                                    "required_scenarios": [
+                                        {
+                                            "name": "Schedule through CLI",
+                                            "entry_point": "mprs.cli schedule command",
+                                            "steps": ["Run scheduler CLI test"],
+                                            "expected_observable": "Allocation is persisted.",
+                                        }
+                                    ],
+                                    "static_checks": [
+                                        {
+                                            "kind": "static_text_contains",
+                                            "path": "eval/benchmarks/sample/workspace/mprs/cli.py",
+                                            "contains": "scheduler",
+                                        }
+                                    ],
+                                    "dynamic_checks": [
+                                        {
+                                            "command": "python -m unittest tests.test_cli_scheduler",
+                                            "working_directory": "eval/benchmarks/sample/workspace",
+                                            "covers_edges": ["edge-1"],
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+        builder._post_chat_completions = fake_post
+        contract = builder.build(
+            tasks=tasks,
+            project_spec="# MPRS\nScheduling through the CLI must persist allocations.",
+            requirements=requirements,
+            file_inventory=file_inventory,
+        )
+        errors = validate_integration_contract(contract)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(contract["generated_by"], "llm")
+        self.assertEqual(contract["kind"], "system_owned_integration_contract")
+        self.assertEqual(contract["module_edges"][0]["id"], "edge-1")
+        self.assertEqual(contract["module_edges"][0]["covered_by"], ["dynamic-1"])
+        self.assertEqual(contract["dynamic_checks"][0]["id"], "dynamic-1")
+        self.assertIn("Required top-level shape", captured_payload["messages"][0]["content"])
+        self.assertIn("REQ-SCHEDULE", captured_payload["messages"][1]["content"])
+        self.assertIn("mprs/cli.py", captured_payload["messages"][1]["content"])
+
+    def test_integration_results_openai_judge_batches_verdicts_and_rejects_import_only_edge(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            app_file = root / "eval" / "benchmarks" / "sample" / "workspace" / "sample" / "ui.py"
+            app_file.parent.mkdir(parents=True)
+            app_file.write_text(
+                "from sample.services import workflow_engine\n\n"
+                "def render_center_panel():\n"
+                "    return 'ready'\n",
+                encoding="utf-8",
+            )
+            contract = {
+                "kind": "system_owned_integration_contract",
+                "version": 1,
+                "entry_points": ["sample.ui.render_center_panel"],
+                "module_edges": [
+                    {
+                        "id": "edge-1",
+                        "from": "sample.ui",
+                        "to": "sample.services.workflow_engine",
+                        "covered_by": ["static-1"],
+                    }
+                ],
+                "required_scenarios": [],
+                "static_checks": [
+                    {
+                        "id": "static-1",
+                        "kind": "static_text_contains",
+                        "path": "eval/benchmarks/sample/workspace/sample/ui.py",
+                        "contains": "from sample.services",
+                    }
+                ],
+                "dynamic_checks": [],
+            }
+            judge = OpenAICompatibleIntegrationResultJudge(
+                api_key="test",
+                base_url="https://example.invalid/v1",
+                model="test",
+            )
+            calls: list[dict] = []
+
+            def fake_post(payload: dict) -> dict:
+                calls.append(payload)
+                content = {
+                    "passed": False,
+                    "summary": "Import-only evidence does not prove integration.",
+                    "checks": [
+                        {
+                            "id": "static-1",
+                            "type": "static",
+                            "passed": False,
+                            "reason": "The file only imports workflow_engine; there is no call or usage.",
+                            "evidence": "Local evidence showed an unused import and a render function returning a literal.",
+                        },
+                        {
+                            "id": "edge-1",
+                            "type": "edge",
+                            "passed": False,
+                            "reason": "The covering static check failed and no real UI-to-service call is proven.",
+                            "evidence": "The UI imports the service package but never uses workflow_engine.",
+                        }
+                    ],
+                }
+                return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+            judge._post_chat_completions = fake_post
+            results = evaluate_integration_contract(
+                root=root,
+                state_dir=state_dir,
+                tasks=[],
+                contract_data=contract,
+                benchmark_id="sample",
+                result_judge=judge,
+            )
+
+        self.assertFalse(results["passed"])
+        self.assertEqual(results["judged_by"], "llm")
+        self.assertEqual(results["judge_mode"], "batch")
+        self.assertEqual(results["version"], 2)
+        self.assertNotIn("static_checks", results)
+        self.assertFalse(next(item for item in results["checks"] if item["id"] == "static-1")["passed"])
+        self.assertFalse(next(item for item in results["checks"] if item["id"] == "edge-1")["passed"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("local_evidence", calls[0]["messages"][1]["content"])
+        self.assertNotIn("tools", calls[0])
+
     def test_final_acceptance_rejects_writing_system_validation_artifact(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4476,6 +5488,51 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(result.data["final_acceptance_read_only"])
+        self.assertIn("may read validation manifest, contract, and result JSON files", result.summary)
+        self.assertIn("Result files are regenerated by the final validation command", result.summary)
+
+    def test_final_acceptance_rejects_manual_result_artifact_write_with_validator_hint(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Benchmark project", max_steps=1)
+            target = "state/system_validation/integration_results.json"
+            state = create_initial_state("Benchmark project")
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "title": "Run project-level final acceptance",
+                    "status": "in_progress",
+                    "final_acceptance": True,
+                    "expected_artifacts": [target],
+                    "implementation_artifacts": [],
+                    "worker_test_artifacts": [],
+                    "acceptance_artifacts": [target],
+                    "frozen_acceptance_artifacts": [target],
+                }
+            ]
+            state.acceptance_contracts = [
+                {
+                    "task_id": "FINAL_ACCEPTANCE",
+                    "summary": "System validation.",
+                    "checks": ["python -m agent.system_validation --help"],
+                    "status": "agreed",
+                }
+            ]
+
+            result = loop._execute_action(
+                {
+                    "action": "write",
+                    "target": target,
+                    "args": {"content": '{"passed": true}\n', "mode": "overwrite"},
+                },
+                state,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["final_acceptance_read_only"])
+        self.assertIn("must not manually edit", result.summary)
+        self.assertIn("Result files are regenerated by the final validation command", result.summary)
 
     def test_final_acceptance_allows_inferred_source_repair_only(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -4598,7 +5655,7 @@ class HarnessBehaviorTests(unittest.TestCase):
     def test_adjust_mode_completed_final_acceptance_still_rejects_state_artifact_write(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
-            target = "state/benchmarks/sample/system_validation/ui_check_results.json"
+            target = "state/benchmarks/sample/system_validation/runtime_ui_results.json"
             loop = AgentLoop(
                 root=root,
                 task="Fix user-reported generated UI bug",
@@ -4651,6 +5708,199 @@ class HarnessBehaviorTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(result.data["adjust_repair_pending_validation"])
+
+    def test_adjust_mode_finish_rejects_before_applying_requested_change(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "title": "Done", "priority": 1, "depends_on": [], "status": "completed"}
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Fix generated app wiring",
+                max_steps=1,
+                tasks_path=source_tasks,
+                interaction_mode="adjust",
+                system_validation=False,
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Fix generated app wiring")
+            state.interaction_mode = "adjust"
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Done", "status": "completed", "evidence": []}]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["adjust_change_not_applied"])
+        self.assertIn("outstanding user-requested change", result.summary)
+
+    def test_adjust_mode_finish_creates_repair_task_for_inferred_workspace_target(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_file = root / "eval" / "benchmarks" / "sample" / "workspace" / "mapa" / "main.py"
+            workspace_file.parent.mkdir(parents=True)
+            workspace_file.write_text("APPROVE_USES_ENGINE = False\n", encoding="utf-8")
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "title": "Done", "priority": 1, "depends_on": [], "status": "completed"}
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Fix generated app wiring",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+                interaction_mode="adjust",
+                system_validation=False,
+                conversation_messages=[
+                    {
+                        "role": "user",
+                        "content": "main.py approve/reject must call WorkflowEngine and persist state.",
+                    }
+                ],
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Fix generated app wiring")
+            state.interaction_mode = "adjust"
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "title": "Done", "status": "completed", "evidence": []}]
+
+            finish_result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            edit_result = loop._execute_action(
+                {
+                    "action": "edit",
+                    "target": "eval/benchmarks/sample/workspace/mapa/main.py",
+                    "args": {"old": "False", "new": "True"},
+                },
+                state,
+            )
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+            repair_task = data["tasks"][-1]
+            persisted_state = json.loads(loop.state_path.read_text(encoding="utf-8"))
+            repaired_content = workspace_file.read_text(encoding="utf-8")
+
+        self.assertFalse(finish_result.ok)
+        self.assertTrue(finish_result.data["adjust_repair_task_created"])
+        self.assertEqual(state.task_id, "ADJUST_REPAIR-01")
+        self.assertEqual(persisted_state["task_id"], "ADJUST_REPAIR-01")
+        self.assertEqual(repair_task["id"], "ADJUST_REPAIR-01")
+        self.assertEqual(repair_task["implementation_artifacts"], ["eval/benchmarks/sample/workspace/mapa/main.py"])
+        self.assertTrue(any(contract.get("task_id") == "ADJUST_REPAIR-01" and contract.get("status") == "agreed" for contract in state.acceptance_contracts))
+        self.assertTrue(edit_result.ok)
+        self.assertEqual(repaired_content, "APPROVE_USES_ENGINE = True\n")
+
+    def test_adjust_mode_finish_can_use_active_task_implementation_artifact_as_repair_target(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_file = root / "eval" / "benchmarks" / "sample" / "workspace" / "mapa" / "main.py"
+            workspace_file.parent.mkdir(parents=True)
+            workspace_file.write_text("APPROVE_USES_ENGINE = False\n", encoding="utf-8")
+            source_tasks = root / "input_tasks.json"
+            source_tasks.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "T22",
+                                "title": "Application Entry Point",
+                                "priority": 1,
+                                "depends_on": [],
+                                "status": "completed",
+                                "expected_artifacts": [
+                                    "eval/benchmarks/sample/workspace/mapa/main.py",
+                                ],
+                                "implementation_artifacts": [
+                                    "eval/benchmarks/sample/workspace/mapa/main.py",
+                                ],
+                            }
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loop = AgentLoop(
+                root=root,
+                task="Fix generated app wiring",
+                max_steps=1,
+                benchmark_id="sample",
+                tasks_path=source_tasks,
+                interaction_mode="adjust",
+                system_validation=False,
+                conversation_messages=[
+                    {
+                        "role": "user",
+                        "content": "主程序没有真正接入业务引擎，approve/reject 没有调用 WorkflowEngine。",
+                    }
+                ],
+            )
+            loop._ensure_state_files()
+            loop._prepare_runtime_task_graph()
+            state = create_initial_state("Fix generated app wiring")
+            state.interaction_mode = "adjust"
+            state.task_id = "T22"
+            state.nodes = [
+                {
+                    "id": "T22",
+                    "title": "Application Entry Point",
+                    "status": "completed",
+                    "implementation_artifacts": [
+                        "eval/benchmarks/sample/workspace/mapa/main.py",
+                    ],
+                    "expected_artifacts": [
+                        "eval/benchmarks/sample/workspace/mapa/main.py",
+                    ],
+                }
+            ]
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+            data = json.loads(loop.tasks_path.read_text(encoding="utf-8"))
+            repair_task = data["tasks"][-1]
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["adjust_repair_task_created"])
+        self.assertEqual(state.task_id, "ADJUST_REPAIR-01")
+        self.assertEqual(repair_task["implementation_artifacts"], ["eval/benchmarks/sample/workspace/mapa/main.py"])
+
+    def test_adjust_mode_finish_rejects_pending_adjust_validation(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = AgentLoop(root=root, task="Fix generated UI", max_steps=1, interaction_mode="adjust")
+            state = create_initial_state("Fix generated UI")
+            state.interaction_mode = "adjust"
+            state.pending_repair = {
+                "reason": "adjust_mode_user_reported_defect",
+                "repair_targets": ["eval/benchmarks/sample/workspace/app.py"],
+            }
+
+            result = loop._execute_action({"action": "finish", "target": "current_task", "args": {}}, state)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.data["adjust_repair_pending_validation"])
+        self.assertIn("has not been validated", result.summary)
 
     def test_finish_can_skip_final_acceptance_when_system_validation_disabled(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
@@ -4783,10 +6033,15 @@ class HarnessBehaviorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loop._prepare_runtime_task_graph()
-            ui_results = loop.state_dir / "system_validation" / "ui_check_results.json"
-            ui_results.parent.mkdir(parents=True)
-            ui_results.write_text(
-                json.dumps({"kind": "ui_check_results", "passed": True}, indent=2) + "\n",
+            runtime_ui_results = loop.state_dir / "system_validation" / "runtime_ui_results.json"
+            runtime_ui_results.parent.mkdir(parents=True)
+            runtime_ui_results.write_text(
+                json.dumps({"kind": "runtime_ui_results", "passed": True}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            integration_results = loop.state_dir / "system_validation" / "integration_results.json"
+            integration_results.write_text(
+                json.dumps({"kind": "integration_check_results", "passed": True}, indent=2) + "\n",
                 encoding="utf-8",
             )
             state = create_initial_state("Benchmark project")
@@ -6050,6 +7305,80 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("Skills multi-select", context)
         self.assertIn("Refresh the employee table after save.", context)
 
+    def test_final_acceptance_pending_repair_includes_repair_guidance(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            state = create_initial_state("Run final acceptance")
+            state.task_id = "FINAL_ACCEPTANCE"
+            state.nodes = [
+                {
+                    "id": "FINAL_ACCEPTANCE",
+                    "status": "in_progress",
+                    "expected_artifacts": [
+                        "state/benchmarks/sample/system_validation/final_acceptance_manifest.json",
+                        "state/benchmarks/sample/system_validation/integration_contract.json",
+                    ],
+                    "implementation_artifacts": [],
+                    "acceptance_artifacts": [
+                        "state/benchmarks/sample/system_validation/final_acceptance_manifest.json",
+                        "state/benchmarks/sample/system_validation/integration_contract.json",
+                    ],
+                    "frozen_acceptance_artifacts": [
+                        "state/benchmarks/sample/system_validation/final_acceptance_manifest.json",
+                        "state/benchmarks/sample/system_validation/integration_contract.json",
+                    ],
+                    "verification_commands": [
+                        "python -c \"from agent.system_validation import main; raise SystemExit(main([]))\""
+                    ],
+                }
+            ]
+            state.pending_repair = {
+                "reason": "failed_acceptance_command",
+                "command": "python -c \"from agent.system_validation import main; raise SystemExit(main([]))\"",
+                "summary": "SYSTEM_VALIDATION_FAIL",
+                "output": (
+                    "UI check failed for REQ-RULE-02: buttons, inputs. "
+                    "repair_targets: eval/benchmarks/sample/workspace/mapa/services/rule_engine.py"
+                ),
+                "targets": ["eval/benchmarks/sample/workspace/mapa/services/rule_engine.py"],
+                "repair_targets": ["eval/benchmarks/sample/workspace/mapa/services/rule_engine.py"],
+                "required_reads": [],
+                "read_targets": [],
+                "repaired_targets": [],
+            }
+
+            builder = ContextBuilder(root, state_dir=state_dir, integration_contract_validation=True)
+            context = builder.build(state)
+            required = builder._required_next_action(state)
+            state.pending_repair["repaired_targets"] = [
+                "eval/benchmarks/sample/workspace/mapa/services/rule_engine.py"
+            ]
+            after_repair_required = builder._required_next_action(state)
+
+        self.assertIn("FINAL_ACCEPTANCE repair guidance:", context)
+        self.assertIn("Project-level validation artifacts are system-owned diagnostics", context)
+        self.assertIn("runtime_ui_results.json and integration_results.json", context)
+        self.assertIn("must not manually write or edit them", context)
+        self.assertIn("final validation command may regenerate or overwrite result files", context)
+        self.assertIn("Do not treat FINAL_ACCEPTANCE expected_artifacts", context)
+        self.assertIn("failed check ids, subjects, reasons, evidence, and repair_targets", context)
+        self.assertIn("comments, docstrings, unused imports, placeholder strings", context)
+        self.assertIn("actual UI widgets, callbacks, disabled/enabled states", context)
+        self.assertIn("real cross-module wiring", context)
+        self.assertIn("weak hint; search/read the UI file", context)
+        self.assertIn("known, unfixed failures", context)
+        self.assertIn("Use smaller targeted commands", context)
+        self.assertNotIn("rerun the same final validation command", context)
+        self.assertIn("FINAL_ACCEPTANCE repair guidance:", required)
+        self.assertIn("validation-shaped text", required)
+        self.assertIn("must not manually write or edit them", required)
+        self.assertIn("continue repairing any known failed UI or integration checks", after_repair_required)
+        self.assertIn("smaller targeted command", after_repair_required)
+        self.assertNotIn("bash target=", after_repair_required)
+        self.assertNotIn("rerun the same acceptance command", after_repair_required)
+
     def test_context_forces_finish_to_schedule_final_validation(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6077,6 +7406,35 @@ class HarnessBehaviorTests(unittest.TestCase):
         self.assertIn("required_next_action:", context)
         self.assertIn("FINAL_ACCEPTANCE is not scheduled", context)
         self.assertIn("Next action must be finish target='current_task'", context)
+
+    def test_context_does_not_force_final_validation_when_system_validation_disabled(self) -> None:
+        with WorkspaceTemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state" / "benchmarks" / "sample"
+            state_dir.mkdir(parents=True)
+            (state_dir / "generated_tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {"id": "T1", "status": "completed", "priority": 1, "depends_on": []},
+                        ]
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = create_initial_state("Adjust generated project")
+            state.interaction_mode = "adjust"
+            state.task_id = "T1"
+            state.nodes = [{"id": "T1", "status": "completed", "title": "Final ordinary task"}]
+
+            context = ContextBuilder(root, state_dir=state_dir, system_validation=False).build(state)
+
+        self.assertNotIn("FINAL_ACCEPTANCE is not scheduled", context)
+        self.assertNotIn("Next action must be finish target='current_task'", context)
+        self.assertIn("harness can create an ADJUST_REPAIR task", context)
+        self.assertIn("Do not create a manual contract to unlock writes", context)
 
     def test_context_builder_keeps_startup_reference_without_later_handoff(self) -> None:
         with WorkspaceTemporaryDirectory() as tmp:

@@ -113,30 +113,30 @@ class ProjectTerminator:
                 "status": status,
                 "summary": "FINAL_ACCEPTANCE must pass before project termination.",
             }
-        ui_results_path = self.state_dir / "system_validation" / "ui_check_results.json"
+        runtime_ui_results_path = self.state_dir / "system_validation" / "runtime_ui_results.json"
         if self.ui_contract_required:
-            if not ui_results_path.exists():
+            if not runtime_ui_results_path.exists():
                 return {
                     "ok": False,
-                    "reason": "ui_check_results_missing",
-                    "path": str(ui_results_path),
-                    "summary": "FINAL_ACCEPTANCE completed but ui_check_results.json is missing.",
+                    "reason": "runtime_ui_results_missing",
+                    "path": str(runtime_ui_results_path),
+                    "summary": "FINAL_ACCEPTANCE completed but runtime_ui_results.json is missing.",
                 }
             try:
-                ui_results = json.loads(ui_results_path.read_text(encoding="utf-8"))
+                runtime_ui_results = json.loads(runtime_ui_results_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 return {
                     "ok": False,
-                    "reason": "ui_check_results_unreadable",
-                    "path": str(ui_results_path),
-                    "summary": f"ui_check_results.json could not be loaded: {exc}",
+                    "reason": "runtime_ui_results_unreadable",
+                    "path": str(runtime_ui_results_path),
+                    "summary": f"runtime_ui_results.json could not be loaded: {exc}",
                 }
-            if ui_results.get("passed") is not True:
+            if runtime_ui_results.get("passed") is not True:
                 return {
                     "ok": False,
-                    "reason": "ui_check_results_failed",
-                    "path": str(ui_results_path),
-                    "summary": "ui_check_results.json shows UI/system validation has not passed.",
+                    "reason": "runtime_ui_results_failed",
+                    "path": str(runtime_ui_results_path),
+                    "summary": "runtime_ui_results.json shows runtime UI validation has not passed.",
                 }
         integration_results_path = self.state_dir / "system_validation" / "integration_results.json"
         if self.integration_contract_required:
@@ -166,10 +166,10 @@ class ProjectTerminator:
         return {
             "ok": True,
             "task_id": "FINAL_ACCEPTANCE",
-            "ui_check_results_path": str(ui_results_path) if self.ui_contract_required else "",
+            "runtime_ui_results_path": str(runtime_ui_results_path) if self.ui_contract_required else "",
             "integration_results_path": str(integration_results_path) if self.integration_contract_required else "",
             "summary": (
-                "FINAL_ACCEPTANCE, UI validation, and integration validation passed."
+                "FINAL_ACCEPTANCE, UI validation, runtime UI validation, and integration validation passed."
                 if self.ui_contract_required and self.integration_contract_required
                 else "FINAL_ACCEPTANCE passed with configured final validation checks."
             ),
